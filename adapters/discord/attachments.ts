@@ -1,0 +1,281 @@
+/**
+ * Attachment rules, ported from the existing Discord bridge.
+ *
+ * Inbound (Discord -> agent): the bridge does NOT download anything. It passes
+ * up to 10 URL refs (Discord CDN `url`, fallback `proxyURL`) with filename,
+ * contentType and size in the prompt trailer (`a=<url>`) and in
+ * metadata.attachments. Voice messages are attachments too (audio/ogg), so
+ * they travel the same way.
+ *
+ * Outbound (agent callback -> Discord): base64 `data` or an https `url` the
+ * bridge fetches (15 s timeout). MIME allowlist (images/media, PDF, Office,
+ * text/code, zip/tar/gz/7z/rar; never exe/msi/dmg/iso), 8 MiB per file,
+ * 25 MiB total, 10 files.
+ */
+export const MAX_ATTACHMENTS = 10;
+export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+export const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+export const ATTACHMENT_FETCH_TIMEOUT_MS = 15_000;
+
+export const ALLOWED_MIME = new Set([
+  "image/png", "image/jpeg", "image/gif", "image/webp",
+  "video/mp4", "video/webm",
+  "audio/mpeg", "audio/ogg", "audio/wav",
+  "application/pdf", "text/plain",
+  // office documents
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/msword", "application/vnd.ms-excel", "application/vnd.ms-powerpoint",
+  "application/vnd.oasis.opendocument.text", "application/vnd.oasis.opendocument.spreadsheet",
+  "application/vnd.oasis.opendocument.presentation", "application/rtf",
+  "text/csv", "text/tab-separated-values",
+  // text / code
+  "text/markdown", "text/html", "text/css", "text/javascript", "application/javascript",
+  "application/json", "application/xml", "text/xml", "application/x-yaml", "text/yaml",
+  "text/x-python", "application/x-python", "text/x-shellscript", "application/x-sh",
+  "application/x-powershell", "text/x-powershell",
+  // archives
+  "application/zip", "application/x-tar", "application/tar", "application/gzip", "application/x-gzip",
+  "application/x-gtar", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed",
+]);
+
+const EXT_MIME: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+  ".mp4": "video/mp4", ".webm": "video/webm", ".mp3": "audio/mpeg", ".mpeg": "audio/mpeg",
+  ".ogg": "audio/ogg", ".oga": "audio/ogg", ".wav": "audio/wav",
+  ".pdf": "application/pdf", ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json",
+  ".xml": "application/xml", ".yml": "application/x-yaml", ".yaml": "application/x-yaml",
+  ".py": "text/x-python", ".ps1": "application/x-powershell", ".sh": "application/x-sh", ".bash": "application/x-sh",
+  ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".html": "text/html", ".css": "text/css",
+  ".js": "text/javascript", ".ts": "text/plain",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".doc": "application/msword", ".xls": "application/vnd.ms-excel", ".ppt": "application/vnd.ms-powerpoint",
+  ".odt": "application/vnd.oasis.opendocument.text", ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+  ".odp": "application/vnd.oasis.opendocument.presentation", ".rtf": "application/rtf",
+  ".zip": "application/zip", ".tar": "application/x-tar", ".gz": "application/gzip", ".tgz": "application/x-gtar",
+  ".7z": "application/x-7z-compressed", ".rar": "application/vnd.rar",
+};
+
+export type AttachmentErrorCode =
+  | "attachment_too_large"
+  | "too_many_attachments"
+  | "unsupported_media_type"
+  | "attachment_fetch_failed"
+  | "invalid_attachment"
+  | "invalid_attachment_url";
+
+export class AttachmentError extends Error {
+  constructor(
+    readonly code: AttachmentErrorCode,
+    message?: string,
+  ) {
+    super(message ?? code);
+    this.name = "AttachmentError";
+  }
+}
+
+/** HTTP status for an attachment error (same mapping as the existing bridge). */
+export function attachmentHttpStatus(code: AttachmentErrorCode): number {
+  if (code === "unsupported_media_type") return 415;
+  if (code === "attachment_fetch_failed") return 502;
+  return 400;
+}
+
+export interface ResolvedAttachment {
+  filename: string;
+  contentType: string;
+  buffer: Buffer;
+}
+
+export interface WakeAttachmentRef {
+  url: string;
+  filename?: string;
+  contentType?: string;
+  size?: number;
+}
+
+export interface JsonAttachmentInput {
+  filename?: unknown;
+  contentType?: unknown;
+  data?: unknown;
+  url?: unknown;
+}
+
+export function guessMimeFromFilename(filename: string): string | undefined {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".tar.gz")) return "application/gzip";
+  const dot = lower.lastIndexOf(".");
+  return dot < 0 ? undefined : EXT_MIME[lower.slice(dot)];
+}
+
+export function normalizeMime(raw: string | undefined, filename: string): string {
+  const base = (raw ?? "").split(";")[0].trim().toLowerCase();
+  if (base && base !== "application/octet-stream" && ALLOWED_MIME.has(base)) return base;
+  if (base === "image/jpg") return "image/jpeg";
+  const guessed = guessMimeFromFilename(filename);
+  if (guessed) return guessed;
+  return base || "application/octet-stream";
+}
+
+export function assertMimeAllowed(contentType: string): void {
+  const base = contentType.split(";")[0].trim().toLowerCase();
+  if (!ALLOWED_MIME.has(base)) throw new AttachmentError("unsupported_media_type");
+}
+
+/** Short, content-free kind for audit lines: image, video, audio, pdf, office, text, archive, other. */
+export function mimeKind(contentType: string | undefined): string {
+  const m = (contentType ?? "").split(";")[0].trim().toLowerCase();
+  if (m.startsWith("image/")) return "image";
+  if (m.startsWith("video/")) return "video";
+  if (m.startsWith("audio/")) return "audio";
+  if (m === "application/pdf") return "pdf";
+  if (/officedocument|msword|ms-excel|ms-powerpoint|opendocument|rtf/.test(m)) return "office";
+  if (/zip|tar|gzip|7z|rar/.test(m)) return "archive";
+  if (m.startsWith("text/") || /json|xml|yaml|javascript|python|x-sh|powershell/.test(m)) return "text";
+  return "other";
+}
+
+export function safeFilename(name: unknown, fallback: string): string {
+  const raw = (typeof name === "string" ? name : fallback).trim() || fallback;
+  return raw.replace(/[/\\:\0<>|"?*\u0000-\u001f]/g, "_").slice(0, 200) || fallback;
+}
+
+function filenameFromUrl(urlStr: string): string {
+  try {
+    const last = new URL(urlStr).pathname.split("/").filter(Boolean).pop();
+    if (last) return decodeURIComponent(last).slice(0, 200);
+  } catch {
+    /* ignore */
+  }
+  return "attachment.bin";
+}
+
+export function decodeBase64Attachment(input: JsonAttachmentInput): ResolvedAttachment {
+  if (typeof input.data !== "string" || !input.data.trim()) throw new AttachmentError("invalid_attachment", "data required");
+  if (typeof input.filename !== "string" || !input.filename.trim()) throw new AttachmentError("invalid_attachment", "filename required for data");
+  const filename = safeFilename(input.filename, "file.bin");
+  const raw = input.data.trim().replace(/^data:[^;]+;base64,/i, "");
+  if (!/^[A-Za-z0-9+/=\s_-]+$/.test(raw)) throw new AttachmentError("invalid_attachment", "invalid base64");
+  // Reject before decoding when the encoded size already exceeds the cap.
+  if (Math.floor((raw.length * 3) / 4) > MAX_ATTACHMENT_BYTES + 3) throw new AttachmentError("attachment_too_large");
+  const buffer = Buffer.from(raw, "base64");
+  if (buffer.length === 0) throw new AttachmentError("invalid_attachment", "empty data");
+  if (buffer.length > MAX_ATTACHMENT_BYTES) throw new AttachmentError("attachment_too_large");
+  const contentType = normalizeMime(typeof input.contentType === "string" ? input.contentType : undefined, filename);
+  assertMimeAllowed(contentType);
+  return { filename, contentType, buffer };
+}
+
+export interface FetchOptions {
+  fetchImpl?: typeof fetch;
+  /**
+   * Hosts allowed over plain http (loopback only: tests and the local smoke
+   * run's mock CDN). Everything else must be https.
+   */
+  allowHttpHosts?: readonly string[];
+  timeoutMs?: number;
+}
+
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+export function validateAllowHttpHosts(hosts: unknown): string[] {
+  if (hosts === undefined) return [];
+  if (!Array.isArray(hosts)) return ["discord.attachments.allowHttpHosts must be an array"];
+  return hosts.filter((h) => !LOOPBACK.has(String(h))).map((h) => `discord.attachments.allowHttpHosts: ${String(h)} is not loopback`);
+}
+
+function urlAllowed(u: URL, opts: FetchOptions): boolean {
+  if (u.protocol === "https:") return true;
+  return u.protocol === "http:" && LOOPBACK.has(u.hostname) && (opts.allowHttpHosts ?? []).includes(u.hostname);
+}
+
+export async function fetchUrlAttachment(input: JsonAttachmentInput, opts: FetchOptions = {}): Promise<ResolvedAttachment> {
+  if (typeof input.url !== "string" || !input.url.trim()) throw new AttachmentError("invalid_attachment", "url required");
+  let parsed: URL;
+  try {
+    parsed = new URL(input.url.trim());
+  } catch {
+    throw new AttachmentError("invalid_attachment_url");
+  }
+  if (!urlAllowed(parsed, opts)) throw new AttachmentError("invalid_attachment_url", "https only");
+  const filename = safeFilename(input.filename ?? filenameFromUrl(parsed.toString()), "attachment.bin");
+  try {
+    const res = await (opts.fetchImpl ?? fetch)(parsed.toString(), {
+      method: "GET",
+      redirect: "follow",
+      signal: AbortSignal.timeout(opts.timeoutMs ?? ATTACHMENT_FETCH_TIMEOUT_MS),
+      headers: { accept: "*/*" },
+    });
+    // A redirect must not land on a plain-http host.
+    if (res.url) {
+      try {
+        if (!urlAllowed(new URL(res.url), opts)) throw new AttachmentError("invalid_attachment_url", "redirected off https");
+      } catch (e) {
+        if (e instanceof AttachmentError) throw e;
+      }
+    }
+    if (!res.ok) throw new AttachmentError("attachment_fetch_failed", `HTTP ${res.status}`);
+    const contentType = normalizeMime(
+      typeof input.contentType === "string" ? input.contentType : res.headers.get("content-type") ?? undefined,
+      filename,
+    );
+    assertMimeAllowed(contentType);
+    const len = Number(res.headers.get("content-length") ?? NaN);
+    if (Number.isFinite(len) && len > MAX_ATTACHMENT_BYTES) throw new AttachmentError("attachment_too_large");
+    const buffer = await readCapped(res, MAX_ATTACHMENT_BYTES);
+    if (buffer.length === 0) throw new AttachmentError("attachment_fetch_failed", "empty body");
+    return { filename, contentType, buffer };
+  } catch (err) {
+    if (err instanceof AttachmentError) throw err;
+    throw new AttachmentError("attachment_fetch_failed", (err as Error)?.name ?? "fetch");
+  }
+}
+
+/** Read a body but stop as soon as it passes the cap (no content-length trust). */
+async function readCapped(res: Response, max: number): Promise<Buffer> {
+  if (!res.body) return Buffer.alloc(0);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => undefined);
+      throw new AttachmentError("attachment_too_large");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Resolve callback attachments: each item has exactly one of data or url. */
+export async function resolveJsonAttachments(items: unknown, opts: FetchOptions = {}): Promise<ResolvedAttachment[]> {
+  if (items === undefined || items === null) return [];
+  if (!Array.isArray(items)) throw new AttachmentError("invalid_attachment", "attachments must be an array");
+  if (items.length === 0) return [];
+  if (items.length > MAX_ATTACHMENTS) throw new AttachmentError("too_many_attachments");
+  const out: ResolvedAttachment[] = [];
+  let total = 0;
+  for (const item of items as JsonAttachmentInput[]) {
+    if (!item || typeof item !== "object") throw new AttachmentError("invalid_attachment");
+    const hasData = typeof item.data === "string" && item.data.length > 0;
+    const hasUrl = typeof item.url === "string" && item.url.length > 0;
+    if (hasData === hasUrl) throw new AttachmentError("invalid_attachment", "each attachment needs exactly one of data or url");
+    const r = hasData ? decodeBase64Attachment(item) : await fetchUrlAttachment(item, opts);
+    total += r.buffer.length;
+    if (total > MAX_TOTAL_ATTACHMENT_BYTES) throw new AttachmentError("attachment_too_large", "total exceeds 25 MiB");
+    out.push(r);
+  }
+  return out;
+}
+
+/** Inbound: keep at most 10 refs with a URL. Nothing is fetched. */
+export function wakeRefs(refs: readonly WakeAttachmentRef[] | undefined): WakeAttachmentRef[] {
+  return (refs ?? []).filter((r) => typeof r.url === "string" && r.url).slice(0, MAX_ATTACHMENTS);
+}
+

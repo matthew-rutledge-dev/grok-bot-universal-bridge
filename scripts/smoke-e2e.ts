@@ -10,6 +10,12 @@
  *  B) Builds the same service in-process with the Discord gateway replaced by
  *     an in-memory port (no Discord token), and shows a mention being held,
  *     ONE status message edited on delivery, and a callback reply posted.
+ *  C) Discord media, voice and the local-planner hop, in-process with a mock
+ *     Discord CDN and a mock planner listener on loopback: inbound attachment
+ *     refs, callback files (base64 + CDN url), allowlist refusals, the planner
+ *     "Working on it." message edited by the planner's own callback, a
+ *     dropped planner connection that shows no red X, and voice play/stream
+ *     through an in-memory voice port.
  *
  * Prints evidence as Markdown. Exit code 0 only if every check passed.
  */
@@ -17,7 +23,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildService } from "../src/service.js";
-import { BOT, CHANNEL, GUILD, USER, FakeDiscordPort, discordMessage, mockRoutine, tmp, until } from "../test/helpers.js";
+import { BOT, CHANNEL, GUILD, USER, FakeDiscordPort, PNG_1X1, discordMessage, mockCdn, mockPlanner, mockRoutine, tmp, until } from "../test/helpers.js";
 import { silentLogger } from "../core/types.js";
 
 const out: string[] = [];
@@ -39,7 +45,7 @@ async function freePort(): Promise<number> {
   });
 }
 
-function writeConfigs(dir: string, routineUrl: string, wakeUrl: string, port: number, adapters: Record<string, boolean>) {
+function writeConfigs(dir: string, routineUrl: string, wakeUrl: string, port: number, adapters: Record<string, boolean>, discordOver: Record<string, unknown> = {}) {
   const registry = {
     version: 1,
     agents: {
@@ -54,7 +60,7 @@ function writeConfigs(dir: string, routineUrl: string, wakeUrl: string, port: nu
   chmodSync(regPath, 0o600);
   const discord = JSON.parse(readFileSync("adapters/discord/config.example.json", "utf8"));
   const grokbuild = JSON.parse(readFileSync("adapters/grokbuild/config.example.json", "utf8"));
-  writeFileSync(join(dir, "discord.json"), JSON.stringify(discord));
+  writeFileSync(join(dir, "discord.json"), JSON.stringify({ ...discord, ...discordOver }));
   writeFileSync(join(dir, "grokbuild.json"), JSON.stringify(grokbuild));
   const bridge = {
     version: 1,
@@ -84,6 +90,8 @@ function writeConfigs(dir: string, routineUrl: string, wakeUrl: string, port: nu
       GROKBUILD_CLIENT_TOKEN: "client-token",
       GROKBUILD_CALLBACK_TOKEN: "cb-grokbuild",
       GROKBUILD_READ_ONLY: "",
+      DISCORD_PLANNER_URL: "",
+      DISCORD_PLANNER_TOKEN: "",
     },
   };
 }
@@ -254,12 +262,143 @@ async function partB() {
   }
 }
 
+async function partC() {
+  say();
+  say("### C. Discord attachments, voice and the local-planner hop (mock CDN + mock planner on loopback)");
+  say();
+  const routine = await mockRoutine({ key: "routine-key" });
+  const cdn = await mockCdn({
+    "/attachments/1/2/render.png": { type: "image/png", body: PNG_1X1 },
+    "/attachments/1/2/setup.exe": { type: "application/x-msdownload", body: Buffer.from("MZ") },
+  });
+  const dir = tmp("ubridge-smoke-c-");
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const cbAuth = { authorization: "Bearer cb-discord" };
+  let dropNext = false;
+  // The mock planner accepts, then (like the real listener) POSTs its result to the callback URL it was given.
+  const planner = await mockPlanner({
+    token: "planner-token",
+    answer: (h) => {
+      if (dropNext) return "drop";
+      const cbUrl = h.url.searchParams.get("callbackUrl")!;
+      setTimeout(() => {
+        void fetch(cbUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...cbAuth },
+          body: JSON.stringify({
+            channelId: h.body.channelId,
+            content: "Done: here is the edit.",
+            replyToMessageId: h.url.searchParams.get("messageId"),
+            statusMessageId: h.url.searchParams.get("statusMessageId"),
+            attachments: [{ url: `${cdn.base}/attachments/1/2/render.png` }],
+          }),
+        });
+      }, 50);
+      return { status: 202, body: { ok: true, exitCode: 0 } };
+    },
+  });
+  const voiceCh = "777777777777777777";
+  const plannerCh = "200000000000000001";
+  const { file, env } = writeConfigs(dir, routine.url, "", port, { discord: true }, {
+    attachments: { allowHttpHosts: ["127.0.0.1"] },
+    planner: { urlRef: "env:DISCORD_PLANNER_URL", tokenRef: "env:DISCORD_PLANNER_TOKEN", callbackUrl: `${base}/discord/callback` },
+    voice: { enabled: true, channels: [voiceCh] },
+  });
+  const fake = new FakeDiscordPort(BOT);
+  const svc = await buildService(file, {
+    discordPort: fake,
+    env: { ...env, BRIDGE_WAKE_URL: "", DISCORD_PLANNER_URL: `${planner.url}?messageId=PLACEHOLDER`, DISCORD_PLANNER_TOKEN: "planner-token" },
+    log: silentLogger,
+  });
+  await svc.start();
+  try {
+    type Started = { accepted?: boolean; planner?: true; done?: Promise<string> };
+    const discord = svc.adapters.get("discord") as unknown as { onMessage: (m: ReturnType<typeof discordMessage>) => Promise<Started | undefined> };
+    // 1. inbound attachments (incl. a voice message) -> agent gets URL refs, nothing downloaded
+    const refs = [
+      { url: `${cdn.base}/attachments/1/2/render.png?ex=1`, filename: "render.png", contentType: "image/png", size: PNG_1X1.length },
+      { url: `${cdn.base}/attachments/1/2/voice-message.ogg`, filename: "voice-message.ogg", contentType: "audio/ogg", size: 2048 },
+    ];
+    const r1 = await discord.onMessage(discordMessage({ id: "700000000000000011", content: `<@${BOT}>`, attachments: refs }));
+    const p: string = routine.hits.at(-1)?.body.prompt ?? "";
+    check(
+      "inbound image + voice message reach the agent as a= refs and metadata (not fetched)",
+      r1?.accepted === true && p.startsWith("Discord #example-chat from example-user (2 attachments):") && p.includes(` a=${refs[1].url}`) && routine.hits.at(-1)?.body.metadata.attachments.length === 2 && cdn.hits.length === 0,
+      p.split("\n")[0],
+    );
+    // 2. callback files: base64 + mock CDN url; exe refused; unlisted channel refused before any fetch
+    const cb = await api(base, "POST", "/discord/callback", {
+      channelId: CHANNEL,
+      content: "Files attached.",
+      replyToMessageId: "700000000000000011",
+      attachments: [{ filename: "summary.md", data: Buffer.from("# summary").toString("base64") }, { url: `${cdn.base}/attachments/1/2/render.png` }],
+    }, cbAuth);
+    const sentFiles = fake.sent.at(-1)?.files?.map((f) => `${f.filename}:${f.contentType}`).join(", ");
+    check("callback posts base64 + CDN-url attachments", cb.status === 200 && cb.body.attachments === 2, sentFiles);
+    const exe = await api(base, "POST", "/discord/callback", { channelId: CHANNEL, content: "x", attachments: [{ url: `${cdn.base}/attachments/1/2/setup.exe` }] }, cbAuth);
+    check("executable from the CDN refused with 415", exe.status === 415 && exe.body.error === "unsupported_media_type", `HTTP ${exe.status} ${exe.body.error}`);
+    const hitsBefore = cdn.hits.length;
+    const off = await api(base, "POST", "/discord/callback", { channelId: "999999999999999999", content: "x", attachments: [{ url: `${cdn.base}/attachments/1/2/render.png` }] }, cbAuth);
+    check("callback to an unrouted channel refused before any CDN fetch", off.status === 403 && cdn.hits.length === hitsBefore, `HTTP ${off.status}`);
+    // 3. planner hop end to end
+    const sentBefore = fake.sent.length;
+    const r2 = await discord.onMessage(discordMessage({ id: "700000000000000012", channelId: plannerCh, content: `<@${BOT}> make the sky purple`, attachments: [refs[0]] }));
+    const signal = await r2?.done;
+    const working = fake.sent[sentBefore];
+    const ph = planner.hits[0];
+    check("planner route posts ONE \"Working on it.\" reply and does not wake the agent", working?.content === "Working on it. (0s)" && working.replyTo === "700000000000000012" && routine.hits.length === 1, `"${working?.content}"`);
+    check(
+      "planner called with the real message id, callback URL and status id; no token on the query string",
+      signal === "accepted" && ph.url.searchParams.get("messageId") === "700000000000000012" && ph.url.searchParams.get("callbackUrl") === `${base}/discord/callback` && ph.url.searchParams.get("statusMessageId") === working.id && !ph.url.searchParams.has("token") && ph.headers.authorization === "Bearer planner-token" && ph.body.imagePath === refs[0].url,
+      `signal=${signal}`,
+    );
+    await until(() => fake.edits.some((e) => e.content === "Done: here is the edit."), 5000);
+    const final = fake.edits.find((e) => e.content === "Done: here is the edit.");
+    check("planner's own callback edits the working message (with the CDN file); no extra message", final?.messageId === working.id && final.files?.[0]?.filename === "render.png" && fake.sent.length === sentBefore + 1, `files=${final?.files?.length}`);
+    check("accepted planner hop reacts \u2705 on the user's message", fake.reactions.some((x) => x.messageId === "700000000000000012" && x.emoji === "\u2705"));
+    dropNext = true;
+    const r3 = await discord.onMessage(discordMessage({ id: "700000000000000013", channelId: plannerCh, content: `<@${BOT}> again` }));
+    const s3 = await r3?.done;
+    const w3 = fake.sent.at(-1)!;
+    const noRedX = ![...fake.sent, ...fake.edits].some((m) => m.messageId === w3.id || m.id === w3.id ? /\u274C|Couldn't start/.test(m.content) : false);
+    check("planner connection dropped (listener timeout): no red X, working message left for the late callback", s3 === "transport" && noRedX && w3.content.startsWith("Working on it."), `signal=${s3}`);
+    // 4. voice
+    const play = await api(base, "POST", "/discord/voice/play", { channelId: voiceCh }, cbAuth);
+    const noAuth = await api(base, "POST", "/discord/voice/play", { channelId: voiceCh });
+    const unlisted = await api(base, "POST", "/discord/voice/play", { channelId: "100000000000000000" }, cbAuth);
+    check("voice play: callback token required, channel allowlist, tone played", play.status === 200 && noAuth.status === 401 && unlisted.status === 403 && fake.voice.played.length === 1, `${play.status}/${noAuth.status}/${unlisted.status}`);
+    const open = await api(base, "POST", "/discord/voice/stream", { op: "open", channelId: voiceCh }, cbAuth);
+    const busy = await api(base, "POST", "/discord/voice/play", { channelId: voiceCh }, cbAuth);
+    const closed = await api(base, "POST", "/discord/voice/stream", { op: "close" }, cbAuth);
+    check("voice stream open blocks play (409) until closed", open.status === 200 && busy.status === 409 && closed.body.closed === true, `${open.status}/${busy.status}`);
+    const audit = readFileSync(join(dir, "data", "audit.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const att = audit.filter((l) => l.action === "attachment");
+    const text = JSON.stringify(audit);
+    check(
+      "attachment + planner + voice audit lines are content-free (counts, kinds, codes; no names, URLs or text)",
+      att.length >= 3 && audit.some((l) => l.action === "planner") && audit.some((l) => l.action === "voice") && !/render\.png|summary|voice-message|127\.0\.0\.1|sky purple|planner-token/.test(text),
+      `${att.length} attachment lines`,
+    );
+    say();
+    say("```");
+    for (const l of audit.filter((x) => ["attachment", "planner", "voice"].includes(x.action))) say(JSON.stringify(l));
+    say("```");
+  } finally {
+    await svc.stop();
+    await routine.close();
+    await planner.close();
+    await cdn.close();
+  }
+}
+
 const started = Date.now();
 say(`## Local end-to-end smoke (${process.platform}, node ${process.version})`);
 say();
 try {
   await partA();
   await partB();
+  await partC();
 } catch (err) {
   failures += 1;
   say(`- [ ] smoke run threw: ${(err as Error).message}`);

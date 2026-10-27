@@ -19,7 +19,10 @@ export type AuditAction =
   | "ingest"
   | "reply_read"
   | "wake"
-  | "observe";
+  | "observe"
+  | "attachment"
+  | "planner"
+  | "voice";
 
 export interface AuditEntry {
   adapter: string;
@@ -37,9 +40,13 @@ export interface AuditEntry {
   status?: number;
   tries?: number;
   ms?: number;
+  /** Attachment lines: file count, total bytes, comma list of kinds (image,text,...). Never names or content. */
+  count?: number;
+  bytes?: number;
+  kinds?: string;
 }
 
-const KEEP = ["adapter", "action", "outcome", "reason", "agent", "route", "type", "status", "tries", "ms"] as const;
+const KEEP = ["adapter", "action", "outcome", "reason", "agent", "route", "type", "status", "tries", "ms", "count", "bytes", "kinds"] as const;
 const MASK = ["eventId", "lane", "actor"] as const;
 
 export interface AuditSink {

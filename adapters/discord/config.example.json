@@ -6,8 +6,13 @@
     {
       "id": "example-chat",
       "enabled": true,
-      "match": { "guild": "111111111111111111", "channel": "222222222222222222" },
-      "allowActors": ["333333333333333333"],
+      "match": {
+        "guild": "111111111111111111",
+        "channel": "222222222222222222"
+      },
+      "allowActors": [
+        "333333333333333333"
+      ],
       "allowGroups": [],
       "agent": "example-agent",
       "requireAddressed": true,
@@ -16,10 +21,46 @@
     {
       "id": "example-dm",
       "enabled": false,
-      "match": { "dm": "true" },
-      "allowActors": ["333333333333333333"],
+      "match": {
+        "dm": "true"
+      },
+      "allowActors": [
+        "333333333333333333"
+      ],
       "agent": "example-agent",
       "slug": "dm"
+    },
+    {
+      "id": "example-planner",
+      "enabled": true,
+      "match": {
+        "guild": "111111111111111111",
+        "channel": "200000000000000001"
+      },
+      "allowActors": [
+        "333333333333333333"
+      ],
+      "agent": "example-agent",
+      "requireAddressed": true,
+      "slug": "example-media",
+      "handler": "local-planner"
     }
-  ]
+  ],
+  "attachments": {
+    "allowHttpHosts": []
+  },
+  "planner": {
+    "urlRef": "env:DISCORD_PLANNER_URL",
+    "tokenRef": "env:DISCORD_PLANNER_TOKEN",
+    "pulseMaxMs": 1800000
+  },
+  "voice": {
+    "enabled": false,
+    "channels": [
+      "777777777777777777"
+    ],
+    "piperHostRef": "env:PIPER_HOST",
+    "piperPortRef": "env:PIPER_PORT",
+    "grokApiKeyRef": "env:GROK_VOICE_API_KEY"
+  }
 }

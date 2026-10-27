@@ -28,6 +28,14 @@ export interface AdapterContext {
   audit(entry: Omit<AuditEntry, "adapter">): void;
   /** Register an HTTP route under /<adapter>/... */
   route(method: "GET" | "POST", subpath: string, handler: Handler, opts?: { maxBytes?: number }): void;
+  /** Same, behind the adapter's callback token + rate limit (agent-facing routes such as voice). */
+  authedRoute(
+    method: "GET" | "POST",
+    subpath: string,
+    action: AuditEntry["action"],
+    handler: Handler,
+    opts?: { maxBytes?: number },
+  ): void;
   secret(ref: string | undefined): string | undefined;
   state(eventId: string): EventState | undefined;
   /** Raw value of an env:/file: reference (no placeholder filtering). Throws on a bad shape. */
@@ -125,6 +133,8 @@ export class Bridge {
       check: (event) => authorize(adapter.routes, event),
       audit: (entry) => this.opts.audit.write({ ...entry, adapter: name }),
       route: (method, subpath, handler, o) => this.opts.http.route(method, `/${name}/${subpath.replace(/^\/+/, "")}`, handler, o),
+      authedRoute: (method, subpath, action, handler, o) =>
+        this.opts.http.route(method, `/${name}/${subpath.replace(/^\/+/, "")}`, this.guard(adapter, action, handler), o),
       secret: (ref) => resolveSecret(ref, this.opts.env ?? process.env),
       raw: (ref) => readRef(ref, this.opts.env ?? process.env),
       state: (eventId) => this.stateOf(`${name}:${eventId}`),
@@ -230,37 +240,45 @@ export class Bridge {
   }
 
   private registerCallback(adapter: SourceAdapter): void {
-    const name = adapter.name;
     this.opts.http.route(
       "POST",
-      `/${name}/callback`,
-      async (req) => {
-        const expected = resolveSecret(adapter.callbackTokenRef, this.opts.env ?? process.env);
-        const audit = (outcome: AuditEntry["outcome"], reason?: string, status?: number) =>
-          this.opts.audit.write({ adapter: name, action: "callback", outcome, reason, status });
-        if (!expected) {
-          audit("deny", "callback_token_unset", 503);
-          return { status: 503, body: { ok: false, error: "callback_disabled" } };
-        }
-        if (req.query.has("token")) {
-          audit("deny", "query_token_refused", 400);
-          return { status: 400, body: { ok: false, error: "use the Authorization header, not ?token=" } };
-        }
-        const got = tokenFromHeaders(req.headers);
-        if (!safeEqual(got, expected)) {
-          audit("deny", "bad_token", 401);
-          return { status: 401, body: { ok: false, error: "unauthorized" } };
-        }
-        const rl = this.limiter.check(name);
-        if (!rl.allowed) {
-          audit("deny", "rate_limited", 429);
-          return { status: 429, body: { ok: false, error: "rate_limited" }, headers: { "retry-after": String(rl.retryAfterSec) } };
-        }
-        const out = await adapter.handleCallback!(req.body);
-        audit(out.status < 400 ? "ok" : "error", (out.body as { error?: string } | null)?.error, out.status);
-        return out;
-      },
+      `/${adapter.name}/callback`,
+      this.guard(adapter, "callback", (req) => adapter.handleCallback!(req.body)),
       { maxBytes: adapter.callbackMaxBytes },
     );
+  }
+
+  /**
+   * Callback auth for any agent-facing route: header-only bearer (constant
+   * time), ?token= refused, 503 when no token is configured, shared rate limit.
+   */
+  private guard(adapter: SourceAdapter, action: AuditEntry["action"], handler: Handler): Handler {
+    const name = adapter.name;
+    return async (req) => {
+      const expected = resolveSecret(adapter.callbackTokenRef, this.opts.env ?? process.env);
+      const audit = (outcome: AuditEntry["outcome"], reason?: string, status?: number) =>
+        this.opts.audit.write({ adapter: name, action, outcome, reason, status });
+      if (!expected) {
+        audit("deny", "callback_token_unset", 503);
+        return { status: 503, body: { ok: false, error: "callback_disabled" } };
+      }
+      if (req.query.has("token")) {
+        audit("deny", "query_token_refused", 400);
+        return { status: 400, body: { ok: false, error: "use the Authorization header, not ?token=" } };
+      }
+      const got = tokenFromHeaders(req.headers);
+      if (!safeEqual(got, expected)) {
+        audit("deny", "bad_token", 401);
+        return { status: 401, body: { ok: false, error: "unauthorized" } };
+      }
+      const rl = this.limiter.check(name);
+      if (!rl.allowed) {
+        audit("deny", "rate_limited", 429);
+        return { status: 429, body: { ok: false, error: "rate_limited" }, headers: { "retry-after": String(rl.retryAfterSec) } };
+      }
+      const out = await handler(req);
+      audit(out.status < 400 ? "ok" : "error", (out.body as { error?: string } | null)?.error, out.status);
+      return out;
+    };
   }
 }
