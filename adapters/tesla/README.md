@@ -7,7 +7,7 @@ The bridge's half of the Tesla split. It turns vehicle telemetry and energy-site
 
 ## Hard rules (enforced by the validator and the tests)
 
-* A config with `commands`/`actions` keys, a `vehicle_data` / `wake_up` / `command/` path, or any `refresh*` key is refused.
+* A config with `commands`/`actions` keys, a `vehicle_data` / `wake_up` / `command/` path, or any refresh-token key (`refresh_token`, `refreshTokenRef`, ...) is refused.
 * Replies go back through the agent's **origin channel**, so there's no `/tesla/callback` route.
 * Prompts and audit carry a **masked** VIN or site id (last 4 characters) only. There's no full-VIN opt-in: agents that need the VIN get it from the plugin's `list_vehicles`, and prompts end up in logs and transcripts.
 
