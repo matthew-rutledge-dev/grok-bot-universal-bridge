@@ -1,42 +1,47 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { validateRoutes } from "../../core/allowlist.js";
 import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
 import { maskId } from "../../core/redact.js";
 import { isSecretRef } from "../../core/secrets.js";
 import type { Route } from "../../core/types.js";
+import {
+  deriveEnergyTriggers,
+  EnergyApiError,
+  FleetEnergyClient,
+  gridOutage,
+  hasEnergyData,
+  unintentionalOutage,
+  type EnergyStatus,
+  type EnergyStatusSource,
+  type EnergyTrigger,
+  type FetchLike,
+} from "./energy.js";
+import { deriveVehicleTriggers, KNOWN_FIELDS, mergeState, REPLACED_FIELDS, type TelemetryRecord, type TelemetryValue, type TriggerHit, type VehicleTrigger } from "./fields.js";
+import { DecodedJsonReceiver, isLoopbackHost, MtlsTelemetryReceiver, splitListen, type DropReason, type TelemetryReceiver } from "./receiver.js";
+
+export * from "./fields.js";
+export * from "./energy.js";
+export * from "./receiver.js";
 
 /**
- * Tesla source adapter: SKELETON (not wired to a live receiver yet).
+ * Tesla source adapter.
  *
  * Split with the Tesla plugin:
- *   bridge (here): Fleet Telemetry receiver (mTLS), energy live_status polling,
- *                  filter + debounce, wake rules, VIN/site allowlists, hold-retry, audit.
- *   plugin:        OAuth/refresh, Fleet API client, read + command tools, safety
+ *   bridge (here): telemetry receiver (decoded JSON from fleet-telemetry, or mTLS), energy
+ *                  live_status polling, filter + debounce, wake rules, VIN/site allowlists,
+ *                  hold-retry, audit.
+ *   plugin:        OAuth and token refresh, Fleet API client, read + command tools, safety
  *                  (read-only fail-closed, confirm, dry-run, state_unknown), proxy client.
  *
  * Hard rules enforced here:
  *   - The bridge NEVER sends vehicle commands (config with commands is refused).
- *   - Never poll vehicle_data (it wakes the car). Vehicles are push-only via telemetry.
+ *   - Never poll vehicle_data or wake a car. Vehicles are push-only via telemetry.
+ *   - Energy uses an ACCESS token only (energy_device_data). Refresh tokens are refused.
  *   - Replies go back through the agent's origin channel; there is no /tesla/callback.
- *   - Audit: event type, masked VIN, timestamp. Nothing else about the car.
- *
- * What is still a stub: the mTLS telemetry server and the energy HTTP client.
- * Both are interfaces (TelemetryReceiver, EnergyStatusSource) injected at
- * construction; without them, enabling telemetry or polling fails at start.
+ *   - Prompts and audit carry a masked VIN / site id only.
  */
 
-export type VehicleTrigger =
-  | "charge_complete"
-  | "charge_stopped"
-  | "plugged_in"
-  | "unplugged"
-  | "door_open_parked"
-  | "trunk_open_parked"
-  | "sentry_alert"
-  | "low_battery"
-  | "update_available";
-
-export type EnergyTrigger = "grid_islanded" | "battery_below_reserve" | "storm_watch";
 export type TeslaTrigger = VehicleTrigger | EnergyTrigger;
 
 export const VEHICLE_TRIGGERS: VehicleTrigger[] = [
@@ -55,13 +60,23 @@ export interface TeslaRule {
 export interface TeslaConfig {
   telemetry?: {
     enabled: boolean;
+    /** "decoded" (default): loopback JSON from Tesla's fleet-telemetry server. "mtls": the bridge terminates mTLS. */
+    mode?: "decoded" | "mtls";
+    /** decoded mode: loopback host:port for POST /records. */
+    decoded_listen?: string;
+    /** decoded mode: optional bearer for the loopback listener. */
+    decoded_token_ref?: string;
+    /** mtls mode. */
     listen?: string;
     public_hostname?: string;
     tls_cert?: string;
     tls_key?: string;
+    /** Tesla vehicle CA (client certs are verified against it). */
     client_ca?: string;
     vin_allowlist: string[];
-    /** Field -> minimum interval seconds requested in fleet_telemetry_config. */
+    /** Must stay true: the vehicle config is pushed with prefer_typed so enums/structs arrive typed. */
+    prefer_typed?: boolean;
+    /** Field -> minimum interval seconds requested in fleet_telemetry_config (pushed by the plugin). */
     fields?: Record<string, number>;
     low_battery_percent?: number;
   };
@@ -69,41 +84,22 @@ export interface TeslaConfig {
     enabled: boolean;
     interval_s?: number;
     site_allowlist: string[];
+    /** Region Fleet API base URL (https). */
+    api_base?: string;
+    /** env:/file: ref to an ACCESS token (scope energy_device_data). Re-read every poll. */
     token_ref?: string;
     reserve_margin_percent?: number;
+    /** site_info (backup_reserve_percent) cache, seconds. Default 600. */
+    site_info_ttl_s?: number;
   };
   rules: TeslaRule[];
   reply?: { via: "origin_channel" };
   routes: Route[];
 }
 
-/** One decoded Fleet Telemetry record (field names per Tesla's schema; confirm with the plugin author). */
-export interface TelemetryRecord {
-  vin: string;
-  createdAt: string;
-  data: Record<string, string | number | boolean | null>;
-}
-
-export interface EnergyStatus {
-  siteId: string;
-  gridStatus?: string;
-  percentCharged?: number;
-  backupReservePercent?: number;
-  stormModeActive?: boolean;
-}
-
-/** mTLS Fleet Telemetry server. Implemented later; the skeleton only defines the seam. */
-export interface TelemetryReceiver {
-  start(onRecord: (r: TelemetryRecord) => void): Promise<void>;
-  stop(): Promise<void>;
-}
-
-/** Energy live_status reader (site endpoint only, never vehicle_data). */
-export interface EnergyStatusSource {
-  liveStatus(siteId: string): Promise<EnergyStatus>;
-}
-
 const FORBIDDEN_KEYS = /^(commands?|command_tools|vehicle_commands|actions?)$/i;
+const REFRESH_KEYS = /refresh_?token/i;
+const PEM_KEYS = ["tls_cert", "tls_key", "client_ca"] as const;
 
 export function validateTeslaConfig(raw: unknown): string[] {
   const c = raw as Partial<TeslaConfig> | null;
@@ -113,7 +109,9 @@ export function validateTeslaConfig(raw: unknown): string[] {
     if (!o || typeof o !== "object") return;
     for (const [k, v] of Object.entries(o)) {
       if (FORBIDDEN_KEYS.test(k)) p.push(`tesla: ${path}${k} refused: the bridge never sends vehicle commands`);
+      if (REFRESH_KEYS.test(k)) p.push(`tesla: ${path}${k} refused: give the bridge an access token only (refresh tokens rotate and are single-use; the plugin owns refresh)`);
       if (typeof v === "string" && /vehicle_data/i.test(v)) p.push(`tesla: ${path}${k} refused: never poll vehicle_data`);
+      if (typeof v === "string" && /\/wake_up\b|\/command\//i.test(v)) p.push(`tesla: ${path}${k} refused: the bridge never wakes cars or sends commands`);
       walk(v, `${path}${k}.`);
     }
   };
@@ -124,16 +122,51 @@ export function validateTeslaConfig(raw: unknown): string[] {
     if (![...VEHICLE_TRIGGERS, ...ENERGY_TRIGGERS].includes(r.on)) p.push(`tesla.rules[${i}]: unknown trigger ${String(r.on)}`);
     if (typeof r.wake !== "boolean") p.push(`tesla.rules[${i}]: wake must be true or false`);
   }
-  if (c.telemetry && !Array.isArray(c.telemetry.vin_allowlist)) p.push("tesla.telemetry.vin_allowlist must be an array");
-  if (c.energy_poll && !Array.isArray(c.energy_poll.site_allowlist)) p.push("tesla.energy_poll.site_allowlist must be an array");
-  for (const k of ["tls_cert", "tls_key", "client_ca"] as const) {
-    const v = c.telemetry?.[k];
-    if (v !== undefined && !isSecretRef(v)) p.push(`tesla.telemetry.${k} must be file:/path or env:NAME`);
+  const t = c.telemetry;
+  if (t) {
+    if (!Array.isArray(t.vin_allowlist)) p.push("tesla.telemetry.vin_allowlist must be an array");
+    for (const v of t.vin_allowlist ?? []) if (typeof v !== "string" || !/^[A-HJ-NPR-Z0-9]{17}$/.test(v)) p.push("tesla.telemetry.vin_allowlist entries must be 17-character VINs");
+    if (t.prefer_typed === false) p.push("tesla.telemetry.prefer_typed must be true (enums and DoorState are parsed as typed values)");
+    const doorRules = (c.rules ?? []).filter((r) => (r.on === "door_open_parked" || r.on === "trunk_open_parked") && r.wake).map((r) => r.on);
+    if (doorRules.length && t.fields && !("Gear" in t.fields)) {
+      p.push(`tesla.telemetry.fields must include Gear when ${doorRules.join("/")} wakes (without Gear the car counts as parked)`);
+    }
+    if (doorRules.length && t.fields && !("DoorState" in t.fields)) p.push(`tesla.telemetry.fields must include DoorState when ${doorRules.join("/")} wakes`);
+    for (const f of Object.keys(t.fields ?? {})) {
+      if (REPLACED_FIELDS[f]) p.push(`tesla.telemetry.fields.${f}: not a usable field; use ${REPLACED_FIELDS[f]}`);
+      else if (!(KNOWN_FIELDS as readonly string[]).includes(f)) p.push(`tesla.telemetry.fields.${f}: not read by the trigger logic (known: ${KNOWN_FIELDS.join(", ")})`);
+    }
+    const mode = t.mode ?? "decoded";
+    if (mode !== "decoded" && mode !== "mtls") p.push('tesla.telemetry.mode must be "decoded" or "mtls"');
+    for (const k of PEM_KEYS) {
+      const v = t[k];
+      if (v !== undefined && !isSecretRef(v)) p.push(`tesla.telemetry.${k} must be file:/path or env:NAME`);
+    }
+    if (t.decoded_token_ref !== undefined && !isSecretRef(t.decoded_token_ref)) p.push("tesla.telemetry.decoded_token_ref must be env:NAME or file:/path");
+    if (t.enabled && mode === "mtls") {
+      for (const k of [...PEM_KEYS, "listen"] as const) if (!t[k]) p.push(`tesla.telemetry.${k} is required in mtls mode`);
+    }
+    if (mode === "decoded" && t.decoded_listen !== undefined) {
+      try {
+        if (!isLoopbackHost(splitListen(t.decoded_listen).host)) p.push("tesla.telemetry.decoded_listen must be a loopback address");
+      } catch {
+        p.push("tesla.telemetry.decoded_listen must be host:port");
+      }
+    }
+    if (t.enabled && mode === "decoded" && !t.decoded_listen) p.push("tesla.telemetry.decoded_listen is required in decoded mode");
   }
-  if (c.energy_poll?.token_ref !== undefined && !isSecretRef(c.energy_poll.token_ref)) {
-    p.push("tesla.energy_poll.token_ref must be env:NAME or file:/path (the host renders vault values into one of these)");
+  const e = c.energy_poll;
+  if (e) {
+    if (!Array.isArray(e.site_allowlist)) p.push("tesla.energy_poll.site_allowlist must be an array");
+    if (e.token_ref !== undefined && !isSecretRef(e.token_ref)) {
+      p.push("tesla.energy_poll.token_ref must be env:NAME or file:/path (the host renders the access token into one of these)");
+    }
+    if (e.interval_s !== undefined && e.interval_s < 60) p.push("tesla.energy_poll.interval_s must be >= 60");
+    if (e.site_info_ttl_s !== undefined && e.site_info_ttl_s < 60) p.push("tesla.energy_poll.site_info_ttl_s must be >= 60");
+    if (e.api_base !== undefined && !/^https:\/\/[^/]+/.test(e.api_base)) p.push("tesla.energy_poll.api_base must be an https URL");
+    if (e.enabled && !e.api_base) p.push("tesla.energy_poll.api_base is required when enabled");
+    if (e.enabled && !e.token_ref) p.push("tesla.energy_poll.token_ref is required when enabled");
   }
-  if (c.energy_poll?.interval_s !== undefined && c.energy_poll.interval_s < 60) p.push("tesla.energy_poll.interval_s must be >= 60");
   for (const [i, r] of (c.routes ?? []).entries()) {
     const keys = Object.keys(r.match ?? {});
     if (keys.length !== 1 || keys[0] !== "kind" || !["vehicle", "energy"].includes(String(r.match.kind))) {
@@ -141,44 +174,6 @@ export function validateTeslaConfig(raw: unknown): string[] {
     }
   }
   return p;
-}
-
-const str = (v: unknown) => (v === null || v === undefined ? "" : String(v));
-
-/** Turn a change between two telemetry snapshots into triggers. Field names need confirmation. */
-export function deriveVehicleTriggers(
-  prev: TelemetryRecord["data"] | undefined,
-  next: TelemetryRecord["data"],
-  opts: { lowBatteryPercent?: number } = {},
-): VehicleTrigger[] {
-  const p = prev ?? {};
-  const out: VehicleTrigger[] = [];
-  const changed = (k: string) => k in next && str(next[k]) !== str(p[k]);
-  const parked = str(next.Gear ?? p.Gear) === "P" || str(next.Gear ?? p.Gear) === "";
-  if (changed("ChargeState")) {
-    const v = str(next.ChargeState);
-    if (v === "Complete") out.push("charge_complete");
-    if (v === "Stopped") out.push("charge_stopped");
-  }
-  if (changed("ChargeCableConnected")) out.push(next.ChargeCableConnected === true || str(next.ChargeCableConnected) === "true" ? "plugged_in" : "unplugged");
-  if (changed("DoorState") && /open/i.test(str(next.DoorState)) && parked) out.push("door_open_parked");
-  if (changed("TrunkOpen") && (next.TrunkOpen === true || str(next.TrunkOpen) === "true") && parked) out.push("trunk_open_parked");
-  if (changed("SentryAlert") && (next.SentryAlert === true || str(next.SentryAlert) === "true")) out.push("sentry_alert");
-  const low = opts.lowBatteryPercent ?? 20;
-  if ("Soc" in next && typeof next.Soc === "number" && next.Soc < low && !(typeof p.Soc === "number" && p.Soc < low)) out.push("low_battery");
-  if (changed("SoftwareUpdateAvailable") && (next.SoftwareUpdateAvailable === true || str(next.SoftwareUpdateAvailable) === "true")) out.push("update_available");
-  return out;
-}
-
-export function deriveEnergyTriggers(prev: EnergyStatus | undefined, next: EnergyStatus, marginPercent = 5): EnergyTrigger[] {
-  const out: EnergyTrigger[] = [];
-  if (/islanded/i.test(next.gridStatus ?? "") && !/islanded/i.test(prev?.gridStatus ?? "")) out.push("grid_islanded");
-  const reserve = next.backupReservePercent;
-  const below = (s: EnergyStatus | undefined) =>
-    s?.percentCharged !== undefined && s.backupReservePercent !== undefined && s.percentCharged < s.backupReservePercent + marginPercent;
-  if (reserve !== undefined && below(next) && !below(prev)) out.push("battery_below_reserve");
-  if (next.stormModeActive === true && prev?.stormModeActive !== true) out.push("storm_watch");
-  return out;
 }
 
 /** Per key debounce: a trigger fires again only after debounce_s. */
@@ -192,47 +187,121 @@ export class Debouncer {
   }
 }
 
+export interface TeslaDeps {
+  receiver?: TelemetryReceiver;
+  energy?: EnergyStatusSource;
+  fetchImpl?: FetchLike;
+  now?: () => number;
+  /** Poll energy once right at start (default true). */
+  pollOnStart?: boolean;
+  /** decoded listener request timeout (default 10 s). */
+  decodedRequestTimeoutMs?: number;
+}
+
+const MAX_AUTH_BACKOFF_S = 3600;
+
 export class TeslaAdapter implements SourceAdapter {
   readonly name = "tesla";
   readonly routes: Route[];
   /** No callback: replies go through the agent's origin channel. */
   readonly callbackTokenRef = undefined;
   private ctx!: AdapterContext;
-  private readonly lastVehicle = new Map<string, TelemetryRecord["data"]>();
+  private readonly lastVehicle = new Map<string, Record<string, TelemetryValue>>();
+  private readonly lastCreatedAt = new Map<string, number>();
   private readonly lastEnergy = new Map<string, EnergyStatus>();
+  private readonly reserveCache = new Map<string, { value: number | undefined; at: number }>();
   private readonly debounce = new Debouncer();
   private timer: ReturnType<typeof setInterval> | undefined;
+  private receiver?: TelemetryReceiver;
+  private energy?: EnergyStatusSource;
+  private polling = false;
+  private skipUntil = 0;
+  private skipReason = "";
+  private authFailures = 0;
+  private lastTokenUsed: string | undefined;
+  private readonly now: () => number;
 
   constructor(
     private readonly cfg: TeslaConfig,
-    private readonly deps: { receiver?: TelemetryReceiver; energy?: EnergyStatusSource } = {},
+    private readonly deps: TeslaDeps = {},
   ) {
     const problems = validateTeslaConfig(cfg);
     if (problems.length) throw new Error(problems.join("; "));
     this.routes = cfg.routes;
+    this.now = deps.now ?? Date.now;
   }
 
   init(ctx: AdapterContext): void {
     this.ctx = ctx;
   }
 
+  /** PEM from a ref: file: is read whole (multi-line), env: may use literal \n. */
+  private pem(ref: string): string {
+    const r = ref.trim();
+    const v = r.startsWith("file:") ? readFileSync(r.slice(5), "utf8") : (this.ctx.raw(r) ?? "").replace(/\\n/g, "\n");
+    if (!v.includes("-----BEGIN")) throw new Error(`tesla: ${r.startsWith("file:") ? "file" : r} does not hold a PEM block`);
+    return v;
+  }
+
+  /** Access token, re-read from its ref on every call. */
+  private token(): string | undefined {
+    const v = this.ctx.secret(this.cfg.energy_poll?.token_ref);
+    this.lastTokenUsed = v;
+    return v;
+  }
+
   async start(): Promise<void> {
-    if (this.cfg.telemetry?.enabled) {
-      if (!this.deps.receiver) throw new Error("tesla: telemetry.enabled but no mTLS receiver is implemented yet (skeleton)");
-      await this.deps.receiver.start((r) => void this.ingestTelemetry(r));
+    const t = this.cfg.telemetry;
+    if (t?.enabled) {
+      this.receiver =
+        this.deps.receiver ??
+        ((t.mode ?? "decoded") === "mtls"
+          ? new MtlsTelemetryReceiver({ listen: t.listen!, cert: this.pem(t.tls_cert!), key: this.pem(t.tls_key!), clientCa: this.pem(t.client_ca!) })
+          : this.decodedReceiver(t));
+      await this.receiver.start({
+        record: (r) =>
+          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin })),
+        drop: (reason, vin) => this.dropped(reason, vin),
+      });
     }
-    if (this.cfg.energy_poll?.enabled) {
-      if (!this.deps.energy) throw new Error("tesla: energy_poll.enabled but no energy status source is implemented yet (skeleton)");
-      const every = Math.max(60, this.cfg.energy_poll.interval_s ?? 300) * 1000;
-      this.timer = setInterval(() => void this.pollEnergyOnce(), every);
+    const e = this.cfg.energy_poll;
+    if (e?.enabled) {
+      this.energy = this.deps.energy ?? new FleetEnergyClient({ apiBase: e.api_base!, getToken: () => this.token(), fetchImpl: this.deps.fetchImpl });
+      const every = Math.max(60, e.interval_s ?? 300) * 1000;
+      this.timer = setInterval(() => this.safeTick(), every);
       this.timer.unref?.();
+      if (this.deps.pollOnStart !== false) this.safeTick();
     }
-    this.ctx.log.info(`[tesla] skeleton started telemetry=${Boolean(this.cfg.telemetry?.enabled)} energy=${Boolean(this.cfg.energy_poll?.enabled)}`);
+    this.ctx.log.info(`[tesla] started telemetry=${t?.enabled ? (t.mode ?? "decoded") : "off"} energy=${Boolean(e?.enabled)}`);
+  }
+
+  private decodedReceiver(t: NonNullable<TeslaConfig["telemetry"]>): DecodedJsonReceiver {
+    const ref = t.decoded_token_ref;
+    if (ref && !this.ctx.secret(ref)) {
+      throw new Error(`tesla: telemetry.decoded_token_ref is set but does not resolve (${ref.startsWith("file:") ? "file" : ref})`);
+    }
+    return new DecodedJsonReceiver({
+      listen: t.decoded_listen!,
+      token: ref ? () => this.ctx.secret(ref) : undefined,
+      requestTimeoutMs: this.deps.decodedRequestTimeoutMs,
+    });
+  }
+
+  /** Timer/start entry: never lets a rejection escape. */
+  private safeTick(): void {
+    this.tick().catch(() => {
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "poll_failed" });
+    });
   }
 
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
-    await this.deps.receiver?.stop().catch(() => undefined);
+    await this.receiver?.stop().catch(() => undefined);
+  }
+
+  /** Bound telemetry port (tests / ops). */
+  telemetryPort(): number {
+    return this.receiver?.port?.() ?? 0;
   }
 
   vinAllowed(vin: string): boolean {
@@ -243,27 +312,122 @@ export class TeslaAdapter implements SourceAdapter {
     return (this.cfg.energy_poll?.site_allowlist ?? []).includes(site);
   }
 
+  private dropped(reason: DropReason, vin?: string): void {
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin });
+  }
+
   /** Feed one decoded telemetry record (called by the receiver). Returns triggers submitted. */
   async ingestTelemetry(r: TelemetryRecord): Promise<TeslaTrigger[]> {
     if (!this.vinAllowed(r.vin)) {
       this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: r.vin });
       return [];
     }
+    if (r.isResend) {
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", actor: r.vin });
+      return [];
+    }
+    const at = Date.parse(r.createdAt);
+    const last = this.lastCreatedAt.get(r.vin);
+    if (!Number.isNaN(at) && last !== undefined && at < last) {
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "stale_record", actor: r.vin });
+      return [];
+    }
+    if (!Number.isNaN(at)) this.lastCreatedAt.set(r.vin, at);
     const prev = this.lastVehicle.get(r.vin);
-    this.lastVehicle.set(r.vin, { ...(prev ?? {}), ...r.data });
-    const triggers = deriveVehicleTriggers(prev, r.data, { lowBatteryPercent: this.cfg.telemetry?.low_battery_percent });
-    return this.fire("vehicle", r.vin, triggers, r.createdAt);
+    const { next, delta } = mergeState(prev, r.data);
+    this.lastVehicle.set(r.vin, next);
+    const hits = deriveVehicleTriggers(prev, delta, { lowBatteryPercent: this.cfg.telemetry?.low_battery_percent });
+    return this.fire("vehicle", r.vin, hits, r.createdAt || new Date(this.now()).toISOString());
+  }
+
+  /** Timer entry: skip when a poll is still running or while backing off. */
+  async tick(): Promise<TeslaTrigger[]> {
+    if (this.polling) {
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "poll_in_progress" });
+      return [];
+    }
+    if (this.now() < this.skipUntil) {
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: `backoff_${this.skipReason}` });
+      return [];
+    }
+    this.polling = true;
+    try {
+      return await this.pollEnergyOnce();
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private backoff(reason: string, sec: number): void {
+    this.skipReason = reason;
+    this.skipUntil = this.now() + sec * 1000;
+  }
+
+  /** Map an energy error to an audit line and back-off. Returns true when the poll round must stop. */
+  private onEnergyError(err: unknown, site: string, what: "live_status" | "site_info"): boolean {
+    const e = err instanceof EnergyApiError ? err : new EnergyApiError("fleet_api_unreachable");
+    this.ctx.audit({ action: "observe", outcome: "error", reason: e.code, type: what, actor: site, status: e.status });
+    const interval = Math.max(60, this.cfg.energy_poll?.interval_s ?? 300);
+    if (e.code === "rate_limited") {
+      this.backoff("rate_limited", e.retryAfterSec ?? 60);
+      return true;
+    }
+    if (e.code === "unauthorized" || e.code === "login_required" || e.code === "missing_scope" || e.code === "no_token") {
+      this.authFailures++;
+      this.backoff(e.code, Math.min(MAX_AUTH_BACKOFF_S, interval * 2 ** (this.authFailures - 1)));
+      return true;
+    }
+    return false;
+  }
+
+  private async call<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      // After a 401, re-read the token ref once: if the plugin/host rotated the access token, retry with it.
+      if (err instanceof EnergyApiError && err.code === "unauthorized") {
+        const used = this.lastTokenUsed;
+        const fresh = this.ctx.secret(this.cfg.energy_poll?.token_ref);
+        if (fresh && fresh !== used) return await fn();
+      }
+      throw err;
+    }
+  }
+
+  private async reserve(site: string): Promise<{ value: number | undefined; stop: boolean }> {
+    const src = this.energy!;
+    const cached = this.reserveCache.get(site);
+    const ttl = Math.max(60, this.cfg.energy_poll?.site_info_ttl_s ?? 600) * 1000;
+    if (!src.backupReserve || (cached && this.now() - cached.at < ttl)) return { value: cached?.value, stop: false };
+    try {
+      const value = await this.call(() => src.backupReserve!(site));
+      this.reserveCache.set(site, { value: value ?? cached?.value, at: this.now() });
+      return { value: value ?? cached?.value, stop: false };
+    } catch (err) {
+      return { value: cached?.value, stop: this.onEnergyError(err, site, "site_info") };
+    }
   }
 
   /** One energy poll across the allowlisted sites. */
   async pollEnergyOnce(): Promise<TeslaTrigger[]> {
     const fired: TeslaTrigger[] = [];
+    if (!this.energy) return fired;
     for (const site of this.cfg.energy_poll?.site_allowlist ?? []) {
+      let s: EnergyStatus;
       try {
-        const s = await this.deps.energy!.liveStatus(site);
+        s = await this.call(() => this.energy!.liveStatus(site));
+      } catch (err) {
+        if (this.onEnergyError(err, site, "live_status")) break;
+        continue;
+      }
+      this.authFailures = 0;
+      if (s.backupReservePercent === undefined) {
+        const r = await this.reserve(site);
+        if (r.value !== undefined) s = { ...s, backupReservePercent: r.value };
         fired.push(...(await this.ingestEnergy(s)));
-      } catch {
-        this.ctx.audit({ action: "observe", outcome: "error", reason: "energy_poll_failed", actor: site });
+        if (r.stop) break;
+      } else {
+        fired.push(...(await this.ingestEnergy(s)));
       }
     }
     return fired;
@@ -274,17 +438,27 @@ export class TeslaAdapter implements SourceAdapter {
       this.ctx.audit({ action: "inbound", outcome: "deny", reason: "site_not_allowlisted", actor: s.siteId });
       return [];
     }
+    if (!hasEnergyData(s)) {
+      // Keep the last good status: overwriting it with a gap would re-arm grid_islanded.
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "no_data", actor: s.siteId });
+      return [];
+    }
     const prev = this.lastEnergy.get(s.siteId);
-    this.lastEnergy.set(s.siteId, s);
-    return this.fire("energy", s.siteId, deriveEnergyTriggers(prev, s, this.cfg.energy_poll?.reserve_margin_percent), new Date().toISOString());
+    const merged: EnergyStatus = { ...s };
+    this.lastEnergy.set(s.siteId, merged);
+    const hits = deriveEnergyTriggers(prev, merged, this.cfg.energy_poll?.reserve_margin_percent).map((on) => ({ on }));
+    const detail = gridOutage(merged) ? (unintentionalOutage(merged) ? "unintentional outage" : "intentional off-grid") : undefined;
+    return this.fire("energy", s.siteId, hits, new Date(this.now()).toISOString(), detail);
   }
 
-  private async fire(kind: "vehicle" | "energy", id: string, triggers: TeslaTrigger[], at: string): Promise<TeslaTrigger[]> {
+  private async fire(kind: "vehicle" | "energy", id: string, hits: TriggerHit<TeslaTrigger>[], at: string, detail?: string): Promise<TeslaTrigger[]> {
     const fired: TeslaTrigger[] = [];
-    for (const t of triggers) {
+    for (const h of hits) {
+      const t = h.on;
       const rule = this.cfg.rules.find((r) => r.on === t);
       if (!rule) continue;
-      if (!this.debounce.allow(`${id}:${t}`, rule.debounce_s ?? 0)) {
+      const priority = h.priority ?? rule.priority ?? "normal";
+      if (!this.debounce.allow(`${id}:${t}:${h.priority ?? ""}`, rule.debounce_s ?? 0, this.now())) {
         this.ctx.audit({ action: "observe", outcome: "skipped", reason: "debounced", type: t, actor: id });
         continue;
       }
@@ -292,8 +466,10 @@ export class TeslaAdapter implements SourceAdapter {
         this.ctx.audit({ action: "observe", outcome: "ok", reason: "no_wake_rule", type: t, actor: id });
         continue;
       }
-      const eventId = createHash("sha256").update(`${id}|${t}|${at}`).digest("hex").slice(0, 16);
       const masked = maskId(id);
+      // Only the masked id goes into the hash, so the event id can't be brute-forced back to a VIN.
+      const eventId = createHash("sha256").update(`${kind}|${masked}|${t}|${priority}|${at}`).digest("hex").slice(0, 16);
+      const extra = t === "grid_islanded" && detail ? ` (${detail})` : "";
       const res = await this.ctx.submit({
         eventId,
         lane: `${kind}:${masked}`,
@@ -301,11 +477,11 @@ export class TeslaAdapter implements SourceAdapter {
         match: { kind },
         addressed: true,
         prompt: [
-          `Tesla ${kind} ${masked}: ${t} (priority ${rule.priority ?? "normal"}) at ${at}.`,
+          `Tesla ${kind} ${masked}: ${t}${extra} (priority ${priority}) at ${at}.`,
           "Reply through your origin channel. This bridge sends no vehicle commands; use the Tesla plugin's confirm-gated tools if an action is needed.",
           `\u27C2 t:${t}:${eventId} id=${masked} kind=${kind}`,
         ].join("\n"),
-        metadata: { trigger: t, kind, priority: rule.priority ?? "normal" },
+        metadata: { trigger: t, kind, priority },
       });
       if (res.accepted) fired.push(t);
     }
@@ -313,6 +489,6 @@ export class TeslaAdapter implements SourceAdapter {
   }
 }
 
-export function createTeslaAdapter(cfg: TeslaConfig, deps?: { receiver?: TelemetryReceiver; energy?: EnergyStatusSource }): TeslaAdapter {
+export function createTeslaAdapter(cfg: TeslaConfig, deps?: TeslaDeps): TeslaAdapter {
   return new TeslaAdapter(cfg, deps);
 }

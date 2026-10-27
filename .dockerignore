@@ -1,0 +1,31 @@
+# Keep host-only and generated files out of the build context.
+# Host files (config, registry, .env, secrets) should live OUTSIDE the repo dir,
+# e.g. a sibling <repo>-host/ dir, and be mounted at run time. If an older layout
+# still keeps them inside the checkout, these rules stop them from being sent to
+# the Docker daemon (a locked host dir inside the context breaks the build).
+.git
+.github
+node_modules
+dist
+data
+coverage
+test-results
+*.log
+*.tmp
+*.lcov
+.env
+.env.*
+!.env.example
+config.host
+config.host/
+host
+host/
+*-host
+*-host/
+secrets
+secrets/
+registry*.json
+config/*.json
+!config/*.example.json
+compose.yml
+compose.override.yml
