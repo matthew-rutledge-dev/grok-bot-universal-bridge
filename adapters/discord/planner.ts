@@ -86,7 +86,7 @@ export async function invokePlanner(
   body: PlannerRequest,
   fetchImpl: typeof fetch = fetch,
 ): Promise<PlannerResult> {
-  if (!url?.trim() || !token?.trim()) return { ok: false, status: 0, detail: "planner_not_configured" };
+  if (!url?.trim() || !token?.trim() || !body.callbackUrl) return { ok: false, status: 0, detail: "planner_not_configured" };
   let requestUrl: string;
   try {
     requestUrl = withPlannerQuery(url.trim(), body.messageId, body.callbackUrl, body.statusMessageId);

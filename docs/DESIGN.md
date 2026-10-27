@@ -34,7 +34,9 @@ Runtime: Node 22 + TypeScript, the same as the existing Discord bridge. Runtime 
 ## Config, registry, secrets
 
 * In git: `config/bridge.example.json`, `config/registry.example.json`, `adapters/*/config.example.json`, `.env.example`. They contain placeholders only (`example-agent`, `111…`, `example.com`).
-* On the deployment host only: `config/bridge.json`, the adapter configs, **`registry.json`** (real bot ids and routine URL refs) and `.env`. These files are rendered from the host's secret store by its loader script, owned by the service user, mode 600, mounted **read-only**, and never committed. The bridge never writes them. Deploys must preserve these runtime files. A `.env` change needs `compose up -d --force-recreate`.
+* On the deployment host only: `config/bridge.json`, the adapter configs, **`registry.json`** (real bot ids and routine URL refs) and `.env`. These files are rendered from the host's secret store by its loader script, owned by the service user, mode 600, mounted **read-only**, and never committed. The bridge never writes them. Deploys must preserve these runtime files. A `.env` change needs `compose up -d --force-recreate`. Keep them in a separate host directory (e.g. `config.host/`, mounted read-only at `/app/config`) so the repo's `config/` stays examples-only.
+* Registry aliases are lowercase and case-sensitive (not normalised). A mixed-case alias is rejected with the lowercase fix in the message, and a route `agent` that differs from a registry alias only by case is a startup error.
+* `http.publicBaseUrl` is optional; it's required only when an enabled adapter has a live callback route (`callbackTokenRef` set).
 * State (`data/`: hold file, adapter request records, Discord DM reply channels, audit JSONL) lives in a named volume. There's no shared DB.
 * File modes (600) are applied on POSIX hosts. On Windows `mode` is a no-op, and the data and config directory ACLs must restrict access instead.
 * Prompts carry a routing trailer that starts with `⟂` (U+27C2). Adapters escape that character in all user-controlled text, so only the bridge can write a trailer.
@@ -43,6 +45,7 @@ Runtime: Node 22 + TypeScript, the same as the existing Discord bridge. Runtime 
 ## Deployment and cutover
 
 * A new directory and compose project run **side by side** with today's bridge on their own loopback port (example `127.0.0.1:18090`). There's one process with the adapters enabled per config: one image, one health check, one rollback. The container is split only for different network needs, for example a public mTLS listener for telemetry.
+* Host scripts call `docker compose run -T` / `exec -T`: without `-T` the container reads stdin and eats the rest of a piped script.
 * Ingress: reuse the existing tunnel and hostnames with **path routes per adapter** (`/discord/*`, `/grokbuild/*`, `/tesla/*`). Auth stays in the core (a bearer per adapter); the edge (WAF) is defense in depth.
 * Cutover = **move the tunnel ingress** route from the old bridge to the new port, soak, then retire the old container. Rollback = move the ingress back; deploys are tagged `rollback-pre-<sha>` with a tarball of the previous build.
 * Merge, host deploy, and making the repo public each need the owner's explicit yes.

@@ -43,3 +43,18 @@ test("a literal deliver.url is only accepted for loopback / example.com / .test 
     assert.ok(validateRegistry(mk(bad)).some((p) => /use urlRef/.test(p)), bad);
   }
 });
+
+test("aliases must be lowercase: clear error with the fix, no silent normalising; route case mismatch is named", async () => {
+  const bad = { version: 1, agents: { "Example-Agent": example.agents["example-agent"] } };
+  const msg = validateRegistry(bad).join();
+  assert.match(msg, /registry aliases must be lowercase/);
+  assert.match(msg, /Rename it to "example-agent" here and in every adapter route's "agent" field/);
+  assert.throws(() => Registry.fromObject(bad, {}), /must be lowercase/);
+  const { routeAliasCaseProblem } = await import("./registry.js");
+  assert.equal(
+    routeAliasCaseProblem("Example-Agent", ["example-agent"], "discord.routes[0]"),
+    'discord.routes[0]: agent "Example-Agent" must be lowercase "example-agent" (registry aliases are lowercase and case-sensitive)',
+  );
+  assert.equal(routeAliasCaseProblem("example-agent", ["example-agent"], "x"), undefined);
+  assert.equal(routeAliasCaseProblem("other-agent", ["example-agent"], "x"), undefined, "unknown aliases stay a runtime deny (agent_unknown)");
+});

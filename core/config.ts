@@ -18,7 +18,12 @@ export interface BridgeConfig {
   http: {
     bind: string;
     port: number;
-    publicBaseUrl: string;
+    /**
+     * Public base URL agents use for callbacks (https://bridge.example.com).
+     * Optional; required only when an enabled adapter has a live callback route
+     * (its callbackTokenRef is set). Checked in buildService.
+     */
+    publicBaseUrl?: string;
     /** Inside a container only: allow 0.0.0.0 when the host publishes the port on 127.0.0.1. */
     allowNonLoopbackBind?: boolean;
   };
@@ -50,7 +55,9 @@ export function validateBridgeConfig(raw: unknown): string[] {
   } else if (c.http && !["127.0.0.1", "::1", "localhost"].includes(c.http.bind) && c.http.allowNonLoopbackBind !== true) {
     p.push("http.bind must be loopback (put the tunnel in front); inside a container set allowNonLoopbackBind and publish on 127.0.0.1 only");
   }
-  if (!c.http?.publicBaseUrl) p.push("http.publicBaseUrl required");
+  if (c.http?.publicBaseUrl !== undefined && c.http.publicBaseUrl !== "" && !/^https?:\/\/[^\s/]+(\/[^\s]*)?$/.test(String(c.http.publicBaseUrl))) {
+    p.push("http.publicBaseUrl must be an http(s) URL");
+  }
   if (!c.registryPath) p.push("registryPath required");
   if (!c.adapters || typeof c.adapters !== "object") p.push("adapters required");
   for (const [k, v] of Object.entries(c.wake ?? {})) {
@@ -68,4 +75,15 @@ export function loadBridgeConfig(file: string): LoadedConfig {
   // Relative paths resolve against the working directory (the image uses /app).
   const baseDir = process.cwd();
   return { config: raw, baseDir, path: (p: string) => (isAbsolute(p) ? p : resolve(baseDir, p)) };
+}
+
+/** Adapters whose callback route is live (has a handler and a callback token ref). */
+export function liveCallbackAdapters(adapters: Iterable<{ name: string; handleCallback?: unknown; callbackTokenRef?: string }>): string[] {
+  return [...adapters].filter((a) => typeof a.handleCallback === "function" && Boolean(a.callbackTokenRef)).map((a) => a.name);
+}
+
+/** publicBaseUrl is required only when a callback route is live. */
+export function publicBaseUrlProblem(publicBaseUrl: string | undefined, live: string[]): string | undefined {
+  if (publicBaseUrl || live.length === 0) return undefined;
+  return `http.publicBaseUrl required: callback route enabled for ${live.join(", ")} (set the URL agents call back on, or remove callbackTokenRef)`;
 }

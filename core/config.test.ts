@@ -20,3 +20,19 @@ test("non-loopback bind needs allowNonLoopbackBind", () => {
   assert.match(validateBridgeConfig(withHttp({ bind: "0.0.0.0" })).join(), /must be loopback/);
   assert.deepEqual(validateBridgeConfig(withHttp({ bind: "0.0.0.0", allowNonLoopbackBind: true })), []);
 });
+
+test("publicBaseUrl is optional in the file, still checked when set; required only with a live callback route", async () => {
+  const { publicBaseUrl: _u, ...http } = example.http;
+  assert.deepEqual(validateBridgeConfig({ ...example, http }), []);
+  assert.match(validateBridgeConfig(withHttp({ publicBaseUrl: "bridge.example.com" })).join(), /publicBaseUrl must be an http\(s\) URL/);
+  const { liveCallbackAdapters, publicBaseUrlProblem } = await import("./config.js");
+  const live = liveCallbackAdapters([
+    { name: "discord", handleCallback: () => undefined, callbackTokenRef: "env:X" },
+    { name: "grokbuild", handleCallback: () => undefined },
+    { name: "tesla" },
+  ]);
+  assert.deepEqual(live, ["discord"]);
+  assert.match(publicBaseUrlProblem(undefined, live)!, /publicBaseUrl required: callback route enabled for discord/);
+  assert.equal(publicBaseUrlProblem("https://bridge.example.com", live), undefined);
+  assert.equal(publicBaseUrlProblem(undefined, []), undefined);
+});

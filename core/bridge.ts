@@ -68,7 +68,8 @@ export interface BridgeOptions {
   http: HttpServer;
   holdFile: string;
   holdMaxSec: number;
-  publicBaseUrl: string;
+  /** "" when unset: ctx.callbackUrl is then "" (only allowed when no callback route is live). */
+  publicBaseUrl?: string;
   callbackRateLimitPerMin?: number;
   wake?: WakeHook;
   log?: Logger;
@@ -128,7 +129,7 @@ export class Bridge {
     const ctx: AdapterContext = {
       name,
       log: this.log,
-      callbackUrl: `${this.opts.publicBaseUrl.replace(/\/+$/, "")}/${name}/callback`,
+      callbackUrl: this.opts.publicBaseUrl ? `${this.opts.publicBaseUrl.replace(/\/+$/, "")}/${name}/callback` : "",
       submit: (event) => this.submit(adapter, event),
       check: (event) => authorize(adapter.routes, event),
       audit: (entry) => this.opts.audit.write({ ...entry, adapter: name }),

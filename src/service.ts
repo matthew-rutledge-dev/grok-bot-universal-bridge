@@ -5,11 +5,11 @@ import { DiscordAdapter, type DiscordAdapterConfig } from "../adapters/discord/i
 import type { DiscordPort } from "../adapters/discord/port.js";
 import { JsonlAudit } from "../core/audit.js";
 import { Bridge, type SourceAdapter } from "../core/bridge.js";
-import { loadBridgeConfig } from "../core/config.js";
+import { liveCallbackAdapters, loadBridgeConfig, publicBaseUrlProblem } from "../core/config.js";
 import type { FetchLike } from "../core/deliver.js";
 import { holdRetryDelayMs } from "../core/hold.js";
 import { HttpServer } from "../core/http.js";
-import { Registry } from "../core/registry.js";
+import { Registry, routeAliasCaseProblem } from "../core/registry.js";
 import { filePermissionWarning, resolveSecret, type SecretEnv } from "../core/secrets.js";
 import { HttpWakeHook } from "../core/wake.js";
 import { consoleLogger, type Logger } from "../core/types.js";
@@ -75,6 +75,13 @@ export async function buildService(configFile: string, o: ServiceOverrides = {})
     const adapterCfg = JSON.parse(readFileSync(path(entry.configPath), "utf8"));
     const adapter =
       name === "discord" && o.discordPort ? new DiscordAdapter(adapterCfg as DiscordAdapterConfig, o.discordPort) : await factory(adapterCfg);
+    const known = registry.aliases();
+    const caseProblems = adapter.routes
+      .map((r, i) => routeAliasCaseProblem(r.agent, known, `${name}.routes[${i}]`))
+      .filter((x): x is string => Boolean(x));
+    if (caseProblems.length) throw new Error(caseProblems.join("; "));
+    const urlProblem = publicBaseUrlProblem(config.http.publicBaseUrl, liveCallbackAdapters([adapter]));
+    if (urlProblem) throw new Error(urlProblem);
     await bridge.add(adapter);
     adapters.set(name, adapter);
   }

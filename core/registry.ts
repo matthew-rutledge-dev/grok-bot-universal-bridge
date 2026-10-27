@@ -54,6 +54,27 @@ export interface PublicAgent {
 
 const ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
+/**
+ * Aliases are case-sensitive and must be lowercase. They are NOT normalised:
+ * "Example-Agent" is rejected with a hint, never silently mapped, so two
+ * spellings can never point at different bots.
+ */
+export function aliasProblem(alias: string): string {
+  const lower = alias.toLowerCase();
+  const hint = ALIAS.test(lower) ? ` Rename it to "${lower}" here and in every adapter route's "agent" field (e.g. Discord routes).` : "";
+  return `${alias}: registry aliases must be lowercase: start with a-z or 0-9, then a-z 0-9 . _ - (max 64).${hint}`;
+}
+
+/** A route's agent alias that only differs from a registry alias by case. Startup error. */
+export function routeAliasCaseProblem(alias: string, known: readonly string[], where: string): string | undefined {
+  if (!alias || known.includes(alias)) return undefined;
+  const lower = alias.toLowerCase();
+  if (lower !== alias && known.includes(lower)) {
+    return `${where}: agent "${alias}" must be lowercase "${lower}" (registry aliases are lowercase and case-sensitive)`;
+  }
+  return undefined;
+}
+
 export class Registry {
   private constructor(
     private readonly file: RegistryFile,
@@ -153,7 +174,7 @@ export function validateRegistry(raw: unknown): string[] {
   if (r.version !== 1) p.push("version must be 1");
   if (!r.agents || typeof r.agents !== "object") return [...p, "agents must be an object"];
   for (const [alias, a] of Object.entries(r.agents)) {
-    if (!ALIAS.test(alias)) p.push(`${alias}: alias must be lowercase [a-z0-9._-]`);
+    if (!ALIAS.test(alias)) p.push(aliasProblem(alias));
     if (!a || typeof a !== "object") {
       p.push(`${alias}: not an object`);
       continue;
