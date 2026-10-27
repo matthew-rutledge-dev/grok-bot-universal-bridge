@@ -99,7 +99,7 @@ function startProcess(configFile: string, env: Record<string, string>, logs: str
 }
 
 async function stopProcess(child: ChildProcess) {
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
   const done = new Promise((r) => child.once("exit", r));
   child.kill(process.platform === "win32" ? undefined : "SIGTERM");
   await done;
@@ -168,7 +168,11 @@ async function partA() {
 
     // Restart while held: the event must survive.
     await stopProcess(child);
-    check("service stopped while an event was held", child.exitCode !== null);
+    check(
+      "service stopped while an event was held",
+      child.exitCode !== null || child.signalCode !== null,
+      process.platform === "win32" ? "hard kill on Windows: no graceful shutdown" : "SIGTERM",
+    );
     const before = routine.hits.length;
     child = startProcess(file, env, logs);
     const h2 = await waitHealthy(base);
