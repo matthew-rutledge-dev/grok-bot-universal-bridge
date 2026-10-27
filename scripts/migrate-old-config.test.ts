@@ -244,12 +244,12 @@ test("migrate-old-config: --gateway-url-ref / --gateway-token-ref override the r
   assert.ok(adds.some((a) => a.deliver.urlRef === "env:EXAMPLE_GATEWAY_URL"));
   assert.ok(b.env.referenced.includes("EXAMPLE_GATEWAY_URL"));
   assert.ok(!b.env.referenced.includes("GROK_BOT_GATEWAY_TOKEN"));
-  for (const bad of [["--gateway-url-ref", "https://example.invalid/x"], ["--gateway-token-ref", "sentinel-literal"], ["--gateway-url-ref"]]) {
+  for (const bad of [["--gateway-url-ref", "https://example.invalid/x"], ["--gateway-token-ref", "sentinel-literal"], ["--gateway-url-ref"], ["--gateway-token-ref", "file:relative/x"], ["--gateway-token-ref", "file: /x"], ["--gateway-url-ref", "env:BAD NAME"]]) {
     const r = run(bad);
     assert.equal(r.status, 2, bad.join(" "));
     assert.ok(!r.stderr.includes("sentinel-literal") && !r.stderr.includes("example.invalid"));
     assert.ok(!/\n\s+at /.test(r.stderr), "no stack trace");
   }
-  assert.throws(() => convert({ security: {}, channelMap: {}, gatewayTokenRef: "literal" }), /env:NAME or file/);
+  for (const bad of ["literal", "file:relative/x", "file: /x"]) assert.throws(() => convert({ security: {}, channelMap: {}, gatewayTokenRef: bad }), /env:NAME or file/);
   void dir;
 });

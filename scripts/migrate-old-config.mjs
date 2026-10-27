@@ -16,7 +16,7 @@
 // (mode 600). Per-row sendPromptUrl values (they can carry secrets) are only written to
 // --env-out (mode 600) as NAME=value lines; stdout shows the names only.
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 /** Keys whose values are secrets (or secret-bearing URLs): referenced, never copied or printed. */
 export const SECRET_KEYS = new Set([
@@ -41,7 +41,9 @@ const ID = /^\d{5,25}$/;
 
 export const DEFAULT_GATEWAY_URL_REF = "env:GROK_BOT_SENDPROMPT_URL";
 export const DEFAULT_GATEWAY_TOKEN_REF = "env:GROK_BOT_GATEWAY_TOKEN";
-const isRef = (v) => typeof v === "string" && (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(v) || /^file:.+/.test(v));
+// Mirrors core/secrets.ts isSecretRef (file: needs an absolute path, per this platform's
+// path.isAbsolute), and additionally refuses any whitespace in the ref.
+const isRef = (v) => typeof v === "string" && !/\s/.test(v) && (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(v) || (v.startsWith("file:") && v.length > 5 && isAbsolute(v.slice(5))));
 
 export function parseEnv(text) {
   const out = {};
