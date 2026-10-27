@@ -261,7 +261,7 @@ export class TeslaAdapter implements SourceAdapter {
       await this.receiver.start({
         record: (r) =>
           void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin })),
-        drop: (reason, vin) => this.dropped(reason, vin),
+        drop: (reason, vin, count) => this.dropped(reason, vin, count),
       });
     }
     const e = this.cfg.energy_poll;
@@ -312,8 +312,8 @@ export class TeslaAdapter implements SourceAdapter {
     return (this.cfg.energy_poll?.site_allowlist ?? []).includes(site);
   }
 
-  private dropped(reason: DropReason, vin?: string): void {
-    this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin });
+  private dropped(reason: DropReason, vin?: string, count?: number): void {
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin, ...(count !== undefined ? { count } : {}) });
   }
 
   /** Feed one decoded telemetry record (called by the receiver). Returns triggers submitted. */

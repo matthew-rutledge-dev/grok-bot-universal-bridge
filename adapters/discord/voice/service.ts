@@ -30,6 +30,8 @@ export interface VoiceDeps {
   port: VoicePort | undefined;
   secret: (ref: string | undefined) => string | undefined;
   grokUrl?: string;
+  /** Called when Discord drops an open stream (audit hook). */
+  onStreamEnded?: () => void;
 }
 
 const CHANNEL = /^[0-9]{17,20}$/;
@@ -151,8 +153,18 @@ export class VoiceService {
         this.close();
         const mixer = new PcmMixer();
         try {
-          const handle = await this.deps.port!.openStream(channelId, () => mixer.nextFrame());
-          this.stream = { channelId, mixer, handle };
+          let ended = false;
+          const handle = await this.deps.port!.openStream(
+            channelId,
+            () => mixer.nextFrame(),
+            () => {
+              // Dropped by Discord: forget the stream so play/open work again (no stuck 409).
+              ended = true;
+              if (this.stream?.mixer === mixer) this.stream = null;
+              this.deps.onStreamEnded?.();
+            },
+          );
+          if (!ended) this.stream = { channelId, mixer, handle };
           return this.done({ status: 200, body: { ok: true, ...this.status() } }, t0);
         } catch (e) {
           const msg = (e as Error)?.message ?? "";

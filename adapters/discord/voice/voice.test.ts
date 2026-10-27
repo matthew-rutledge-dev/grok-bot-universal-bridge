@@ -280,3 +280,32 @@ test("nit 9: the Piper receive buffer is capped", async () => {
     await piper.close();
   }
 });
+
+test("a stream Discord drops releases the busy lock: play works again (no stuck 409)", async () => {
+  const s = await setup({ ...example.voice, enabled: true });
+  try {
+    assert.equal((await s.b.call("POST", "/discord/voice/stream", { op: "open", channelId: VCH }, auth)).status, 200);
+    assert.equal((await s.b.call("POST", "/discord/voice/play", { channelId: VCH }, auth)).status, 409);
+    s.port.voice.drop();
+    const st = await s.b.call("POST", "/discord/voice/stream", { op: "status" }, auth);
+    assert.equal(st.body.open, false);
+    assert.equal((await s.b.call("POST", "/discord/voice/play", { channelId: VCH }, auth)).status, 200);
+    assert.equal((await s.b.call("POST", "/discord/voice/stream", { op: "open", channelId: VCH }, auth)).status, 200, "re-open works");
+    assert.ok(s.b.audit.lines.some((l) => l.reason === "stream_dropped"));
+  } finally {
+    await s.close();
+  }
+  // Gateway-side guard: a dropped stream releases its lock; a later close() is a no-op.
+  const raw = new FakeVoicePort();
+  const v = guardVoice(raw);
+  let ended = 0;
+  const h = await v.openStream(VCH, () => Buffer.alloc(FRAME_BYTES), () => ended++);
+  await assert.rejects(v.play(VCH, Buffer.alloc(4)), /voice_busy/);
+  raw.drop();
+  assert.equal(ended, 1);
+  await v.play(VCH, Buffer.alloc(4));
+  h.close();
+  const h2 = await v.openStream(VCH, () => Buffer.alloc(FRAME_BYTES));
+  await assert.rejects(v.play(VCH, Buffer.alloc(4)), /voice_busy/, "the new stream holds the lock; the old handle's close didn't release it");
+  h2.close();
+});

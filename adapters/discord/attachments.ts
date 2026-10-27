@@ -1,5 +1,8 @@
 import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { Readable } from "node:stream";
 
 /**
  * Attachment rules, ported from the existing Discord bridge.
@@ -192,26 +195,57 @@ export interface FetchOptions {
   /** Byte cap for this file (default 8 MiB; resolveJsonAttachments passes what is left of the 25 MiB total). */
   maxBytes?: number;
   /** DNS lookup (tests). Default: node:dns/promises lookup, all addresses. */
-  lookup?: (host: string) => Promise<{ address: string }[]>;
+  lookup?: (host: string) => Promise<{ address: string; family?: number }[]>;
+  /** Test hooks for the pinned fetch only. Not reachable from config. */
+  testHooks?: { isBlocked?: (ip: string) => boolean; ca?: string };
 }
 
 export const MAX_REDIRECTS = 3;
 
-/** Private, loopback, link-local, CGNAT, unspecified, multicast/reserved, ULA and v4-mapped forms. */
+/** Expand an IPv6 literal (with optional embedded dotted quad) to 8 hextets; undefined if not IPv6. */
+export function ipv6Hextets(ip: string): number[] | undefined {
+  let v = ip.replace(/^\[|\]$/g, "").toLowerCase();
+  const zone = v.indexOf("%");
+  if (zone >= 0) v = v.slice(0, zone);
+  if (isIP(v) !== 6) return undefined;
+  const dotted = /(\d+\.\d+\.\d+\.\d+)$/.exec(v);
+  if (dotted) {
+    const [a, b, c, d] = dotted[1].split(".").map(Number);
+    v = v.slice(0, -dotted[1].length) + `${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = v.includes("::") ? v.split("::") : [v, undefined];
+  const h = head ? head.split(":") : [];
+  const t = tail !== undefined && tail !== "" ? tail.split(":") : [];
+  const fill = tail === undefined ? [] : new Array(8 - h.length - t.length).fill("0");
+  const all = [...h, ...fill, ...t].map((x) => parseInt(x || "0", 16));
+  return all.length === 8 && all.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff) ? all : undefined;
+}
+
+/**
+ * Private, loopback, link-local, CGNAT, benchmarking (198.18.0.0/15), unspecified,
+ * multicast/reserved, ULA, NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), and every
+ * IPv4-compatible (::a.b.c.d) or IPv4-mapped (::ffff:a.b.c.d) form, in any spelling.
+ */
 export function isPrivateAddress(ip: string): boolean {
   const v = ip.replace(/^\[|\]$/g, "").toLowerCase();
   if (isIP(v) === 4) {
     const [a, b] = v.split(".").map(Number);
-    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+    return (
+      a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 198 && (b === 18 || b === 19)) || a >= 224
+    );
   }
-  if (isIP(v) === 6) {
-    if (v === "::" || v === "::1") return true;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v);
-    if (mapped) return isPrivateAddress(mapped[1]);
-    if (/^::ffff:[0-9a-f]{1,4}:[0-9a-f]{1,4}$/.test(v)) return true; // hex-form v4-mapped: refuse
-    return /^f[cd]/.test(v) || /^fe[89ab]/.test(v) || /^ff/.test(v);
-  }
-  return false;
+  const h = ipv6Hextets(v);
+  if (!h) return false;
+  const zeros = (n: number) => h.slice(0, n).every((x) => x === 0);
+  if (zeros(8)) return true; // ::
+  if (zeros(7) && h[7] === 1) return true; // ::1
+  if (zeros(5) && h[5] === 0xffff) return true; // ::ffff:a.b.c.d (mapped)
+  if (zeros(6)) return true; // ::a.b.c.d (IPv4-compatible, deprecated)
+  if (h[0] === 0x64 && h[1] === 0xff9b && h.slice(2, 6).every((x) => x === 0)) return true; // NAT64 well-known
+  if (h[0] === 0x64 && h[1] === 0xff9b && h[2] === 1) return true; // NAT64 local-use
+  const top = h[0];
+  return (top & 0xfe00) === 0xfc00 || (top & 0xffc0) === 0xfe80 || (top & 0xff00) === 0xff00;
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -240,6 +274,9 @@ async function assertTargetAllowed(u: URL, opts: FetchOptions): Promise<void> {
     if (isPrivateAddress(host)) throw new AttachmentError("invalid_attachment_url", "private target");
     return;
   }
+  // Default path: the DNS answer is checked inside the connect (pinnedFetch), so there is
+  // no second lookup an attacker could rebind between the check and the connection.
+  if (!opts.fetchImpl) return;
   let addrs: { address: string }[];
   try {
     addrs = await (opts.lookup ?? ((h: string) => dnsLookup(h, { all: true })))(host);
@@ -266,7 +303,9 @@ export async function fetchUrlAttachment(input: JsonAttachmentInput, opts: Fetch
     let res: Response | undefined;
     for (let hop = 0; ; hop++) {
       await assertTargetAllowed(current, opts);
-      res = await (opts.fetchImpl ?? fetch)(current.toString(), { method: "GET", redirect: "manual", signal, headers: { accept: "*/*" } });
+      res = opts.fetchImpl
+        ? await opts.fetchImpl(current.toString(), { method: "GET", redirect: "manual", signal, headers: { accept: "*/*" } })
+        : await pinnedFetch(current, opts, signal);
       if (res.status < 300 || res.status > 399 || res.status === 304) break;
       const loc = res.headers.get("location");
       await res.body?.cancel().catch(() => undefined);
@@ -295,6 +334,70 @@ export async function fetchUrlAttachment(input: JsonAttachmentInput, opts: Fetch
   }
 }
 
+/**
+ * GET with the DNS check pinned to the connection (closes the DNS-rebinding gap):
+ *  - the lookup used for the socket resolves once, refuses if ANY answer is private,
+ *    and hands exactly the checked address to the connect;
+ *  - after connect, the socket's remote address is checked again (belt and braces;
+ *    also covers literal IPs, which skip lookup).
+ * Hosts in allowHttpHosts (loopback, tests / local smoke) skip both checks.
+ * No redirects are followed here (the caller re-checks every hop).
+ */
+export function pinnedFetch(url: URL, opts: FetchOptions, signal?: AbortSignal): Promise<Response> {
+  const allowed = (opts.allowHttpHosts ?? []).includes(url.hostname);
+  const blocked = opts.testHooks?.isBlocked ?? isPrivateAddress;
+  const resolve = opts.lookup ?? ((h: string) => dnsLookup(h, { all: true }));
+  const privateErr = () => new AttachmentError("invalid_attachment_url", "private target");
+  type LookupCb = (err: Error | null, address: string | { address: string; family: number }[], family?: number) => void;
+  const lookup = (hostname: string, options: { all?: boolean }, cb: LookupCb) => {
+    resolve(hostname)
+      .then((addrs) => {
+        if (!allowed && (!addrs.length || addrs.some((a) => blocked(a.address)))) return cb(privateErr(), "");
+        const a = addrs[0];
+        if (!a) return cb(Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }), "");
+        const family = a.family ?? (isIP(a.address) === 6 ? 6 : 4);
+        if (options?.all) cb(null, [{ address: a.address, family }]);
+        else cb(null, a.address, family);
+      })
+      .catch(() => cb(new AttachmentError("attachment_fetch_failed", "dns"), ""));
+  };
+  return new Promise<Response>((resolvePromise, reject) => {
+    const mod = url.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = mod(
+      url,
+      {
+        method: "GET",
+        headers: { accept: "*/*", "accept-encoding": "identity" },
+        signal,
+        lookup: lookup as never,
+        ...(opts.testHooks?.ca ? { ca: opts.testHooks.ca } : {}),
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        if (status < 200 || status > 599) {
+          res.resume();
+          return reject(new AttachmentError("attachment_fetch_failed", `HTTP ${status}`));
+        }
+        const headers = new Headers();
+        for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) headers.set(k, Array.isArray(v) ? v.join(", ") : v);
+        const nullBody = status === 204 || status === 205 || status === 304;
+        if (nullBody) res.resume();
+        resolvePromise(new Response(nullBody ? null : (Readable.toWeb(res) as unknown as ReadableStream), { status, headers }));
+      },
+    );
+    req.on("socket", (sock) => {
+      const check = () => {
+        const ra = sock.remoteAddress ?? "";
+        if (!allowed && (!ra || blocked(ra))) req.destroy(privateErr());
+      };
+      if ((sock as { connecting?: boolean }).connecting) sock.once("connect", check);
+      else check();
+    });
+    req.on("error", (e) => reject(e instanceof AttachmentError ? e : new AttachmentError("attachment_fetch_failed", (e as Error).name)));
+    req.end();
+  });
+}
+
 /** Read a body but stop as soon as it passes the cap (no content-length trust). */
 async function readCapped(res: Response, max: number): Promise<Buffer> {
   if (!res.body) return Buffer.alloc(0);
@@ -314,15 +417,43 @@ async function readCapped(res: Response, max: number): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-/** Resolve callback attachments: each item has exactly one of data or url. */
-export async function resolveJsonAttachments(items: unknown, opts: FetchOptions = {}): Promise<ResolvedAttachment[]> {
-  if (items === undefined || items === null) return [];
-  if (!Array.isArray(items)) throw new AttachmentError("invalid_attachment", "attachments must be an array");
-  if (items.length === 0) return [];
-  if (items.length > MAX_ATTACHMENTS) throw new AttachmentError("too_many_attachments");
+/** A multipart file part (already in memory): same name, extension, MIME and size rules as base64 data. */
+export interface UploadedFile {
+  filename?: string;
+  contentType?: string;
+  data: Buffer;
+}
+
+export function bufferAttachment(f: UploadedFile, maxBytes = MAX_ATTACHMENT_BYTES): ResolvedAttachment {
+  if (typeof f.filename !== "string" || !f.filename.trim()) throw new AttachmentError("invalid_attachment", "filename required");
+  const filename = safeFilename(f.filename, "file.bin");
+  assertExtensionAllowed(filename);
+  if (f.data.length === 0) throw new AttachmentError("invalid_attachment", "empty file");
+  if (f.data.length > maxBytes) throw new AttachmentError("attachment_too_large");
+  const contentType = normalizeMime(f.contentType, filename);
+  assertMimeAllowed(contentType);
+  return { filename, contentType, buffer: Buffer.from(f.data) };
+}
+
+/**
+ * Resolve callback attachments: multipart uploads first, then JSON items (each has exactly
+ * one of data or url). The 10-file, 8 MiB-per-file and 25 MiB-total caps cover both together.
+ */
+export async function resolveJsonAttachments(items: unknown, opts: FetchOptions = {}, uploads: readonly UploadedFile[] = []): Promise<ResolvedAttachment[]> {
+  if (items !== undefined && items !== null && !Array.isArray(items)) throw new AttachmentError("invalid_attachment", "attachments must be an array");
+  const list = (Array.isArray(items) ? items : []) as JsonAttachmentInput[];
+  if (list.length + uploads.length === 0) return [];
+  if (list.length + uploads.length > MAX_ATTACHMENTS) throw new AttachmentError("too_many_attachments");
   const out: ResolvedAttachment[] = [];
   let total = 0;
-  for (const item of items as JsonAttachmentInput[]) {
+  for (const u of uploads) {
+    const left = Math.min(MAX_ATTACHMENT_BYTES, MAX_TOTAL_ATTACHMENT_BYTES - total);
+    if (left <= 0 || u.data.length > MAX_TOTAL_ATTACHMENT_BYTES - total) throw new AttachmentError("attachment_too_large", "total exceeds 25 MiB");
+    const r = bufferAttachment(u, left);
+    total += r.buffer.length;
+    out.push(r);
+  }
+  for (const item of list) {
     if (!item || typeof item !== "object") throw new AttachmentError("invalid_attachment");
     const hasData = typeof item.data === "string" && item.data.length > 0;
     const hasUrl = typeof item.url === "string" && item.url.length > 0;

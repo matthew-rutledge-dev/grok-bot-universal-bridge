@@ -65,7 +65,7 @@ export async function createGatewayPort(): Promise<DiscordPort> {
     }
   }
 
-  async function openNow(channelId: string, nextFrame: () => Buffer) {
+  async function openNow(channelId: string, nextFrame: () => Buffer, onEnded?: () => void) {
     const ch = await voiceChannel(channelId);
     const v = await import("@discordjs/voice");
     const connection = v.joinVoiceChannel({ channelId: ch.id, guildId: ch.guild.id, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true });
@@ -86,13 +86,30 @@ export async function createGatewayPort(): Promise<DiscordPort> {
       if (!stream.push(nextFrame())) stream.resume();
     }, 20);
     timer.unref?.();
-    return {
-      close() {
-        clearInterval(timer);
-        stream.push(null);
+    let done = false;
+    const end = (byUs: boolean) => {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      stream.push(null);
+      try {
         connection.destroy();
-      },
+      } catch {
+        /* already destroyed */
+      }
+      if (!byUs) onEnded?.();
     };
+    // Discord dropped us: give it 5 s to reconnect on its own (standard @discordjs/voice
+    // pattern), otherwise end the stream so the busy lock is released.
+    connection.on(v.VoiceConnectionStatus.Disconnected, () => {
+      Promise.race([
+        v.entersState(connection, v.VoiceConnectionStatus.Signalling, 5_000),
+        v.entersState(connection, v.VoiceConnectionStatus.Connecting, 5_000),
+      ]).catch(() => end(false));
+    });
+    connection.on(v.VoiceConnectionStatus.Destroyed, () => end(false));
+    player.on("error", () => end(false));
+    return { close: () => end(true) };
   }
 
   return {
@@ -138,6 +155,10 @@ export async function createGatewayPort(): Promise<DiscordPort> {
         ...(opts?.replyTo ? { reply: { messageReference: opts.replyTo, failIfNotExists: false } } : {}),
       });
       return sent.id;
+    },
+    async openDm(userId) {
+      const user = await client.users.fetch(userId);
+      return (await user.createDM()).id;
     },
     async edit(channelId, messageId, content, opts) {
       const ch = await textChannel(channelId);

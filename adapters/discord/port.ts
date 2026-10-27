@@ -44,8 +44,12 @@ export interface VoiceStreamHandle {
 export interface VoicePort {
   /** Join, play the clip, leave. */
   play(channelId: string, pcm: Buffer): Promise<void>;
-  /** Join and keep playing nextFrame() (3840-byte frames) until close(). */
-  openStream(channelId: string, nextFrame: () => Buffer): Promise<VoiceStreamHandle>;
+  /**
+   * Join and keep playing nextFrame() (3840-byte frames) until close().
+   * onEnded fires (once) when the stream ends WITHOUT close(): Discord dropped the
+   * connection, the bot was moved/kicked, or the player failed.
+   */
+  openStream(channelId: string, nextFrame: () => Buffer, onEnded?: () => void): Promise<VoiceStreamHandle>;
 }
 
 export interface DiscordPort {
@@ -61,6 +65,8 @@ export interface DiscordPort {
   react(channelId: string, messageId: string, emoji: string): Promise<void>;
   /** Start a thread on a message and post text into it (planner threadContent). */
   thread(channelId: string, messageId: string, name: string, parts: string[]): Promise<void>;
+  /** Open (or reuse) the DM channel with a user. Returns the DM channel id. */
+  openDm?(userId: string): Promise<string>;
   /** Voice, when the gateway supports it. */
   readonly voice?: VoicePort;
 }
