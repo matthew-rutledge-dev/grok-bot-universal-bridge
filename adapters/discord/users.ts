@@ -2,8 +2,10 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { dirname } from "node:path";
 
 /**
- * User directory: Discord user id -> names, learned from every human message author
- * (and interaction user), plus an optional read-only seed of operator labels.
+ * User directory: Discord user id -> names, learned from allowlisted human message authors
+ * (and interaction users), plus an optional read-only seed of operator labels. Bounded:
+ * at most `max` entries (default 5000), least recently seen dropped first; seed labels are
+ * kept apart and never evicted.
  *
  * Names and timestamps only (no message text, no tokens). Stored in the data dir
  * (`discord-user-directory.json`, mode 600, atomic, debounced). Labels from the seed
@@ -30,6 +32,7 @@ export interface WakeIdentity {
 
 const ID = /^\d{5,25}$/;
 const MAX_NAME = 64;
+export const USER_DIRECTORY_MAX = 5000;
 
 function clean(v: unknown): string | undefined {
   if (typeof v !== "string") return undefined;
@@ -37,12 +40,35 @@ function clean(v: unknown): string | undefined {
   return s ? s.slice(0, MAX_NAME) : undefined;
 }
 
+function toIdentity(e: UserEntry | undefined): WakeIdentity {
+  const out: WakeIdentity = {};
+  if (e?.username) out.un = e.username;
+  if (e?.displayName) out.dn = e.displayName;
+  if (e?.label) out.lb = e.label;
+  return out;
+}
+
 export class UserDirectory {
   private readonly users = new Map<string, UserEntry>();
   private readonly seedLabels = new Map<string, string>();
   private timer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor(private readonly opts: { file: string; seedPath?: string; writeDelayMs?: number; now?: () => Date; warn?: (l: string) => void }) {}
+  constructor(private readonly opts: { file: string; seedPath?: string; writeDelayMs?: number; now?: () => Date; warn?: (l: string) => void; max?: number }) {}
+
+  private get max(): number {
+    return Math.max(1, this.opts.max ?? USER_DIRECTORY_MAX);
+  }
+
+  /** Insert as most recently seen, then drop the least recently seen past the cap. */
+  private put(id: string, e: UserEntry): void {
+    this.users.delete(id);
+    this.users.set(id, e);
+    while (this.users.size > this.max) {
+      const oldest = this.users.keys().next().value;
+      if (oldest === undefined) break;
+      this.users.delete(oldest);
+    }
+  }
 
   private now() {
     return (this.opts.now ?? (() => new Date()))().toISOString();
@@ -50,9 +76,11 @@ export class UserDirectory {
 
   load(): { users: number; seeded: number } {
     const saved = this.read(this.opts.file) as { users?: Record<string, Partial<UserEntry>> } | undefined;
-    for (const [id, e] of Object.entries(saved?.users ?? {})) {
+    // Oldest lastSeen first, so the cap keeps the most recently seen users.
+    const rows = Object.entries(saved?.users ?? {}).sort(([, a], [, b]) => String(a?.lastSeen ?? a?.firstSeen ?? "").localeCompare(String(b?.lastSeen ?? b?.firstSeen ?? "")));
+    for (const [id, e] of rows) {
       if (!ID.test(id) || !e || typeof e !== "object") continue;
-      this.users.set(id, {
+      this.put(id, {
         username: clean(e.username),
         globalName: clean(e.globalName),
         displayName: clean(e.displayName),
@@ -71,38 +99,49 @@ export class UserDirectory {
       if (label) e.label = label;
       e.username ??= clean(s.username);
       e.displayName ??= clean(s.displayName);
-      this.users.set(id, e);
+      this.put(id, e);
       seeded++;
     }
     return { users: this.users.size, seeded };
   }
 
-  learn(input: { id: string; username?: string | null; globalName?: string | null; displayName?: string | null }): void {
-    if (!ID.test(input.id)) return;
+  private merged(input: { id: string; username?: string | null; globalName?: string | null; displayName?: string | null }): UserEntry {
     const prev = this.users.get(input.id);
     const username = clean(input.username);
     const globalName = clean(input.globalName);
     const displayName = clean(input.displayName) ?? globalName ?? username;
     const now = this.now();
-    this.users.set(input.id, {
+    return {
       username: username ?? prev?.username,
       globalName: globalName ?? prev?.globalName,
       displayName: displayName ?? prev?.displayName,
       label: this.seedLabels.get(input.id) ?? prev?.label,
       firstSeen: prev?.firstSeen ?? now,
       lastSeen: now,
-    });
+    };
+  }
+
+  learn(input: { id: string; username?: string | null; globalName?: string | null; displayName?: string | null }): void {
+    if (!ID.test(input.id)) return;
+    this.put(input.id, this.merged(input));
     this.schedule();
   }
 
-  identity(id: string): WakeIdentity {
-    const e = this.users.get(id);
-    const out: WakeIdentity = {};
-    if (e?.username) out.un = e.username;
-    if (e?.displayName) out.dn = e.displayName;
-    if (e?.label) out.lb = e.label;
-    return out;
+  /** Identity and label as if `input` were learned, without storing anything (pre-allowlist). */
+  preview(input: { id: string; username?: string | null; globalName?: string | null; displayName?: string | null }, fallback: string): { who: WakeIdentity; label: string } {
+    const e = ID.test(input.id) ? this.merged(input) : this.users.get(input.id);
+    const who = toIdentity(e);
+    return { who, label: who.lb ?? who.dn ?? who.un ?? fallback };
   }
+
+  size(): number {
+    return this.users.size;
+  }
+
+  identity(id: string): WakeIdentity {
+    return toIdentity(this.users.get(id));
+  }
+
 
   /** Prompt label: seed label, else display name, else username, else the fallback. */
   label(id: string, fallback: string): string {

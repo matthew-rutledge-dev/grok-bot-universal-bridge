@@ -208,12 +208,26 @@ export class FakeDiscordPort implements DiscordPort {
   }
   async send(channelId: string, content: string, opts?: { replyTo?: string; files?: OutgoingFile[] }) {
     const id = String(this.next++);
+    if (this.sendDelayMs) {
+      this.sending++;
+      await new Promise((r) => setTimeout(r, this.sendDelayMs));
+      this.sending--;
+    }
     this.sent.push({ id, channelId, content, replyTo: opts?.replyTo, ...(opts?.files?.length ? { files: opts.files } : {}) });
     return id;
   }
   async edit(channelId: string, messageId: string, content: string, opts?: { files?: OutgoingFile[] }) {
     if (this.failEdits.has(messageId)) throw new Error("Unknown Message");
     this.edits.push({ channelId, messageId, content, ...(opts?.files?.length ? { files: opts.files } : {}) });
+  }
+  deleted: { channelId: string; messageId: string }[] = [];
+  /** Delay (ms) before send() resolves (simulates a slow Discord API). */
+  sendDelayMs = 0;
+  /** Sends currently waiting on sendDelayMs. */
+  sending = 0;
+  async delete(channelId: string, messageId: string) {
+    this.deleted.push({ channelId, messageId });
+    this.sent = this.sent.filter((m) => m.id !== messageId);
   }
   dms: string[] = [];
   /** User ids whose DM can't be opened. */

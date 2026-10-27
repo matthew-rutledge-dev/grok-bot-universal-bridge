@@ -230,10 +230,12 @@ export function ipv6Hextets(ip: string): number[] | undefined {
 export function isPrivateAddress(ip: string): boolean {
   const v = ip.replace(/^\[|\]$/g, "").toLowerCase();
   if (isIP(v) === 4) {
-    const [a, b] = v.split(".").map(Number);
+    const [a, b, c] = v.split(".").map(Number);
     return (
       a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 198 && (b === 18 || b === 19)) || a >= 224
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 198 && (b === 18 || b === 19)) || a >= 224 ||
+      // IETF protocol assignments (192.0.0/24) and the documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24)
+      (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113)
     );
   }
   const h = ipv6Hextets(v);
@@ -247,8 +249,10 @@ export function isPrivateAddress(ip: string): boolean {
   if (h[0] === 0x64 && h[1] === 0xff9b && h[2] === 1) return true; // NAT64 local-use
   if (h[0] === 0x2002) return true; // 6to4: embeds an IPv4 (could be private)
   if (h[0] === 0x2001 && h[1] === 0) return true; // Teredo: embeds an (obfuscated) IPv4
+  if (h[0] === 0x100 && h[1] === 0 && h[2] === 0 && h[3] === 0) return true; // 100::/64 discard-only
   const top = h[0];
-  return (top & 0xfe00) === 0xfc00 || (top & 0xffc0) === 0xfe80 || (top & 0xff00) === 0xff00;
+  // fc00::/7 unique local, fe80::/10 link-local, fec0::/10 site-local (deprecated), ff00::/8 multicast
+  return (top & 0xfe00) === 0xfc00 || (top & 0xffc0) === 0xfe80 || (top & 0xffc0) === 0xfec0 || (top & 0xff00) === 0xff00;
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);

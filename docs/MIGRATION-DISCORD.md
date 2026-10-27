@@ -142,7 +142,7 @@ The universal bridge already runs in place of the old one, with the old containe
 | Compact wake prompt + trailer grammar | ported (same grammar) |
 | `WAKE_PROMPT_FORMAT=legacy` (d: line + thin JSON) | ported (`wakePromptFormat`) |
 | sendPrompt `metadata` (hop, discordMessageId/ChannelId/UserId/GuildId, discordUser, callbackBaseUrl/Path, attachments) | ported (`source` is `"discord"`, set by the core) |
-| User directory (learn names, seed labels win, mode-600 atomic debounced file) + interaction users | ported (`users.seedPath`, `discord-user-directory.json`) |
+| User directory (learn names, seed labels win, mode-600 atomic debounced file) + interaction users | ported (`users.seedPath`, `discord-user-directory.json`); now bounded (`users.max`, default 5000) and learns only allowlisted authors |
 | Inbound attachments as CDN refs (max 10, `a=` trailer, metadata) | ported |
 | Callback auth header-only (`Bearer` / `x-callback-token`), `?token=` refused | ported (both already refused `?token=`) |
 | `POST /callback` path | ported differently: `/discord/callback` plus the optional `legacyPaths.callback` alias |

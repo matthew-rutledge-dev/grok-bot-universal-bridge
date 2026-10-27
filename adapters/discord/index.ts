@@ -121,7 +121,8 @@ export interface DiscordAdapterConfig {
   /** "compact" (default) or "legacy" (the older bridge's d:-line + thin JSON). */
   wakePromptFormat?: WakePromptFormat;
   /** Optional read-only seed of operator labels (host-only file path). */
-  users?: { seedPath?: string };
+  /** User directory: seed labels file; max entries (default 5000, least recently seen dropped). */
+  users?: { seedPath?: string; max?: number };
 }
 
 export interface DiscordAdapterOptions {
@@ -236,6 +237,7 @@ export function validateDiscordConfig(raw: unknown): string[] {
     if (problem) p.push(`discord.legacyPaths.${k}: ${problem}`);
   }
   if (c.users?.seedPath !== undefined && typeof c.users.seedPath !== "string") p.push("discord.users.seedPath must be a file path");
+  if (c.users?.max !== undefined && !(Number.isInteger(c.users.max) && c.users.max >= 1 && c.users.max <= 100_000)) p.push("discord.users.max must be an integer 1..100000");
   if (c.planner?.callbackUrl !== undefined && !/^https?:\/\/[^\s]+$/.test(String(c.planner.callbackUrl))) {
     p.push("discord.planner.callbackUrl must be an http(s) URL");
   }
@@ -322,6 +324,12 @@ export class DiscordAdapter implements SourceAdapter {
   private readonly paired = new Set<string>();
   /** Chat hops showing "typing…": origin id -> stop. */
   private readonly chatTyping = new Map<string, () => void>();
+  /**
+   * Hops still waiting on their reply, by origin message id (cap 1000, oldest dropped).
+   * A reply or a start failure marks the hop finished, so a "Working on it." send that was
+   * still in flight is deleted (or forgotten) when it resolves and never starts its pulse.
+   */
+  private readonly hops = new Map<string, { finished: boolean }>();
   readonly legacyCallbackPath?: string;
 
   constructor(
@@ -399,7 +407,7 @@ export class DiscordAdapter implements SourceAdapter {
       ctx.authedRoute("POST", "voice/play", "voice", (req) => voice.play(req.body), { ...max, legacyPath: this.cfg.legacyPaths?.voicePlay });
       ctx.authedRoute("POST", "voice/stream", "voice", (req) => voice.streamOp(req.body), { ...max, legacyPath: this.cfg.legacyPaths?.voiceStream });
     }
-    this.users = new UserDirectory({ file: ctx.dataFile("user-directory.json"), seedPath: this.cfg.users?.seedPath, warn: (l) => ctx.log.warn(l) });
+    this.users = new UserDirectory({ file: ctx.dataFile("user-directory.json"), seedPath: this.cfg.users?.seedPath, max: this.cfg.users?.max, warn: (l) => ctx.log.warn(l) });
     const u = this.users.load();
     ctx.log.info(`[discord] user directory users=${u.users} seed=${u.seeded}`);
     this.dmFile = ctx.dataFile("dm-channels.json");
@@ -450,6 +458,8 @@ export class DiscordAdapter implements SourceAdapter {
     this.planner.stopAll();
     for (const cancel of this.chatHolds.values()) cancel();
     this.chatHolds.clear();
+    for (const hop of this.hops.values()) hop.finished = true;
+    this.hops.clear();
     await this.port.disconnect();
   }
 
@@ -459,8 +469,9 @@ export class DiscordAdapter implements SourceAdapter {
       this.ctx.audit({ action: "inbound", outcome: "skipped", reason: "bot_author", eventId: m.id, lane: m.channelId });
       return undefined;
     }
-    // Every human author, before the allowlist: names and times only (labels for the prompt).
-    this.users?.learn({ id: m.authorId, username: m.authorUsername ?? m.authorLabel, globalName: m.authorGlobalName, displayName: m.authorDisplayName });
+    // Names for the prompt are previewed here; the author is stored only once the allowlist passes.
+    const author = { id: m.authorId, username: m.authorUsername ?? m.authorLabel, globalName: m.authorGlobalName, displayName: m.authorDisplayName };
+    const named = this.users?.preview(author, m.authorLabel);
     if (await this.pairCommand(m)) return undefined;
     if (!m.guildId && this.dmPolicy === "disabled") {
       this.ctx.audit({ action: "inbound", outcome: "skipped", reason: "dm_disabled", eventId: m.id, lane: m.channelId });
@@ -468,8 +479,8 @@ export class DiscordAdapter implements SourceAdapter {
     }
     const { event, skip } = messageToEvent(m, this.port.botUserId(), this.routes, {
       format: this.cfg.wakePromptFormat,
-      who: this.users?.identity(m.authorId),
-      label: this.users?.label(m.authorId, m.authorLabel),
+      who: named?.who,
+      label: named?.label,
       callbackUrl: this.ctx.callbackUrl,
     });
     if (!event) {
@@ -477,6 +488,7 @@ export class DiscordAdapter implements SourceAdapter {
       return undefined;
     }
     const authz = this.ctx.check(event);
+    if (authz.ok) this.users?.learn(author);
     if (!authz.ok && !m.guildId && this.dmPolicy === "pairing" && (authz.reason === "no_route" || authz.reason === "actor_not_allowlisted")) {
       this.ctx.audit({ action: "inbound", outcome: "deny", reason: "dm_not_paired", eventId: m.id, lane: m.channelId, actor: m.authorId });
       await this.port.send(m.channelId, NOT_PAIRED_TEXT, { replyTo: m.id }).catch(() => undefined);
@@ -527,10 +539,18 @@ export class DiscordAdapter implements SourceAdapter {
     const t0 = Date.now();
     const slug = typeof route.slug === "string" && route.slug ? route.slug : m.guildId ? "channel" : "dm";
     let workingId: string | undefined;
+    const hop = { finished: false };
+    this.hops.set(m.id, hop);
+    if (this.hops.size > 1000) this.hops.delete(this.hops.keys().next().value as string);
     const postWorking = async () => {
       try {
-        workingId = await this.port.send(m.channelId, workingProgressText(Date.now() - t0), { replyTo: m.id });
-        const id = workingId;
+        const id = await this.port.send(m.channelId, workingProgressText(Date.now() - t0), { replyTo: m.id });
+        if (hop.finished) {
+          // The reply (or a start failure) beat this send: drop the stale message, no pulse.
+          await this.port.delete?.(m.channelId, id).catch(() => undefined);
+          return;
+        }
+        workingId = id;
         const pulseMs = this.opts.pulseMs ?? PLANNER_PULSE_MS;
         const maxMs = this.cfg.planner?.pulseMaxMs ?? 30 * 60_000;
         const timer = setInterval(() => {
@@ -593,6 +613,7 @@ export class DiscordAdapter implements SourceAdapter {
     if (signal === "accepted") {
       await this.port.react(m.channelId, m.id, PLANNER_DONE_EMOJI).catch(() => undefined);
     } else if (signal === "start_failed") {
+      this.finishHop(m.id);
       this.stopTyping(m.id);
       this.chatHolds.get(m.id)?.();
       this.chatHolds.delete(m.id);
@@ -604,6 +625,14 @@ export class DiscordAdapter implements SourceAdapter {
       this.ctx.log.warn(`[discord] planner ${signal} (not a final failure)`);
     }
     return signal;
+  }
+
+  /** Reply or start failure: a working-message send still in flight must not post or pulse. */
+  private finishHop(id: string | undefined): void {
+    if (!id) return;
+    const hop = this.hops.get(id);
+    if (hop) hop.finished = true;
+    this.hops.delete(id);
   }
 
   private stopTyping(id: string | undefined): void {
@@ -737,6 +766,7 @@ export class DiscordAdapter implements SourceAdapter {
         });
       }
     }
+    this.finishHop(replyTo);
     this.stopTyping(replyTo);
     // A chat-hop reply that beats the working-message delay: cancel it, answer as a new reply.
     if (replyTo && this.chatHolds.has(replyTo)) {

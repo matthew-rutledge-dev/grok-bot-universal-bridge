@@ -47,13 +47,16 @@ export function formatPrompt(a: PromptArgs): string {
   return `${body}\n${trailer.join(" ")}`;
 }
 
-/** Split text into Discord-sized chunks (2000 chars), preferring line breaks. */
+/** Split text into Discord-sized chunks (2000 UTF-16 units), preferring line breaks, never inside a surrogate pair. */
 export function chunk(text: string, max = 2000): string[] {
   const out: string[] = [];
   let rest = text;
   while (rest.length > max) {
     let cut = rest.lastIndexOf("\n", max);
     if (cut < max / 2) cut = max;
+    // Never split a UTF-16 surrogate pair: back off one unit when the cut lands after a high surrogate.
+    const hi = rest.charCodeAt(cut - 1);
+    if (hi >= 0xd800 && hi <= 0xdbff) cut--;
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n/, "");
   }

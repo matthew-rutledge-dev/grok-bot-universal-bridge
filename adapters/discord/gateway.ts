@@ -33,7 +33,7 @@ export async function createGatewayPort(): Promise<DiscordPort> {
     if (!ch || !("send" in ch) || !("messages" in ch)) throw new Error("channel is not text-capable");
     return ch as unknown as {
       send(o: Record<string, unknown>): Promise<{ id: string }>;
-      messages: { edit(id: string, o: Record<string, unknown>): Promise<unknown>; fetch(id: string): Promise<Msg> };
+      messages: { edit(id: string, o: Record<string, unknown>): Promise<unknown>; delete(id: string): Promise<unknown>; fetch(id: string): Promise<Msg> };
     };
   }
   const files = (f: OutgoingFile[] | undefined) => (f?.length ? { files: f.map((x) => new AttachmentBuilder(x.buffer, { name: x.filename })) } : {});
@@ -175,6 +175,10 @@ export async function createGatewayPort(): Promise<DiscordPort> {
     async edit(channelId, messageId, content, opts) {
       const ch = await textChannel(channelId);
       await ch.messages.edit(messageId, { content, ...files(opts?.files) });
+    },
+    async delete(channelId, messageId) {
+      const ch = await textChannel(channelId);
+      await ch.messages.delete(messageId);
     },
     async react(channelId, messageId, emoji) {
       const ch = await textChannel(channelId);

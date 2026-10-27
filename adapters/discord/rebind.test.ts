@@ -41,11 +41,20 @@ test("isPrivateAddress: NAT64, 6to4, Teredo, IPv4-compatible / mapped in any spe
     h6("0", "0", "0", "0", "0", "0", "0", "1"),
   ];
   for (const ip of priv) assert.equal(isPrivateAddress(ip), true, ip);
-  for (const ip of ["203.0.113.10", v4(198, 20, 0, 1), v4(198, 17, 255, 255), "2001:db8::1", h6("2001", "1", "", "1"), h6("2003", "", "1"), h6("64", "ff9c", "", "1")]) {
+  for (const ip of [v4(8, 8, 8, 8), v4(198, 20, 0, 1), v4(198, 17, 255, 255), "2001:db8::1", h6("2001", "1", "", "1"), h6("2003", "", "1"), h6("64", "ff9c", "", "1")]) {
     assert.equal(isPrivateAddress(ip), false, ip);
   }
   assert.deepEqual(ipv6Hextets(`::ffff:${v4(10, 0, 0, 1)}`), [0, 0, 0, 0, 0, 0xffff, 0x0a00, 1]);
   assert.equal(ipv6Hextets("not-an-ip"), undefined);
+});
+
+test("isPrivateAddress: IETF / documentation v4 ranges, site-local and discard-only v6", () => {
+  for (const ip of [v4(192, 0, 0, 8), v4(192, 0, 0, 0), v4(192, 0, 2, 1), v4(198, 51, 100, 7), v4(203, 0, 113, 10), v4(203, 0, 113, 255), h6("fec0", "", "1"), h6("feff", "", "1"), h6("100", "", "1"), h6("100", "0", "0", "0", "ffff", "", "1")]) {
+    assert.equal(isPrivateAddress(ip), true, ip);
+  }
+  for (const ip of [v4(192, 0, 1, 1), v4(192, 0, 3, 1), v4(198, 51, 101, 1), v4(203, 0, 114, 1), v4(192, 1, 0, 1), h6("fe00", "", "1"), h6("100", "0", "0", "1", "", "1"), h6("101", "", "1")]) {
+    assert.equal(isPrivateAddress(ip), false, ip);
+  }
 });
 
 async function cdn() {
@@ -92,7 +101,7 @@ test("pinned fetch refuses a private answer before connecting, and re-checks the
     const priv = await code(fetchUrlAttachment({ url: c.url }, { lookup: async () => [{ address: "127.0.0.1", family: 4 }], testHooks: { ca: c.ca } }));
     assert.equal(priv, "invalid_attachment_url");
     const mixed = await code(
-      fetchUrlAttachment({ url: c.url }, { lookup: async () => [{ address: "203.0.113.10", family: 4 }, { address: h6("64", "ff9b", "", v4(10, 0, 0, 1)), family: 6 }], testHooks: { ca: c.ca } }),
+      fetchUrlAttachment({ url: c.url }, { lookup: async () => [{ address: v4(8, 8, 8, 8), family: 4 }, { address: h6("64", "ff9b", "", v4(10, 0, 0, 1)), family: 6 }], testHooks: { ca: c.ca } }),
     );
     assert.equal(mixed, "invalid_attachment_url", "any private answer (here NAT64) refuses");
     // Lookup check passes, the post-connect check sees the real peer and refuses.

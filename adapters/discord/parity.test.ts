@@ -19,9 +19,9 @@ const DMCH = (n: number) => `90000000000000001${n}`;
 const AGENTS = { "agent-one": "a1111111-1111-4111-8111-111111111111", "agent-two": "a2222222-2222-4222-8222-222222222222", "agent-three": "a3333333-3333-4333-8333-333333333333", "agent-default": "a4444444-4444-4444-8444-444444444444" };
 const guildRoutes = example.routes;
 
-async function setup(over: Partial<DiscordAdapterConfig> = {}, o: { holdFile?: string; script?: number[] } = {}) {
+async function setup(over: Partial<DiscordAdapterConfig> = {}, o: { holdFile?: string; script?: number[]; plannerAnswer?: Parameters<typeof mockPlanner>[0]["answer"] } = {}) {
   const routine = await mockRoutine({ key: "routine-key", script: o.script });
-  const planner = await mockPlanner({ token: "planner-token" });
+  const planner = await mockPlanner({ token: "planner-token", answer: o.plannerAnswer });
   const port = new FakeDiscordPort(BOT);
   const adapter = new DiscordAdapter({ ...example, dm: undefined, dmRoutes: undefined, legacyPaths: undefined, routes: guildRoutes, ...over }, port, { pulseMs: 30, typingMs: 20 });
   const env = { DISCORD_BOT_TOKEN: "aaa.bbb.ccc", DISCORD_CALLBACK_TOKEN: "cb-discord", DISCORD_PLANNER_URL: planner.url, DISCORD_PLANNER_TOKEN: "planner-token" };
@@ -211,12 +211,15 @@ test("legacy wake format, metadata fields, user directory seed labels (mode 600)
       { ...body.metadata, eventId: undefined, source: undefined },
       { hop: first, discordMessageId: "500000000000000005", discordChannelId: CHANNEL, discordUserId: USER, discordGuildId: GUILD, discordUser: { un: "example-handle", dn: "Shown Name", lb: "Example Person" }, callbackBaseUrl: "https://bridge.example.com", callbackPath: "/discord/callback", eventId: undefined, source: undefined },
     );
+    // A guild author outside the allowlist is not learned.
+    await s.adapter.onMessage(discordMessage({ id: "500000000000000015", authorId: "800000000000000077", authorUsername: "stranger-handle" }));
     s.port.userHandler?.({ id: "600000000000000009", username: "button-user", bot: false });
     await s.adapter.stop();
     const file = join(dir, "discord-user-directory.json");
     const saved = JSON.parse(readFileSync(file, "utf8"));
     assert.equal(saved.users[USER].label, "Example Person");
     assert.equal(saved.users["600000000000000009"].username, "button-user");
+    assert.equal(saved.users["800000000000000077"], undefined, "denied author not stored");
     if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
     assert.ok(!readFileSync(file, "utf8").includes("hello there"), "no message text");
   } finally {
@@ -249,6 +252,47 @@ test("chat hop on a channel route: typing at once and until the reply; working m
     await new Promise((res) => setTimeout(res, 80));
     assert.equal(s.port.typings.length, n, "typing stops after the reply");
     assert.ok(!s.port.sent.some((m) => m.content.startsWith("Working on it.")), "fast reply: no working message");
+  } finally {
+    await s.close();
+  }
+});
+
+test("chat hop race: a reply that lands while the delayed working send is in flight leaves no working message and no edits", async () => {
+  const routes = guildRoutes.map((r) => (r.handler === "grokbuild-chat" ? { ...r, enabled: true } : r));
+  const s = await setup({ routes, planner: { ...example.planner!, chatWorkingDelayMs: 10 } });
+  try {
+    const CHAT = "200000000000000002";
+    const ORIGIN = "500000000000000008";
+    s.port.sendDelayMs = 200;
+    const started = (await s.adapter.onMessage(discordMessage({ id: ORIGIN, channelId: CHAT }))) as { done: Promise<string> };
+    assert.equal(await started.done, "accepted");
+    await until(() => s.port.sending > 0); // the working send is in flight
+    const r = await s.b.call("POST", "/discord/callback", { channelId: CHAT, content: "Hi!", replyToMessageId: ORIGIN }, auth);
+    assert.equal(r.status, 200);
+    await until(() => s.port.sending === 0);
+    await new Promise((res) => setTimeout(res, 200)); // several pulse intervals (pulseMs 30)
+    assert.deepEqual(s.port.sent.map((m) => m.content), ["Hi!"], "the working message does not stay posted");
+    assert.equal(s.port.deleted.length, 1, "the late working message is deleted");
+    assert.equal(s.port.edits.length, 0, "no pulse edits after the reply");
+  } finally {
+    await s.close();
+  }
+});
+
+test("chat hop race: a start failure while the working send is in flight leaves only the failure text, no pulse", async () => {
+  const routes = guildRoutes.map((r) => (r.handler === "grokbuild-chat" ? { ...r, enabled: true } : r));
+  const s = await setup({ routes, planner: { ...example.planner!, chatWorkingDelayMs: 0 } }, { plannerAnswer: () => ({ status: 404, body: { ok: false } }) });
+  try {
+    const CHAT = "200000000000000002";
+    s.port.sendDelayMs = 200;
+    const started = (await s.adapter.onMessage(discordMessage({ id: "500000000000000009", channelId: CHAT }))) as { done: Promise<string> };
+    assert.equal(await started.done, "start_failed");
+    await until(() => s.port.sending === 0);
+    await new Promise((res) => setTimeout(res, 200));
+    assert.equal(s.port.sent.length, 1);
+    assert.ok(!s.port.sent[0].content.startsWith("Working on it."), "only the failure text stays");
+    assert.equal(s.port.deleted.length, 1);
+    assert.equal(s.port.edits.length, 0);
   } finally {
     await s.close();
   }

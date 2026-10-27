@@ -15,7 +15,7 @@
 // (mode 600). Per-row sendPromptUrl values (they can carry secrets) are only written to
 // --env-out (mode 600) as NAME=value lines; stdout shows the names only.
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /** Keys whose values are secrets (or secret-bearing URLs): referenced, never copied or printed. */
 export const SECRET_KEYS = new Set([
@@ -288,13 +288,15 @@ if (/migrate-old-config\.mjs$/.test(process.argv[1] ?? "")) {
     plannerHandlers: process.argv.flatMap((a, i) => (a === "--planner-handler" && process.argv[i + 1] ? [process.argv[i + 1]] : [])),
   });
   const envOut = arg("--env-out");
+  const outDir = arg("--out-dir");
+  // Create every output directory before the first write, so --env-out may live inside a fresh --out-dir.
+  if (outDir) mkdirSync(outDir, { recursive: true });
+  if (envOut) mkdirSync(dirname(resolve(envOut)), { recursive: true });
   if (Object.keys(extraEnv).length) {
     if (envOut) writePrivate(envOut, Object.entries(extraEnv).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
     else bundle.warnings.push(`${Object.keys(extraEnv).length} URL value(s) need --env-out <file> (never printed): ${Object.keys(extraEnv).join(", ")}`);
   }
-  const outDir = arg("--out-dir");
   if (outDir) {
-    mkdirSync(outDir, { recursive: true });
     writePrivate(join(outDir, "discord.json"), JSON.stringify(bundle.discord, null, 2) + "\n");
     writePrivate(join(outDir, "registry.additions.json"), JSON.stringify(bundle.registryAdditions, null, 2) + "\n");
     writePrivate(join(outDir, "bridge.patch.json"), JSON.stringify(bundle.bridgePatch, null, 2) + "\n");

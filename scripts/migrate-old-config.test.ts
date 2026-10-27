@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error plain .mjs script, no types
 import { convert, parseEnv } from "./migrate-old-config.mjs";
@@ -128,6 +128,25 @@ test("migrate-old-config: maps every old key, prints no secret, output validates
     if (process.platform !== "win32") assert.equal(statSync(join(out, f)).mode & 0o777, 0o600, f);
   }
   if (process.platform !== "win32") assert.equal(statSync(join(dir, "extra.env")).mode & 0o777, 0o600);
+});
+
+test("migrate-old-config: fresh --out-dir with --env-out inside it (and a nested env-out parent) is created before any write", () => {
+  const { dir, p } = files();
+  const script = new URL("./migrate-old-config.mjs", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+  const out = join(dir, "fresh", "out");
+  assert.ok(!existsSync(join(dir, "fresh")));
+  const r = spawnSync(process.execPath, [script, "--security", p("security.json"), "--channel-map", p("channel-map.json"), "--env", p(".env"), "--out-dir", out, "--env-out", join(out, "extra.env"), "--planner-handler", PH], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stderr, "");
+  assert.ok(!r.stdout.includes("sentinel"));
+  assert.equal(readFileSync(join(out, "extra.env"), "utf8"), `DISCORD_SENDPROMPT_URL_EXAMPLE_CHAT=${ROW_URL}\n`);
+  for (const f of ["discord.json", "registry.additions.json", "bridge.patch.json", "warnings.txt"]) assert.ok(existsSync(join(out, f)), f);
+  // env-out in its own fresh nested directory outside out-dir.
+  const envNested = join(dir, "env", "deep", "extra.env");
+  const r2 = spawnSync(process.execPath, [script, "--security", p("security.json"), "--channel-map", p("channel-map.json"), "--env", p(".env"), "--out-dir", join(dir, "o2"), "--env-out", envNested, "--planner-handler", PH], { encoding: "utf8" });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.ok(existsSync(envNested));
+  if (process.platform !== "win32") assert.equal(statSync(join(out, "extra.env")).mode & 0o777, 0o600);
 });
 
 test("migrate-old-config: reuses existing registry aliases by agentId; HTTP_ONLY, legacy format, env pin, wake_agent without handler", () => {

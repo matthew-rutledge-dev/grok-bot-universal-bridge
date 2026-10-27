@@ -78,6 +78,8 @@ export interface DiscordPort {
   react(channelId: string, messageId: string, emoji: string): Promise<void>;
   /** Start a thread on a message and post text into it (planner threadContent). */
   thread(channelId: string, messageId: string, name: string, parts: string[]): Promise<void>;
+  /** Delete a message the bot posted (best effort; e.g. a stale "Working on it."). */
+  delete?(channelId: string, messageId: string): Promise<void>;
   /** Open (or reuse) the DM channel with a user. Returns the DM channel id. */
   openDm?(userId: string): Promise<string>;
   /** Voice, when the gateway supports it. */
