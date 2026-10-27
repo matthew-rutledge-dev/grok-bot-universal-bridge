@@ -29,6 +29,8 @@ export interface ReceiverSink {
   record(r: TelemetryRecord): void;
   /** count: how many events this line stands for (rate-limited handshake failures). */
   drop(reason: DropReason, vin?: string, count?: number): void;
+  /** Upstream connection events (mqtt mode). Reason codes only. */
+  event?(e: { outcome: "ok" | "error"; reason: string; ms?: number }): void;
 }
 
 export interface TelemetryReceiver {

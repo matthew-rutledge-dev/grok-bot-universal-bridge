@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
@@ -296,7 +296,7 @@ test("energy: polls immediately at start; a failing submit inside a timer tick i
 test("decoded receiver: loopback only; POST NDJSON from fleet-telemetry -> triggers", async () => {
   assert.throws(() => new DecodedJsonReceiver({ listen: "0.0.0.0:1" }), /loopback/);
   const m = await mockRoutine({ key: "routine-key" });
-  const a = new TeslaAdapter({ ...example, telemetry: { ...example.telemetry!, enabled: true, decoded_listen: "127.0.0.1:0" } });
+  const a = new TeslaAdapter({ ...example, telemetry: { ...example.telemetry!, enabled: true, mode: "decoded", decoded_listen: "127.0.0.1:0" } });
   const b = await startBridge({ routineUrl: m.url, adapters: [a] });
   try {
     const port = a.telemetryPort();
@@ -319,7 +319,7 @@ test("decoded receiver: loopback only; POST NDJSON from fleet-telemetry -> trigg
 });
 
 test("decoded receiver: a configured token ref that doesn't resolve fails at start and answers 503 later", async () => {
-  const cfg = { ...example, telemetry: { ...example.telemetry!, enabled: true, decoded_listen: "127.0.0.1:0", decoded_token_ref: "env:RELAY_TOKEN" } };
+  const cfg = { ...example, telemetry: { ...example.telemetry!, enabled: true, mode: "decoded", decoded_listen: "127.0.0.1:0", decoded_token_ref: "env:RELAY_TOKEN" } };
   let token: string | undefined;
   const ctx = { log: { info() {}, warn() {}, error() {} }, audit() {}, submit: async () => ({ accepted: true }), secret: () => token } as never;
   const a1 = new TeslaAdapter(cfg);
@@ -360,7 +360,7 @@ test("decoded receiver: request timeout closes a slow client", async () => {
 });
 
 test("decoded receiver: optional bearer token; a failing submit is audited, not thrown", async () => {
-  const a = new TeslaAdapter({ ...example, telemetry: { ...example.telemetry!, enabled: true, decoded_listen: "127.0.0.1:0", decoded_token_ref: "env:RELAY_TOKEN" } });
+  const a = new TeslaAdapter({ ...example, telemetry: { ...example.telemetry!, enabled: true, mode: "decoded", decoded_listen: "127.0.0.1:0", decoded_token_ref: "env:RELAY_TOKEN" } });
   const audit: Array<{ reason?: string }> = [];
   a.init({
     log: { info() {}, warn() {}, error() {} },
@@ -516,4 +516,70 @@ test("mtls: failed TLS handshakes are counted and rate-limited, not one audit li
   }
   assert.deepEqual(drops.at(-1), { reason: "tls_handshake_failed", count: 1 }, "stop() flushes the remainder");
   assert.equal(drops.length, 3);
+});
+
+test("energy state persists (mode 600, atomic): a restart during an outage doesn't re-fire grid_islanded", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "tesla-energy-state-"));
+  const holdFile = join(dir, "hold.json");
+  const stateFile = join(dir, "tesla-energy-state.json");
+  const tokenFile = join(dir, "token");
+  writeFileSync(tokenFile, "access-one\n");
+  let island = "on_grid";
+  let clock = Date.parse("2026-01-01T00:00:00Z");
+  const api = fakeApi((url) => (url.endsWith("/site_info") ? { status: 200, body: { response: { backup_reserve_percent: 20 } } } : live({ island_status: island })));
+  const cfg: TeslaConfig = { ...example, energy_poll: { ...example.energy_poll!, enabled: true, api_base: API, token_ref: `file:${tokenFile}` } };
+  const boot = async () => {
+    const m = await mockRoutine({ key: "routine-key" });
+    const a = new TeslaAdapter(cfg, { fetchImpl: api.f, now: () => clock, pollOnStart: false });
+    const b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile });
+    return { a, b, m, close: async () => (await b.close(), await m.close()) };
+  };
+  let r = await boot();
+  try {
+    assert.deepEqual(await r.a.tick(), [], "baseline");
+    island = "off_grid_unintentional";
+    clock += 300_000;
+    assert.deepEqual(await r.a.tick(), ["grid_islanded"]);
+    const saved = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(saved.version, 1);
+    assert.equal(saved.sites[SITE].status.islandStatus, "off_grid_unintentional");
+    assert.ok(Object.keys(saved.sites[SITE].debounce).some((k) => k.startsWith(`${SITE}:grid_islanded`)));
+    if (process.platform !== "win32") assert.equal(statSync(stateFile).mode & 0o777, 0o600);
+    assert.equal(existsSync(`${stateFile}.tmp`), false, "written via tmp + rename");
+  } finally {
+    await r.close();
+  }
+  // Restart mid-outage: the saved status is the baseline, so nothing re-fires.
+  clock += 600_000;
+  r = await boot();
+  try {
+    assert.deepEqual(await r.a.tick(), []);
+    assert.equal(r.m.hits.length, 0);
+    assert.ok(r.b.audit.lines.some((l) => l.reason === "energy_state_restored"));
+    // Grid back, then a new outage after the debounce window: fires again.
+    island = "on_grid";
+    clock += 300_000;
+    assert.deepEqual(await r.a.tick(), []);
+    island = "off_grid_unintentional";
+    clock += 1_800_000;
+    assert.deepEqual(await r.a.tick(), ["grid_islanded"]);
+  } finally {
+    await r.close();
+  }
+  // State older than 24 h is ignored: an outage at the first poll is reported.
+  clock += 25 * 3600_000;
+  r = await boot();
+  try {
+    assert.deepEqual(await r.a.tick(), ["grid_islanded"]);
+  } finally {
+    await r.close();
+  }
+  // A corrupt state file never stops the adapter.
+  writeFileSync(stateFile, "{not json");
+  r = await boot();
+  try {
+    await r.a.tick();
+  } finally {
+    await r.close();
+  }
 });

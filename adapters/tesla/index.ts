@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { validateRoutes } from "../../core/allowlist.js";
 import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
 import { maskId } from "../../core/redact.js";
@@ -17,22 +18,28 @@ import {
   type EnergyTrigger,
   type FetchLike,
 } from "./energy.js";
-import { deriveVehicleTriggers, KNOWN_FIELDS, mergeState, REPLACED_FIELDS, type TelemetryRecord, type TelemetryValue, type TriggerHit, type VehicleTrigger } from "./fields.js";
+import { deriveVehicleTriggers, KNOWN_FIELDS, mergeState, REPLACED_FIELDS, STREAM_ONLY_FIELDS, type TelemetryRecord, type TelemetryValue, type TriggerHit, type VehicleTrigger } from "./fields.js";
+import { brokerUrlProblem, MqttTelemetryReceiver, topicBaseProblem } from "./mqtt.js";
 import { DecodedJsonReceiver, isLoopbackHost, MtlsTelemetryReceiver, splitListen, type DropReason, type TelemetryReceiver } from "./receiver.js";
 
 export * from "./fields.js";
 export * from "./energy.js";
 export * from "./receiver.js";
+export * from "./mqtt.js";
 
 /**
  * Tesla source adapter.
  *
  * Split with the Tesla plugin:
- *   bridge (here): telemetry receiver (decoded JSON from fleet-telemetry, or mTLS), energy
+ *   bridge (here): telemetry receiver (fleet-telemetry over MQTT or decoded JSON, or mTLS), energy
  *                  live_status polling, filter + debounce, wake rules, VIN/site allowlists,
  *                  hold-retry, audit.
  *   plugin:        OAuth and token refresh, Fleet API client, read + command tools, safety
- *                  (read-only fail-closed, confirm, dry-run, state_unknown), proxy client.
+ *                  (read-only fail-closed, confirm, dry-run, state_unknown), proxy client, and
+ *                  the access-token export file energy polling reads.
+ *   operator:      pushes fleet_telemetry_config to each car once (a signed request through the
+ *                  proxy; a future confirm-gated plugin tool). Neither the plugin nor the bridge
+ *                  pushes it today; telemetry.fields here is its source of truth.
  *
  * Hard rules enforced here:
  *   - The bridge NEVER sends vehicle commands (config with commands is refused).
@@ -57,11 +64,36 @@ export interface TeslaRule {
   priority?: "low" | "normal" | "high";
 }
 
+export interface TeslaMqttConfig {
+  /** Broker URL: env:NAME / file:/path ref, or a literal mqtt(s):// URL on loopback or the LAN (no credentials in it). */
+  broker: string;
+  client_id: string;
+  /** fleet-telemetry's mqtt.topic_base. The bridge subscribes to <topic_base>/+/v/+. */
+  topic_base: string;
+  /** 1 (default) or 0. QoS 2 is refused (fleet-telemetry publishes at 0-2; 1 is the recommended pairing). */
+  qos?: 0 | 1;
+  username_ref?: string;
+  password_ref?: string;
+  /** mqtts: PEM CA for the broker cert, as a file: ref (read whole). */
+  ca_file?: string;
+  /** Coalesce one VIN's field messages for this long into one record (default 250 ms, 0-5000). */
+  batch_ms?: number;
+  /** Reconnect backoff (defaults 1000 ms doubling to 60000 ms, with jitter). */
+  reconnect_min_ms?: number;
+  reconnect_max_ms?: number;
+}
+
 export interface TeslaConfig {
   telemetry?: {
     enabled: boolean;
-    /** "decoded" (default): loopback JSON from Tesla's fleet-telemetry server. "mtls": the bridge terminates mTLS. */
-    mode?: "decoded" | "mtls";
+    /**
+     * "decoded" (default): loopback JSON POSTed from a relay of Tesla's fleet-telemetry server.
+     * "mqtt": the bridge subscribes to the broker fleet-telemetry's MQTT dispatcher publishes to.
+     * "mtls": the bridge terminates mTLS itself (decoded JSON text frames only).
+     */
+    mode?: "decoded" | "mqtt" | "mtls";
+    /** mqtt mode. */
+    mqtt?: TeslaMqttConfig;
     /** decoded mode: loopback host:port for POST /records. */
     decoded_listen?: string;
     /** decoded mode: optional bearer for the loopback listener. */
@@ -76,9 +108,11 @@ export interface TeslaConfig {
     vin_allowlist: string[];
     /** Must stay true: the vehicle config is pushed with prefer_typed so enums/structs arrive typed. */
     prefer_typed?: boolean;
-    /** Field -> minimum interval seconds requested in fleet_telemetry_config (pushed by the plugin). */
+    /** Field -> interval_seconds for fleet_telemetry_config (pushed once by the operator; the bridge never pushes it). */
     fields?: Record<string, number>;
     low_battery_percent?: number;
+    /** resend_interval_seconds the plugin applies to every field (a long one, e.g. 21600). Documentation for the plugin; the bridge never pushes config. */
+    resend_interval_s?: number;
   };
   energy_poll?: {
     enabled: boolean;
@@ -132,12 +166,15 @@ export function validateTeslaConfig(raw: unknown): string[] {
       p.push(`tesla.telemetry.fields must include Gear when ${doorRules.join("/")} wakes (without Gear the car counts as parked)`);
     }
     if (doorRules.length && t.fields && !("DoorState" in t.fields)) p.push(`tesla.telemetry.fields must include DoorState when ${doorRules.join("/")} wakes`);
+    if (t.resend_interval_s !== undefined && !(Number.isInteger(t.resend_interval_s) && t.resend_interval_s >= 60)) p.push("tesla.telemetry.resend_interval_s must be an integer >= 60");
+    for (const [f, sec] of Object.entries(t.fields ?? {})) if (!(Number.isInteger(sec) && sec >= 1)) p.push(`tesla.telemetry.fields.${f} must be an interval in whole seconds >= 1`);
     for (const f of Object.keys(t.fields ?? {})) {
       if (REPLACED_FIELDS[f]) p.push(`tesla.telemetry.fields.${f}: not a usable field; use ${REPLACED_FIELDS[f]}`);
-      else if (!(KNOWN_FIELDS as readonly string[]).includes(f)) p.push(`tesla.telemetry.fields.${f}: not read by the trigger logic (known: ${KNOWN_FIELDS.join(", ")})`);
+      else if (!(KNOWN_FIELDS as readonly string[]).includes(f) && !STREAM_ONLY_FIELDS.includes(f)) p.push(`tesla.telemetry.fields.${f}: not read by the trigger logic (known: ${KNOWN_FIELDS.join(", ")})`);
     }
     const mode = t.mode ?? "decoded";
-    if (mode !== "decoded" && mode !== "mtls") p.push('tesla.telemetry.mode must be "decoded" or "mtls"');
+    if (mode !== "decoded" && mode !== "mtls" && mode !== "mqtt") p.push('tesla.telemetry.mode must be "decoded", "mqtt" or "mtls"');
+    if (t.mqtt !== undefined || (t.enabled && mode === "mqtt")) p.push(...validateMqtt(t.mqtt));
     for (const k of PEM_KEYS) {
       const v = t[k];
       if (v !== undefined && !isSecretRef(v)) p.push(`tesla.telemetry.${k} must be file:/path or env:NAME`);
@@ -146,7 +183,7 @@ export function validateTeslaConfig(raw: unknown): string[] {
     if (t.enabled && mode === "mtls") {
       for (const k of [...PEM_KEYS, "listen"] as const) if (!t[k]) p.push(`tesla.telemetry.${k} is required in mtls mode`);
     }
-    if (mode === "decoded" && t.decoded_listen !== undefined) {
+    if (t.decoded_listen !== undefined) {
       try {
         if (!isLoopbackHost(splitListen(t.decoded_listen).host)) p.push("tesla.telemetry.decoded_listen must be a loopback address");
       } catch {
@@ -176,6 +213,35 @@ export function validateTeslaConfig(raw: unknown): string[] {
   return p;
 }
 
+function validateMqtt(m: TeslaMqttConfig | undefined): string[] {
+  const p: string[] = [];
+  const at = "tesla.telemetry.mqtt";
+  if (!m || typeof m !== "object") return [`${at} is required in mqtt mode`];
+  if (typeof m.broker !== "string" || !m.broker.trim()) p.push(`${at}.broker is required`);
+  else if (!isSecretRef(m.broker)) {
+    const b: string = m.broker;
+    if (/^(env|file):/.test(b.trim())) p.push(`${at}.broker must be env:NAME or file:/absolute/path when it is a ref`);
+    else {
+      const prob = brokerUrlProblem(b, true);
+      if (prob) p.push(`${at}.broker ${prob}`);
+    }
+  }
+  if (typeof m.client_id !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(m.client_id)) p.push(`${at}.client_id must be 1-64 characters of A-Z a-z 0-9 . _ -`);
+  const tb = topicBaseProblem(m.topic_base);
+  if (tb) p.push(`${at}.topic_base ${tb}`);
+  if (m.qos !== undefined && m.qos !== 0 && m.qos !== 1) p.push(`${at}.qos must be 1 (default) or 0`);
+  for (const k of ["username_ref", "password_ref", "ca_file"] as const) {
+    if (m[k] !== undefined && !isSecretRef(m[k])) p.push(`${at}.${k} must be ${k === "ca_file" ? "file:/absolute/path" : "env:NAME or file:/absolute/path"}`);
+  }
+  if (m.ca_file !== undefined && !m.ca_file.trim().startsWith("file:")) p.push(`${at}.ca_file must be file:/absolute/path`);
+  if (m.password_ref !== undefined && m.username_ref === undefined) p.push(`${at}.password_ref needs username_ref`);
+  if (m.batch_ms !== undefined && !(Number.isFinite(m.batch_ms) && m.batch_ms >= 0 && m.batch_ms <= 5000)) p.push(`${at}.batch_ms must be 0-5000`);
+  for (const k of ["reconnect_min_ms", "reconnect_max_ms"] as const) {
+    if (m[k] !== undefined && !(Number.isFinite(m[k]) && m[k]! >= 10 && m[k]! <= 3_600_000)) p.push(`${at}.${k} must be 10-3600000`);
+  }
+  return p;
+}
+
 /** Per key debounce: a trigger fires again only after debounce_s. */
 export class Debouncer {
   private readonly last = new Map<string, number>();
@@ -185,6 +251,22 @@ export class Debouncer {
     this.last.set(key, now);
     return true;
   }
+  /** Entries whose key starts with prefix (for persistence). */
+  entries(prefix: string): Array<[string, number]> {
+    return [...this.last].filter(([k]) => k.startsWith(prefix));
+  }
+  restore(key: string, at: number): void {
+    const prev = this.last.get(key);
+    if (prev === undefined || at > prev) this.last.set(key, at);
+  }
+}
+
+/** Persisted energy state older than this is ignored at start (the outage it describes is history). */
+export const ENERGY_STATE_MAX_AGE_MS = 24 * 3600 * 1000;
+
+interface EnergyStateFile {
+  version: 1;
+  sites: Record<string, { at: number; status: EnergyStatus; debounce: Record<string, number> }>;
 }
 
 export interface TeslaDeps {
@@ -220,6 +302,8 @@ export class TeslaAdapter implements SourceAdapter {
   private authFailures = 0;
   private lastTokenUsed: string | undefined;
   private readonly now: () => number;
+  private energyFile = "";
+  private readonly energySavedAt = new Map<string, number>();
 
   constructor(
     private readonly cfg: TeslaConfig,
@@ -253,19 +337,24 @@ export class TeslaAdapter implements SourceAdapter {
   async start(): Promise<void> {
     const t = this.cfg.telemetry;
     if (t?.enabled) {
+      const mode = t.mode ?? "decoded";
       this.receiver =
         this.deps.receiver ??
-        ((t.mode ?? "decoded") === "mtls"
+        (mode === "mtls"
           ? new MtlsTelemetryReceiver({ listen: t.listen!, cert: this.pem(t.tls_cert!), key: this.pem(t.tls_key!), clientCa: this.pem(t.client_ca!) })
-          : this.decodedReceiver(t));
+          : mode === "mqtt"
+            ? this.mqttReceiver(t.mqtt!)
+            : this.decodedReceiver(t));
       await this.receiver.start({
         record: (r) =>
           void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin })),
         drop: (reason, vin, count) => this.dropped(reason, vin, count),
+        event: (e) => this.ctx.audit({ action: "connection", outcome: e.outcome, reason: `mqtt_${e.reason}`, ms: "ms" in e ? e.ms : undefined }),
       });
     }
     const e = this.cfg.energy_poll;
     if (e?.enabled) {
+      this.loadEnergyState();
       this.energy = this.deps.energy ?? new FleetEnergyClient({ apiBase: e.api_base!, getToken: () => this.token(), fetchImpl: this.deps.fetchImpl });
       const every = Math.max(60, e.interval_s ?? 300) * 1000;
       this.timer = setInterval(() => this.safeTick(), every);
@@ -273,6 +362,39 @@ export class TeslaAdapter implements SourceAdapter {
       if (this.deps.pollOnStart !== false) this.safeTick();
     }
     this.ctx.log.info(`[tesla] started telemetry=${t?.enabled ? (t.mode ?? "decoded") : "off"} energy=${Boolean(e?.enabled)}`);
+  }
+
+  /** Refs are resolved here; a configured ref that doesn't resolve fails the start (never "no auth"). */
+  private mqttReceiver(m: TeslaMqttConfig): MqttTelemetryReceiver {
+    const kind = (ref: string) => (ref.trim().startsWith("file:") ? "file" : ref.trim());
+    const need = (label: string, ref: string | undefined): (() => string | undefined) | undefined => {
+      if (ref === undefined) return undefined;
+      if (!this.ctx.secret(ref)) throw new Error(`tesla: telemetry.mqtt.${label} is set but does not resolve (${kind(ref)})`);
+      // Re-read on each reconnect; keep the last good value if the ref is briefly empty mid-rotation.
+      let last = this.ctx.secret(ref);
+      return () => (last = this.ctx.secret(ref) ?? last);
+    };
+    let url = m.broker.trim();
+    if (isSecretRef(url)) {
+      const v = this.ctx.secret(url);
+      if (!v) throw new Error(`tesla: telemetry.mqtt.broker is set but does not resolve (${kind(url)})`);
+      const prob = brokerUrlProblem(v, false);
+      if (prob) throw new Error(`tesla: telemetry.mqtt.broker (${kind(url)}) ${prob}`);
+      url = v;
+    }
+    return new MqttTelemetryReceiver({
+      url,
+      clientId: m.client_id,
+      topicBase: m.topic_base,
+      qos: m.qos ?? 1,
+      username: need("username_ref", m.username_ref),
+      password: need("password_ref", m.password_ref),
+      ca: m.ca_file ? this.pem(m.ca_file) : undefined,
+      batchMs: m.batch_ms,
+      reconnectMinMs: m.reconnect_min_ms,
+      reconnectMaxMs: m.reconnect_max_ms,
+      now: this.deps.now,
+    });
   }
 
   private decodedReceiver(t: NonNullable<TeslaConfig["telemetry"]>): DecodedJsonReceiver {
@@ -322,8 +444,12 @@ export class TeslaAdapter implements SourceAdapter {
       this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: r.vin });
       return [];
     }
-    if (r.isResend) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", actor: r.vin });
+    if (r.baseline) {
+      // Replayed value (MQTT retained): only fills fields not seen yet, never fires.
+      const cur = this.lastVehicle.get(r.vin) ?? {};
+      const fresh = Object.fromEntries(Object.entries(r.data).filter(([k]) => !(k in cur)));
+      this.lastVehicle.set(r.vin, mergeState(cur, fresh).next);
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", actor: r.vin });
       return [];
     }
     const at = Date.parse(r.createdAt);
@@ -336,6 +462,11 @@ export class TeslaAdapter implements SourceAdapter {
     const prev = this.lastVehicle.get(r.vin);
     const { next, delta } = mergeState(prev, r.data);
     this.lastVehicle.set(r.vin, next);
+    if (r.isResend) {
+      // A resend carries un-acked values: keep the state current, but never fire on it.
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", actor: r.vin });
+      return [];
+    }
     const hits = deriveVehicleTriggers(prev, delta, { lowBatteryPercent: this.cfg.telemetry?.low_battery_percent });
     return this.fire("vehicle", r.vin, hits, r.createdAt || new Date(this.now()).toISOString());
   }
@@ -448,7 +579,58 @@ export class TeslaAdapter implements SourceAdapter {
     this.lastEnergy.set(s.siteId, merged);
     const hits = deriveEnergyTriggers(prev, merged, this.cfg.energy_poll?.reserve_margin_percent).map((on) => ({ on }));
     const detail = gridOutage(merged) ? (unintentionalOutage(merged) ? "unintentional outage" : "intentional off-grid") : undefined;
-    return this.fire("energy", s.siteId, hits, new Date(this.now()).toISOString(), detail);
+    const fired = await this.fire("energy", s.siteId, hits, new Date(this.now()).toISOString(), detail);
+    this.energySavedAt.set(s.siteId, this.now());
+    this.saveEnergyState();
+    return fired;
+  }
+
+  /**
+   * Energy state survives restarts: the last good status and the debounce times per allowlisted
+   * site, in <data dir>/tesla-energy-state.json (mode 600, written atomically). A restart during
+   * an outage then compares against the saved status and doesn't re-fire. Entries older than
+   * 24 h, or for sites no longer allowlisted, are ignored. No data dir = memory only.
+   */
+  private loadEnergyState(): void {
+    this.energyFile = this.ctx.dataFile?.("energy-state.json") ?? "";
+    if (!this.energyFile) return;
+    let raw: EnergyStateFile;
+    try {
+      raw = JSON.parse(readFileSync(this.energyFile, "utf8")) as EnergyStateFile;
+    } catch {
+      return; // none yet (or unreadable: start fresh)
+    }
+    if (raw?.version !== 1 || !raw.sites || typeof raw.sites !== "object") return;
+    let n = 0;
+    for (const [site, v] of Object.entries(raw.sites)) {
+      if (!this.siteAllowed(site) || !v || typeof v.at !== "number" || this.now() - v.at > ENERGY_STATE_MAX_AGE_MS) continue;
+      if (v.status && typeof v.status === "object" && hasEnergyData({ ...v.status, siteId: site })) {
+        this.lastEnergy.set(site, { ...v.status, siteId: site });
+      }
+      for (const [k, at] of Object.entries(v.debounce ?? {})) if (k.startsWith(`${site}:`) && typeof at === "number") this.debounce.restore(k, at);
+      this.energySavedAt.set(site, v.at);
+      n++;
+    }
+    if (n) this.ctx.audit({ action: "observe", outcome: "ok", reason: "energy_state_restored", count: n });
+  }
+
+  private saveEnergyState(): void {
+    if (!this.energyFile) return;
+    const sites: EnergyStateFile["sites"] = {};
+    for (const [site, status] of this.lastEnergy) {
+      if (!this.siteAllowed(site)) continue;
+      sites[site] = { at: this.energySavedAt.get(site) ?? this.now(), status, debounce: Object.fromEntries(this.debounce.entries(`${site}:`)) };
+    }
+    const tmp = `${this.energyFile}.tmp`;
+    try {
+      mkdirSync(dirname(this.energyFile), { recursive: true });
+      rmSync(tmp, { force: true });
+      writeFileSync(tmp, JSON.stringify({ version: 1, sites } satisfies EnergyStateFile), { mode: 0o600 });
+      chmodSync(tmp, 0o600);
+      renameSync(tmp, this.energyFile);
+    } catch {
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "energy_state_write_failed" });
+    }
   }
 
   private async fire(kind: "vehicle" | "energy", id: string, hits: TriggerHit<TeslaTrigger>[], at: string, detail?: string): Promise<TeslaTrigger[]> {
