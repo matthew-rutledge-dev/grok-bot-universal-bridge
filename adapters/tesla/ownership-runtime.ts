@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, posix, win32 } from "node:path";
 import type { AdapterContext } from "../../core/bridge.js";
 import { EnergyApiError, type FetchLike } from "./energy.js";
 import type { TelemetryRecord, TelemetryValue } from "./fields.js";
@@ -81,7 +81,7 @@ export function validateOwnership(o: OwnershipConfig | undefined, vinAllowlist: 
   if (r) {
     if (r.api_base !== undefined && !/^https:\/\/[^/]+/.test(r.api_base)) p.push(`${at}.rest.api_base must be an https URL`);
     if (r.nhtsa_base !== undefined && !/^https:\/\/[^/]+/.test(r.nhtsa_base)) p.push(`${at}.rest.nhtsa_base must be an https URL`);
-    if (r.token_ref !== undefined && !/^(env:[A-Za-z_][A-Za-z0-9_]*|file:\/.+)$/.test(r.token_ref.trim())) p.push(`${at}.rest.token_ref must be env:NAME or file:/path`);
+    if (r.token_ref !== undefined && !isTokenRef(r.token_ref)) p.push(`${at}.rest.token_ref must be env:NAME or file:/path`);
     if (r.enabled && !r.api_base) p.push(`${at}.rest.api_base is required when rest is enabled`);
     if (r.enabled && !r.token_ref) p.push(`${at}.rest.token_ref is required when rest is enabled`);
     for (const k of ["service_h", "warranty_h", "recalls_h", "recent_alerts_h"] as const) {
@@ -104,6 +104,20 @@ const SAVE_EVERY_MS = 30_000;
 export interface OwnershipDeps {
   now: () => number;
   fetchImpl?: FetchLike;
+}
+
+/**
+ * env:NAME, or file:<absolute path>. Absolute means POSIX (/...) or Windows (C:\..., C:/..., or a UNC path \\server\share\...),
+ * whatever OS validates the config, so a config written for one host checks the same everywhere.
+ * Relative and drive-relative (C:foo) paths are refused: they depend on the working directory.
+ */
+export function isTokenRef(ref: unknown): boolean {
+  if (typeof ref !== "string") return false;
+  const r = ref.trim();
+  if (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(r)) return true;
+  if (!r.startsWith("file:") || r.length <= 5) return false;
+  const f = r.slice(5);
+  return isAbsolute(f) || posix.isAbsolute(f) || win32.isAbsolute(f);
 }
 
 /** Wires OwnershipTracker into the adapter: state file, submit, digest timer, REST pulls. */
@@ -162,8 +176,10 @@ export class OwnershipRuntime {
     this.timer.unref?.();
   }
 
+  /** Idempotent: clears the tick timer and writes state once. */
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
     this.save(true);
   }
 

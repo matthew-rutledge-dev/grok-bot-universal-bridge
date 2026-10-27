@@ -458,21 +458,28 @@ test("mqtt: a broker that keeps refusing the subscribe gets exponential backoff,
 });
 
 test("mqtt: with ownership on, alerts/<name>/current is subscribed and feeds ownership events; history/errors ignored", async () => {
-  const br = await broker();
-  const m = await mockRoutine({ key: "routine-key" });
-  const dir = mkdtempSync(join(tmpdir(), "mqtt-own-"));
-  const base = mqttCfg(br.url());
-  const cfg: TeslaConfig = {
-    ...base,
-    ownership: { enabled: true, vehicles: [{ vin: VIN, vehicle_id: "car-a" }] },
-    routes: [...base.routes.filter((r) => r.match.kind !== "ownership"), { id: "example-ownership", enabled: true, match: { kind: "ownership" }, allowActors: [VIN], agent: "example-agent" }],
-  };
-  assert.deepEqual(validateTeslaConfig(cfg), []);
-  assert.equal(alertSubscriptionFor(BASE), "telemetry/+/alerts/+/current");
-  const a = new TeslaAdapter(cfg);
-  const b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") });
-  const p = await publisher(br.url());
+  // Every handle is registered as soon as it exists and closed in finally, even if a later step throws.
+  const closers: Array<() => Promise<unknown> | unknown> = [];
   try {
+    const br = await broker();
+    closers.push(() => br.down());
+    const m = await mockRoutine({ key: "routine-key" });
+    closers.push(() => m.close());
+    const dir = mkdtempSync(join(tmpdir(), "mqtt-own-"));
+    const base = mqttCfg(br.url());
+    const cfg: TeslaConfig = {
+      ...base,
+      ownership: { enabled: true, vehicles: [{ vin: VIN, vehicle_id: "car-a" }] },
+      routes: [...base.routes.filter((r) => r.match.kind !== "ownership"), { id: "example-ownership", enabled: true, match: { kind: "ownership" }, allowActors: [VIN], agent: "example-agent" }],
+    };
+    assert.deepEqual(validateTeslaConfig(cfg), []);
+    assert.equal(alertSubscriptionFor(BASE), "telemetry/+/alerts/+/current");
+    const a = new TeslaAdapter(cfg);
+    closers.push(() => a.stop());
+    const b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") });
+    closers.push(() => b.close());
+    const p = await publisher(br.url());
+    closers.push(() => p.close());
     await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"));
     const alert = { Name: "UI_a001_Example", StartedAt: "2026-10-27T12:00:00Z", Audiences: ["Customer"] };
     await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/history`, JSON.stringify([alert]));
@@ -492,9 +499,6 @@ test("mqtt: with ownership on, alerts/<name>/current is subscribed and feeds own
     await until(() => a.ownershipRuntime()!.pending()["car-a"] === 1);
     assert.equal(m.hits.length, 1);
   } finally {
-    await p.close();
-    await b.close();
-    await m.close();
-    await br.down();
+    for (const c of closers.reverse()) await Promise.resolve().then(c).catch(() => undefined);
   }
 });

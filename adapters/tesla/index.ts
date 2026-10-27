@@ -451,8 +451,10 @@ export class TeslaAdapter implements SourceAdapter {
     });
   }
 
+  /** Idempotent: clears the energy poll timer, stops the receiver and the ownership runtime. */
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
     await this.receiver?.stop().catch(() => undefined);
     await this.ownership?.stop();
   }

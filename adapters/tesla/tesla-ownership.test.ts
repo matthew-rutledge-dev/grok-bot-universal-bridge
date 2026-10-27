@@ -21,6 +21,7 @@ import {
   parseWarranty,
   TeslaAdapter,
   validateTeslaConfig,
+  isTokenRef,
   type CarState,
   type DigestState,
   type FetchLike,
@@ -29,6 +30,20 @@ import {
   type TeslaConfig,
 } from "./index.js";
 import { mockRoutine, startBridge } from "../../test/helpers.js";
+
+/** Teardown stack: every server, bridge and adapter is closed even when a test fails half-way (no leaked handles). */
+function teardown() {
+  const fns: Array<() => unknown> = [];
+  return {
+    add<T>(v: T, close: (v: T) => unknown): T {
+      fns.push(() => close(v));
+      return v;
+    },
+    async run(): Promise<void> {
+      for (const f of fns.reverse()) await Promise.resolve().then(f).catch(() => undefined);
+    },
+  };
+}
 
 const example = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8")) as TeslaConfig;
 // Placeholder VINs: position 4 is the model (3, Y), position 10 the model year (L = 2020).
@@ -346,20 +361,22 @@ test("ownership config: example validates; VINs must be allowlisted; ids unique;
 test("ownership e2e: two cars, immediate vs weekly digest per car, state file mode 600, restart doesn't repeat, no full VIN", async () => {
   const dir = mkdtempSync(join(tmpdir(), "own-e2e-"));
   let clock = T0;
-  const m = await mockRoutine({ key: "routine-key" });
-  const mk = () => new TeslaAdapter(ownCfg(dir), { now: () => clock, pollOnStart: false });
-  let a = mk();
-  let b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") });
-  const post = async (records: unknown[]) => {
-    const res = await fetch(`http://127.0.0.1:${a.telemetryPort()}/records`, { method: "POST", body: records.map((r) => JSON.stringify(r)).join("\n") });
-    assert.equal(res.status, 202);
-    await new Promise((r) => setTimeout(r, 150));
-  };
-  let t = T0;
-  const rec = (vin: string, data: Record<string, unknown>) => ({ vin, createdAt: iso((t += 1000)), data: Object.entries(data).map(([key, value]) => ({ key, value })) });
-  const D = (n: number) => ({ doubleValue: n });
-  const S = (s: string) => ({ stringValue: s });
+  const td = teardown();
   try {
+    const m = td.add(await mockRoutine({ key: "routine-key" }), (x) => x.close());
+    const mk = () => td.add(new TeslaAdapter(ownCfg(dir), { now: () => clock, pollOnStart: false }), (x) => x.stop());
+    const up = async (ad: TeslaAdapter) => td.add(await startBridge({ routineUrl: m.url, adapters: [ad], holdFile: join(dir, "hold.json") }), (x) => x.close());
+    let a = mk();
+    let b = await up(a);
+    const post = async (records: unknown[]) => {
+      const res = await fetch(`http://127.0.0.1:${a.telemetryPort()}/records`, { method: "POST", body: records.map((r) => JSON.stringify(r)).join("\n") });
+      assert.equal(res.status, 202);
+      await new Promise((r) => setTimeout(r, 150));
+    };
+    let t = T0;
+    const rec = (vin: string, data: Record<string, unknown>) => ({ vin, createdAt: iso((t += 1000)), data: Object.entries(data).map(([key, value]) => ({ key, value })) });
+    const D = (n: number) => ({ doubleValue: n });
+    const S = (s: string) => ({ stringValue: s });
     await post([rec(CAR_A, { Odometer: D(999), TpmsPressureFl: D(psi(42)) }), rec(CAR_B, { Odometer: D(20999), TpmsPressureFl: D(psi(42)) })]);
     assert.equal(m.hits.length, 0, "baselines");
     // Car A: low tire by > 5 psi (immediate). Car B: odometer milestone (digest).
@@ -382,12 +399,12 @@ test("ownership e2e: two cars, immediate vs weekly digest per car, state file mo
     const rt = a.ownershipRuntime()!;
     assert.deepEqual(rt.pending(), { "car-a": 1, "car-b": 1 });
     const file = join(dir, "tesla-ownership-state.json");
-    assert.equal(statSync(file).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
     assert.equal(readFileSync(file, "utf8").includes(CAR_A), false, "state is keyed by vehicle_id, never the VIN");
     // Restart: state survives, nothing repeats.
     await b.close();
     a = mk();
-    b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") });
+    b = await up(a);
     await post([rec(CAR_A, { TpmsPressureFl: D(psi(35.1)), Version: S("2026.38.2") }), rec(CAR_B, { Odometer: D(21000.9) })]);
     assert.equal(m.hits.length, 2, "no repeats after restart");
     assert.deepEqual(a.ownershipRuntime()!.pending(), { "car-a": 1, "car-b": 1 });
@@ -403,8 +420,7 @@ test("ownership e2e: two cars, immediate vs weekly digest per car, state file mo
     const all = JSON.stringify(m.hits) + JSON.stringify(b.audit.lines);
     assert.equal(all.includes(CAR_A) || all.includes(CAR_B), false, "no full VIN in prompts or audit");
   } finally {
-    await b.close();
-    await m.close();
+    await td.run();
   }
 });
 
@@ -424,10 +440,11 @@ test("ownership REST pull: service_data / warranty / NHTSA recalls / release not
     else if (url.includes("/release_notes")) body = { response: { release_notes: [{ title: "Example feature", image_url: "https://example.com/i.png" }] } };
     return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify(body) };
   };
-  const m = await mockRoutine({ key: "routine-key" });
-  const a = new TeslaAdapter(ownCfg(dir, {}, true), { now: () => clock, pollOnStart: false, fetchImpl });
-  const b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") });
+  const td = teardown();
   try {
+    const m = td.add(await mockRoutine({ key: "routine-key" }), (x) => x.close());
+    const a = td.add(new TeslaAdapter(ownCfg(dir, {}, true), { now: () => clock, pollOnStart: false, fetchImpl }), (x) => x.stop());
+    td.add(await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") }), (x) => x.close());
     const rt = a.ownershipRuntime()!;
     const first = await rt.pullDue();
     assert.deepEqual(first.map((e) => `${e.vehicle_id}/${e.event_type}`).sort(), ["car-a/recall", "car-a/warranty_status", "car-b/recall", "car-b/warranty_status"]);
@@ -454,7 +471,21 @@ test("ownership REST pull: service_data / warranty / NHTSA recalls / release not
     assert.deepEqual(notes[0].data.notes, [{ title: "Example feature", subtitle: undefined }]);
     assert.equal(calls.filter((c) => c.url.includes("release_notes")).length, 1);
   } finally {
-    await b.close();
-    await m.close();
+    await td.run();
   }
+});
+
+test("rest.token_ref: env:NAME or file:<absolute path> (POSIX, Windows drive, UNC) on any OS; relative and drive-relative refused", () => {
+  for (const ok of ["env:TESLA_ACCESS_TOKEN", "file:/run/secrets/tesla-access", "file:C:\\secrets\\tesla-access", "file:D:/secrets/tesla-access", "file:\\\\fileserver\\share\\tesla-access", `file:${join(tmpdir(), "tok")}`]) {
+    assert.equal(isTokenRef(ok), true, ok);
+  }
+  for (const bad of ["vault:x", "env:", "env:1BAD", "file:", "file:tok", "file:./tok", "file:C:tok", "/run/secrets/tesla-access", 42]) {
+    assert.equal(isTokenRef(bad), false, String(bad));
+  }
+  const ok = { ...ownCfg(tmpdir(), {}, true) };
+  const v = (c: TeslaConfig) => validateTeslaConfig(c).join("\n");
+  for (const ref of ["file:C:\\secrets\\tok", "file:\\\\fileserver\\share\\tok", "file:/run/secrets/tok", `file:${join(tmpdir(), "tok")}`]) {
+    assert.doesNotMatch(v({ ...ok, ownership: { ...ok.ownership!, rest: { ...ok.ownership!.rest!, token_ref: ref } } }), /token_ref/, ref);
+  }
+  assert.match(v({ ...ok, ownership: { ...ok.ownership!, rest: { ...ok.ownership!.rest!, token_ref: "file:tok" } } }), /rest\.token_ref must be env:NAME or file:\/path/);
 });
