@@ -19,7 +19,7 @@ async function code(p: Promise<unknown>): Promise<string> {
   }
 }
 
-test("isPrivateAddress: NAT64, IPv4-compatible / mapped in any spelling, 198.18/15", () => {
+test("isPrivateAddress: NAT64, 6to4, Teredo, IPv4-compatible / mapped in any spelling, 198.18/15", () => {
   const priv = [
     h6("64", "ff9b", "", v4(8, 8, 8, 8)), // NAT64 well-known prefix, even for a public v4
     h6("64", "ff9b", "", "808", "808"),
@@ -30,6 +30,10 @@ test("isPrivateAddress: NAT64, IPv4-compatible / mapped in any spelling, 198.18/
     `::ffff:${v4(8, 8, 8, 8)}`, // mapped: always refused
     h6("", "", "ffff", "a00", "1"),
     h6("0", "0", "0", "0", "0", "ffff", "a00", "1"), // fully expanded mapped
+    h6("2002", "a00", "1", "", "1"), // 6to4 wrapping a private v4
+    h6("2002", "808", "808", "", "1"), // 6to4 (whole /16 refused)
+    h6("2001", "0", "4136", "e378", "8000", "63bf", "3fff", "fdd2"), // Teredo
+    h6("2001", "", "1"),
     v4(198, 18, 0, 1),
     v4(198, 19, 255, 254),
     "fe80::1%eth0",
@@ -37,7 +41,7 @@ test("isPrivateAddress: NAT64, IPv4-compatible / mapped in any spelling, 198.18/
     h6("0", "0", "0", "0", "0", "0", "0", "1"),
   ];
   for (const ip of priv) assert.equal(isPrivateAddress(ip), true, ip);
-  for (const ip of ["203.0.113.10", v4(198, 20, 0, 1), v4(198, 17, 255, 255), "2001:db8::1", h6("64", "ff9c", "", "1")]) {
+  for (const ip of ["203.0.113.10", v4(198, 20, 0, 1), v4(198, 17, 255, 255), "2001:db8::1", h6("2001", "1", "", "1"), h6("2003", "", "1"), h6("64", "ff9c", "", "1")]) {
     assert.equal(isPrivateAddress(ip), false, ip);
   }
   assert.deepEqual(ipv6Hextets(`::ffff:${v4(10, 0, 0, 1)}`), [0, 0, 0, 0, 0, 0xffff, 0x0a00, 1]);

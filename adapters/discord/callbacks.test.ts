@@ -116,7 +116,7 @@ test("multipart callbacks: payload_json or text fields + file parts, same caps a
 });
 
 test("DM-by-userId callbacks: deny by default, allowlisted users only", async () => {
-  const s0 = await setup({ dmCallbacks: undefined });
+  const s0 = await setup({ dmCallbacks: undefined, dm: undefined, dmRoutes: undefined });
   try {
     const r = await s0.b.call("POST", "/discord/callback", { userId: USER, content: "hi" }, auth);
     assert.deepEqual([r.status, r.body.error], [403, "user_not_allowlisted"], "no dmCallbacks = deny");

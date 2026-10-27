@@ -60,4 +60,4 @@ Discord and Tesla development **continues against the current named bridges** in
 
 ## Not in v0.1 (tracked)
 
-Discord: `/discord/voice/*` is **pending live**. CI uses an in-memory voice port, and the manual check (`scripts/voice-live-check.mjs`, docs/VOICE-LIVE-TEST.md) runs after cutover. Tesla: the bridge's own mTLS mode does not decode native vehicle frames (flatbuffers + protobuf); real cars go through fleet-telemetry's decoded mode. Hold-file encryption at rest (it's mode 600 inside the volume today). Multi-instance HA. The bridge is single-writer by design.
+Discord: parity with the older bridge is tracked in docs/MIGRATION-DISCORD.md (parity table, converter, cutover, rollback). `/discord/voice/*` is **pending live**. CI uses an in-memory voice port, and the manual check (`scripts/voice-live-check.mjs`, docs/VOICE-LIVE-TEST.md) runs after cutover. Tesla: the bridge's own mTLS mode does not decode native vehicle frames (flatbuffers + protobuf); real cars go through fleet-telemetry's decoded mode. Hold-file encryption at rest (it's mode 600 inside the volume today). Multi-instance HA. The bridge is single-writer by design.

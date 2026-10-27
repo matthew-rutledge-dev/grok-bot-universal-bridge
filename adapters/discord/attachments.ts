@@ -223,8 +223,9 @@ export function ipv6Hextets(ip: string): number[] | undefined {
 
 /**
  * Private, loopback, link-local, CGNAT, benchmarking (198.18/15), unspecified,
- * multicast/reserved, ULA, NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), and every
- * IPv4-compatible (::a.b.c.d) or IPv4-mapped (::ffff:a.b.c.d) form, in any spelling.
+ * multicast/reserved, ULA, NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), 6to4 (2002::/16) and
+ * Teredo (2001::/32), which can embed a private IPv4, and every IPv4-compatible (::a.b.c.d)
+ * or IPv4-mapped (::ffff:a.b.c.d) form, in any spelling.
  */
 export function isPrivateAddress(ip: string): boolean {
   const v = ip.replace(/^\[|\]$/g, "").toLowerCase();
@@ -244,6 +245,8 @@ export function isPrivateAddress(ip: string): boolean {
   if (zeros(6)) return true; // ::a.b.c.d (IPv4-compatible, deprecated)
   if (h[0] === 0x64 && h[1] === 0xff9b && h.slice(2, 6).every((x) => x === 0)) return true; // NAT64 well-known
   if (h[0] === 0x64 && h[1] === 0xff9b && h[2] === 1) return true; // NAT64 local-use
+  if (h[0] === 0x2002) return true; // 6to4: embeds an IPv4 (could be private)
+  if (h[0] === 0x2001 && h[1] === 0) return true; // Teredo: embeds an (obfuscated) IPv4
   const top = h[0];
   return (top & 0xfe00) === 0xfc00 || (top & 0xffc0) === 0xfe80 || (top & 0xff00) === 0xff00;
 }

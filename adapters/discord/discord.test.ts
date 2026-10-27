@@ -9,6 +9,8 @@ const example = JSON.parse(readFileSync(new URL("./config.example.json", import.
 const env = { DISCORD_BOT_TOKEN: "aaa.bbb.ccc", DISCORD_CALLBACK_TOKEN: "cb-discord" };
 const cfg = (): DiscordAdapterConfig => ({
   ...example,
+  dm: undefined,
+  dmRoutes: undefined,
   routes: [
     ...example.routes.filter((r) => r.id !== "example-dm"),
     { id: "dm", enabled: true, match: { dm: "true" }, allowActors: [USER], agent: "example-agent", slug: "dm" },

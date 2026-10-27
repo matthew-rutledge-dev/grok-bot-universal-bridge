@@ -192,6 +192,8 @@ export class MtlsTelemetryReceiver implements TelemetryReceiver {
     this.server.on("request", (_req, res) => res.writeHead(426).end());
     // Failed handshakes (scanners, no/foreign client cert) are counted, not logged one by one:
     // the first failure in a window writes a line, the rest are summed into the next line.
+    // No timer: a pending count stays unwritten until the next failure after the window or
+    // stop() (flushTls), so the audit file can lag behind a burst.
     this.server.on("tlsClientError", (_e, sock) => {
       sock.destroy();
       this.tlsFailures++;

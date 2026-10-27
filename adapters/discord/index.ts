@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { dirname } from "node:path";
 import { validateRoutes } from "../../core/allowlist.js";
 import { isSecretRef } from "../../core/secrets.js";
-import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
+import { legacyPathProblem, type AdapterContext, type SourceAdapter } from "../../core/bridge.js";
 import type { HeldItem } from "../../core/hold.js";
 import type { HttpResponse } from "../../core/http.js";
 import { MultipartBody, MultipartError } from "../../core/multipart.js";
@@ -20,7 +20,8 @@ import {
   wakeRefs,
   type ResolvedAttachment,
 } from "./attachments.js";
-import { chunk, formatPrompt, stripMention } from "./format.js";
+import { chunk, formatLegacyPrompt, formatPrompt, stripMention, type WakePromptFormat } from "./format.js";
+import { UserDirectory, type WakeIdentity } from "./users.js";
 import {
   CHAT_HANDLER,
   CHAT_WORKING_DELAY_MS,
@@ -90,9 +91,37 @@ export interface DiscordAdapterConfig {
     /** Grok Build chat hop: post the working message only after this long (default 15 s). */
     chatWorkingDelayMs?: number;
   };
-  /** Callbacks that DM a user by id. Deny by default: only these user ids. */
+  /** Callbacks that DM a user by id. Deny by default: only these user ids (plus the dm section's users, below). */
   dmCallbacks?: { allowUsers: string[] };
   voice?: VoiceConfig;
+  /**
+   * Direct messages, per user. Deny by default. Use this OR a `{ dm: "true" }` route, not both.
+   * policy: "allowlist" (default) = only dmRoutes users and allowUsers; "pairing" = also users an
+   * owner paired with `!pair <userId>` (memory only, like the older bridge); "disabled" = ignore DMs.
+   */
+  dm?: {
+    policy?: "allowlist" | "pairing" | "disabled";
+    /** Users allowed to DM without their own agent: they get defaultAgent. */
+    allowUsers?: string[];
+    /** Registry alias for allowUsers and paired users. Unset = those users are refused (no agent). */
+    defaultAgent?: string;
+    /** May run `!pair <userId>` (DM or any channel the bot sees); may receive DM callbacks. */
+    ownerIds?: string[];
+    /** Trailer slug (default "dm"). */
+    slug?: string;
+    /** Trailer map= value for defaultAgent users (default: the alias). */
+    map?: string;
+  };
+  /** One user -> one agent. Same allowlist as DM callbacks by userId. */
+  dmRoutes?: { userId: string; agent: string; map?: string }[];
+  /** Extra channels callbacks may post to that have no inbound route (outbound only). */
+  callbackChannels?: string[];
+  /** Also serve these root paths (agents/handlers still on an older bridge's URLs). Same auth. */
+  legacyPaths?: { callback?: string; voicePlay?: string; voiceStream?: string };
+  /** "compact" (default) or "legacy" (the older bridge's d:-line + thin JSON). */
+  wakePromptFormat?: WakePromptFormat;
+  /** Optional read-only seed of operator labels (host-only file path). */
+  users?: { seedPath?: string };
 }
 
 export interface DiscordAdapterOptions {
@@ -102,6 +131,8 @@ export interface DiscordAdapterOptions {
   grokVoiceUrl?: string;
   /** Planner pulse interval (default 5 s). */
   pulseMs?: number;
+  /** Chat-hop typing interval (default 8 s). */
+  typingMs?: number;
 }
 
 export const PLANNER_DONE_EMOJI = "✅";
@@ -110,6 +141,12 @@ export const HOLD_STATUS_TEXT = "Bot is waking up, holding your message…";
 export const HOLD_DELIVERED_TEXT = "Delivered. The bot is on it.";
 export const HOLD_GAVE_UP_TEXT = "❌ Couldn't reach the bot, please try again.";
 export const FAILED_TEXT = "❌ Couldn't deliver that message.";
+export const NOT_PAIRED_TEXT = "Not paired. Ask the owner to run `!pair <yourId>` (deny-by-default).";
+export const DELIVERED_EMOJI = "✅";
+export const NOT_ACCEPTED_EMOJI = "⚠️";
+export const FAILED_EMOJI = "❌";
+/** Callback text cap (chunked into 2000-character messages). */
+export const MAX_CALLBACK_CONTENT = 32_000;
 
 export interface DiscordCallbackBody {
   channelId?: unknown;
@@ -170,6 +207,35 @@ export function validateDiscordConfig(raw: unknown): string[] {
     const u = c.dmCallbacks?.allowUsers;
     if (!Array.isArray(u) || u.some((x) => typeof x !== "string" || !SNOWFLAKE.test(x))) p.push("discord.dmCallbacks.allowUsers must be an array of user ids (no wildcards)");
   }
+  const ids = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string" && SNOWFLAKE.test(x));
+  if (c.dm !== undefined || c.dmRoutes !== undefined) {
+    if ((c.routes ?? []).some((r) => r?.match && "dm" in r.match)) p.push('discord: use dm/dmRoutes or a { dm: "true" } route, not both');
+    const d = c.dm ?? {};
+    if (d.policy !== undefined && !["allowlist", "pairing", "disabled"].includes(d.policy)) p.push("discord.dm.policy must be allowlist, pairing or disabled");
+    if (d.allowUsers !== undefined && !ids(d.allowUsers)) p.push("discord.dm.allowUsers must be user ids (no wildcards)");
+    if (d.ownerIds !== undefined && !ids(d.ownerIds)) p.push("discord.dm.ownerIds must be user ids");
+    if (d.defaultAgent !== undefined && (typeof d.defaultAgent !== "string" || !d.defaultAgent)) p.push("discord.dm.defaultAgent must be a registry alias");
+    if (d.slug !== undefined && !/^[A-Za-z0-9._-]{1,64}$/.test(String(d.slug))) p.push("discord.dm.slug must be a short name");
+    if (c.dmRoutes !== undefined) {
+      if (!Array.isArray(c.dmRoutes)) p.push("discord.dmRoutes must be an array");
+      else {
+        const seen = new Set<string>();
+        c.dmRoutes.forEach((r, i) => {
+          if (!r || typeof r.userId !== "string" || !SNOWFLAKE.test(r.userId)) p.push(`discord.dmRoutes[${i}].userId must be a user id (no wildcards)`);
+          else if (seen.has(r.userId)) p.push(`discord.dmRoutes[${i}]: user listed twice`);
+          else seen.add(r.userId);
+          if (!r || typeof r.agent !== "string" || !r.agent) p.push(`discord.dmRoutes[${i}].agent must be a registry alias`);
+        });
+      }
+    }
+  }
+  if (c.callbackChannels !== undefined && !ids(c.callbackChannels)) p.push("discord.callbackChannels must be channel ids");
+  if (c.wakePromptFormat !== undefined && c.wakePromptFormat !== "compact" && c.wakePromptFormat !== "legacy") p.push("discord.wakePromptFormat must be compact or legacy");
+  for (const [k, v] of Object.entries(c.legacyPaths ?? {})) {
+    const problem = legacyPathProblem(v, ["discord", "grokbuild", "tesla"]);
+    if (problem) p.push(`discord.legacyPaths.${k}: ${problem}`);
+  }
+  if (c.users?.seedPath !== undefined && typeof c.users.seedPath !== "string") p.push("discord.users.seedPath must be a file path");
   if (c.planner?.callbackUrl !== undefined && !/^https?:\/\/[^\s]+$/.test(String(c.planner.callbackUrl))) {
     p.push("discord.planner.callbackUrl must be an http(s) URL");
   }
@@ -181,12 +247,36 @@ export function messageToEvent(
   m: IncomingDiscordMessage,
   botUserId: string | null,
   routes: Route[],
+  opts: { format?: WakePromptFormat; who?: WakeIdentity; label?: string; callbackUrl?: string } = {},
 ): { event?: InboundEvent; skip?: "bot_author" | "empty" } {
   const text = stripMention(m.content, botUserId);
   if (!text && !(m.attachments?.length)) return { skip: "empty" };
-  const match: Record<string, string> = m.guildId ? { guild: m.guildId, channel: m.channelId } : { dm: "true" };
-  const route = routes.find((r) => Object.keys(r.match).every((k) => r.match[k] === match[k]));
+  // DMs carry the user too, so dmRoutes can send each user to their own agent ({ dm } routes still match).
+  const match: Record<string, string> = m.guildId ? { guild: m.guildId, channel: m.channelId } : { dm: "true", user: m.authorId };
+  const route = routes.find((r) => Object.keys(r.match).length > 0 && Object.keys(r.match).every((k) => r.match[k] === match[k]));
   const slug = typeof route?.slug === "string" && route.slug ? route.slug : m.guildId ? "channel" : "dm";
+  const refs = wakeRefs(m.attachments);
+  const args = {
+    slug,
+    messageId: m.id,
+    guildId: m.guildId,
+    channelId: m.channelId,
+    userId: m.authorId,
+    label: opts.label ?? m.authorLabel,
+    alias: typeof route?.map === "string" ? route.map : (route?.agent ?? ""),
+    text,
+    channelName: m.channelName,
+    attachments: refs,
+    who: opts.who,
+  };
+  const who = opts.who && Object.keys(opts.who).length ? opts.who : undefined;
+  let callbackBaseUrl: string | undefined;
+  let callbackPath: string | undefined;
+  try {
+    if (opts.callbackUrl) ({ origin: callbackBaseUrl, pathname: callbackPath } = new URL(opts.callbackUrl));
+  } catch {
+    /* no callback URL */
+  }
   return {
     event: {
       eventId: m.id,
@@ -195,19 +285,18 @@ export function messageToEvent(
       actorGroups: m.roleIds,
       match,
       addressed: m.guildId ? m.mentionsBot : true,
-      prompt: formatPrompt({
-        slug,
-        messageId: m.id,
-        guildId: m.guildId,
-        channelId: m.channelId,
-        userId: m.authorId,
-        label: m.authorLabel,
-        alias: route?.agent ?? "",
-        text,
-        channelName: m.channelName,
-        attachments: wakeRefs(m.attachments),
-      }),
-      metadata: { hop: `d:${slug}:${m.id}`, ...(m.attachments?.length ? { attachments: wakeRefs(m.attachments) } : {}) },
+      prompt: opts.format === "legacy" ? formatLegacyPrompt(args) : formatPrompt(args),
+      // Same fields as the older bridge's sendPrompt metadata (source is set by the core).
+      metadata: {
+        hop: `d:${slug}:${m.id}`,
+        discordMessageId: m.id,
+        discordChannelId: m.channelId,
+        discordUserId: m.authorId,
+        discordGuildId: m.guildId,
+        ...(who ? { discordUser: who } : {}),
+        ...(callbackBaseUrl ? { callbackBaseUrl, callbackPath } : {}),
+        ...(refs.length ? { attachments: refs } : {}),
+      },
       ref: m.guildId ? { channelId: m.channelId, messageId: m.id } : { channelId: m.channelId, messageId: m.id, dm: "true" },
     },
   };
@@ -228,6 +317,12 @@ export class DiscordAdapter implements SourceAdapter {
   /** Chat hops whose working message isn't posted yet: origin id -> cancel. */
   private readonly chatHolds = new Map<string, () => void>();
   private voice?: VoiceService;
+  private users?: UserDirectory;
+  /** Users an owner paired with !pair (memory only). */
+  private readonly paired = new Set<string>();
+  /** Chat hops showing "typing…": origin id -> stop. */
+  private readonly chatTyping = new Map<string, () => void>();
+  readonly legacyCallbackPath?: string;
 
   constructor(
     private readonly cfg: DiscordAdapterConfig,
@@ -236,8 +331,53 @@ export class DiscordAdapter implements SourceAdapter {
   ) {
     const problems = validateDiscordConfig(cfg);
     if (problems.length) throw new Error(problems.join("; "));
-    this.routes = cfg.routes;
+    // Config routes first; per-user DM routes after (config can't also have a { dm } route).
+    this.routes = [...cfg.routes, ...dmRoutesFor(cfg)];
     this.callbackTokenRef = cfg.callbackTokenRef;
+    this.legacyCallbackPath = cfg.legacyPaths?.callback;
+  }
+
+  private get dmPolicy(): "allowlist" | "pairing" | "disabled" | undefined {
+    if (!this.cfg.dm && !this.cfg.dmRoutes) return undefined;
+    return this.cfg.dm?.policy ?? "allowlist";
+  }
+
+  /** May a callback open a DM with this user? Deny by default. */
+  dmCallbackAllowed(userId: string): boolean {
+    if ((this.cfg.dmCallbacks?.allowUsers ?? []).includes(userId)) return true;
+    const policy = this.dmPolicy;
+    if (!policy || policy === "disabled") return false;
+    if ((this.cfg.dmRoutes ?? []).some((r) => r.userId === userId)) return true;
+    if ((this.cfg.dm?.allowUsers ?? []).includes(userId) || (this.cfg.dm?.ownerIds ?? []).includes(userId)) return true;
+    return policy === "pairing" && this.paired.has(userId);
+  }
+
+  /** `!pair <userId>` from an owner: memory-only DM access with the default agent. */
+  private async pairCommand(m: IncomingDiscordMessage): Promise<boolean> {
+    if (this.dmPolicy !== "pairing") return false;
+    const raw = m.content.trim();
+    if (!raw.startsWith("!pair ") || !(this.cfg.dm?.ownerIds ?? []).includes(m.authorId)) return false;
+    const target = raw.slice(6).trim().replace(/[<@!>]/g, "");
+    if (!SNOWFLAKE.test(target)) return true;
+    this.paired.add(target);
+    const d = this.cfg.dm!;
+    const has = this.routes.some((r) => r.match.dm === "true" && r.match.user === target);
+    if (!has && d.defaultAgent) {
+      this.routes.push({ id: "dm-paired", enabled: true, match: { dm: "true", user: target }, allowActors: [target], agent: d.defaultAgent, slug: d.slug ?? "dm", ...(d.map ? { map: d.map } : {}) });
+    }
+    this.ctx.audit({ action: "inbound", outcome: "allow", reason: "dm_paired", actor: target, lane: m.channelId });
+    await this.port.send(m.channelId, `paired ${target}`, { replyTo: m.id }).catch(() => undefined);
+    return true;
+  }
+
+  health(): Record<string, unknown> {
+    return {
+      ready: this.port.isReady ? this.port.isReady() : false,
+      hasTokenConfigured: Boolean(this.ctx?.secret(this.cfg.tokenRef)),
+      callbackPath: "/discord/callback",
+      ...(this.legacyCallbackPath ? { legacyCallbackPath: this.legacyCallbackPath } : {}),
+      routes: this.routes.filter((r) => r.enabled).length,
+    };
   }
 
   init(ctx: AdapterContext): void {
@@ -256,9 +396,12 @@ export class DiscordAdapter implements SourceAdapter {
       });
       this.voice = voice;
       const max = { maxBytes: 24 * 1024 * 1024 };
-      ctx.authedRoute("POST", "voice/play", "voice", (req) => voice.play(req.body), max);
-      ctx.authedRoute("POST", "voice/stream", "voice", (req) => voice.streamOp(req.body), max);
+      ctx.authedRoute("POST", "voice/play", "voice", (req) => voice.play(req.body), { ...max, legacyPath: this.cfg.legacyPaths?.voicePlay });
+      ctx.authedRoute("POST", "voice/stream", "voice", (req) => voice.streamOp(req.body), { ...max, legacyPath: this.cfg.legacyPaths?.voiceStream });
     }
+    this.users = new UserDirectory({ file: ctx.dataFile("user-directory.json"), seedPath: this.cfg.users?.seedPath, warn: (l) => ctx.log.warn(l) });
+    const u = this.users.load();
+    ctx.log.info(`[discord] user directory users=${u.users} seed=${u.seeded}`);
     this.dmFile = ctx.dataFile("dm-channels.json");
     if (this.dmFile) {
       try {
@@ -289,12 +432,21 @@ export class DiscordAdapter implements SourceAdapter {
   async start(): Promise<void> {
     const token = this.ctx.secret(this.cfg.tokenRef);
     if (!token) throw new Error("discord: bot token missing (fail-closed)");
-    await this.port.connect(token, (m) => void this.onMessage(m));
+    await this.port.connect(
+      token,
+      (m) => void this.onMessage(m),
+      (u) => {
+        if (!u.bot) this.users?.learn(u);
+      },
+    );
     this.ctx.log.info(`[discord] connected routes=${this.routes.length}`);
   }
 
   async stop(): Promise<void> {
     this.voice?.close();
+    this.users?.flush();
+    for (const stopTyping of this.chatTyping.values()) stopTyping();
+    this.chatTyping.clear();
     this.planner.stopAll();
     for (const cancel of this.chatHolds.values()) cancel();
     this.chatHolds.clear();
@@ -307,12 +459,29 @@ export class DiscordAdapter implements SourceAdapter {
       this.ctx.audit({ action: "inbound", outcome: "skipped", reason: "bot_author", eventId: m.id, lane: m.channelId });
       return undefined;
     }
-    const { event, skip } = messageToEvent(m, this.port.botUserId(), this.routes);
+    // Every human author, before the allowlist: names and times only (labels for the prompt).
+    this.users?.learn({ id: m.authorId, username: m.authorUsername ?? m.authorLabel, globalName: m.authorGlobalName, displayName: m.authorDisplayName });
+    if (await this.pairCommand(m)) return undefined;
+    if (!m.guildId && this.dmPolicy === "disabled") {
+      this.ctx.audit({ action: "inbound", outcome: "skipped", reason: "dm_disabled", eventId: m.id, lane: m.channelId });
+      return undefined;
+    }
+    const { event, skip } = messageToEvent(m, this.port.botUserId(), this.routes, {
+      format: this.cfg.wakePromptFormat,
+      who: this.users?.identity(m.authorId),
+      label: this.users?.label(m.authorId, m.authorLabel),
+      callbackUrl: this.ctx.callbackUrl,
+    });
     if (!event) {
       this.ctx.audit({ action: "inbound", outcome: "skipped", reason: skip, eventId: m.id, lane: m.channelId });
       return undefined;
     }
     const authz = this.ctx.check(event);
+    if (!authz.ok && !m.guildId && this.dmPolicy === "pairing" && (authz.reason === "no_route" || authz.reason === "actor_not_allowlisted")) {
+      this.ctx.audit({ action: "inbound", outcome: "deny", reason: "dm_not_paired", eventId: m.id, lane: m.channelId, actor: m.authorId });
+      await this.port.send(m.channelId, NOT_PAIRED_TEXT, { replyTo: m.id }).catch(() => undefined);
+      return { accepted: false, reason: authz.reason };
+    }
     const refs = wakeRefs(m.attachments);
     if (authz.ok && refs.length) {
       // Content-free: count, declared bytes, kinds. No names, no URLs.
@@ -388,6 +557,15 @@ export class DiscordAdapter implements SourceAdapter {
       }, delay);
       hold.unref?.();
       this.chatHolds.set(m.id, () => clearTimeout(hold));
+      // Typing starts at once and repeats every 8 s until the reply (or pulseMaxMs).
+      if (this.port.typing) {
+        const typing = () => void this.port.typing!(m.channelId).catch(() => undefined);
+        typing();
+        const maxMs = this.cfg.planner?.pulseMaxMs ?? 30 * 60_000;
+        const t = setInterval(() => (Date.now() - t0 > maxMs ? this.stopTyping(m.id) : typing()), this.opts.typingMs ?? 8000);
+        t.unref?.();
+        this.chatTyping.set(m.id, () => clearInterval(t));
+      }
     } else {
       await postWorking();
     }
@@ -415,6 +593,7 @@ export class DiscordAdapter implements SourceAdapter {
     if (signal === "accepted") {
       await this.port.react(m.channelId, m.id, PLANNER_DONE_EMOJI).catch(() => undefined);
     } else if (signal === "start_failed") {
+      this.stopTyping(m.id);
       this.chatHolds.get(m.id)?.();
       this.chatHolds.delete(m.id);
       this.planner.forget(m.id);
@@ -425,6 +604,12 @@ export class DiscordAdapter implements SourceAdapter {
       this.ctx.log.warn(`[discord] planner ${signal} (not a final failure)`);
     }
     return signal;
+  }
+
+  private stopTyping(id: string | undefined): void {
+    if (!id) return;
+    this.chatTyping.get(id)?.();
+    this.chatTyping.delete(id);
   }
 
   readonly ui = {
@@ -439,9 +624,12 @@ export class DiscordAdapter implements SourceAdapter {
       }
       return this.port.send(ch, HOLD_STATUS_TEXT, { replyTo: item.ref?.messageId });
     },
-    delivered: async (item: HeldItem) => {
+    delivered: async (item: HeldItem, result?: { body?: unknown }) => {
       const ch = item.ref?.channelId;
       if (ch && item.statusRef) await this.port.edit(ch, item.statusRef, HOLD_DELIVERED_TEXT);
+      // Same reactions as the older bridge: ✅ accepted, ⚠️ answered but not accepted.
+      const notAccepted = (result?.body as { accepted?: unknown } | null | undefined)?.accepted === false;
+      if (ch && item.ref?.messageId) await this.port.react(ch, item.ref.messageId, notAccepted ? NOT_ACCEPTED_EMOJI : DELIVERED_EMOJI).catch(() => undefined);
     },
     failed: async (item: HeldItem, _err: unknown, info: { held: boolean }) => {
       const ch = item.ref?.channelId;
@@ -449,18 +637,20 @@ export class DiscordAdapter implements SourceAdapter {
       const text = info.held ? HOLD_GAVE_UP_TEXT : FAILED_TEXT;
       if (item.statusRef) await this.port.edit(ch, item.statusRef, text);
       else await this.port.send(ch, text, { replyTo: item.ref?.messageId });
+      if (item.ref?.messageId) await this.port.react(ch, item.ref.messageId, FAILED_EMOJI).catch(() => undefined);
     },
   };
 
-  /** Channels replies may target: enabled guild routes plus allowlisted DM channels. */
+  /** Channels replies may target: enabled guild routes, callbackChannels, allowlisted DM channels. */
   replyAllowed(channelId: string): boolean {
     if (this.dmChannels.has(channelId)) return true;
+    if ((this.cfg.callbackChannels ?? []).includes(channelId)) return true;
     return this.routes.some((r) => r.enabled && r.match.channel === channelId);
   }
 
   /** multipart/form-data callback -> the JSON body shape plus uploaded files. */
   private fromMultipart(mp: MultipartBody): { body: DiscordCallbackBody; uploads: UploadedFile[] } {
-    const parts = mp.parse({ maxParts: 32, maxFieldBytes: 64 * 1024 });
+    const parts = mp.parse({ maxParts: 32, maxFieldBytes: 256 * 1024 });
     const body: Record<string, unknown> = {};
     const uploads: UploadedFile[] = [];
     const json = parts.find((p) => p.name === "payload_json" && p.filename === undefined);
@@ -500,14 +690,15 @@ export class DiscordAdapter implements SourceAdapter {
     const userId = typeof b.userId === "string" ? b.userId : "";
     const content = typeof b.content === "string" ? b.content : "";
     if (channelId && userId) return { status: 400, body: { ok: false, error: "channelId_or_userId_not_both" } };
-    if (!userId && !SNOWFLAKE.test(channelId)) return { status: 400, body: { ok: false, error: "channelId required" } };
+    if (!userId && !SNOWFLAKE.test(channelId)) return { status: 400, body: { ok: false, error: "channelId_required" } };
     if (userId && !SNOWFLAKE.test(userId)) return { status: 400, body: { ok: false, error: "userId invalid" } };
     const hasFiles = (Array.isArray(b.attachments) && b.attachments.length > 0) || uploads.length > 0;
     if (!content.trim() && !hasFiles) return { status: 400, body: { ok: false, error: "content_or_attachment_required" } };
-    if (content.length > 8000) return { status: 413, body: { ok: false, error: "content too long (max 8000)" } };
+    if (content.length > MAX_CALLBACK_CONTENT) return { status: 413, body: { ok: false, error: "content_too_long", max: MAX_CALLBACK_CONTENT } };
+    if (this.port.isReady && !this.port.isReady()) return { status: 503, body: { ok: false, error: "discord_not_ready" } };
     if (userId) {
-      // DM by user id: deny by default, only explicitly allowlisted users.
-      if (!(this.cfg.dmCallbacks?.allowUsers ?? []).includes(userId)) {
+      // DM by user id: deny by default; dmRoutes users, dm.allowUsers/ownerIds, paired users, dmCallbacks.allowUsers.
+      if (!this.dmCallbackAllowed(userId)) {
         this.ctx.audit({ action: "callback", outcome: "deny", reason: "dm_user_not_allowlisted", actor: userId });
         return { status: 403, body: { ok: false, error: "user_not_allowlisted" } };
       }
@@ -546,6 +737,7 @@ export class DiscordAdapter implements SourceAdapter {
         });
       }
     }
+    this.stopTyping(replyTo);
     // A chat-hop reply that beats the working-message delay: cancel it, answer as a new reply.
     if (replyTo && this.chatHolds.has(replyTo)) {
       this.chatHolds.get(replyTo)!();
@@ -577,7 +769,7 @@ export class DiscordAdapter implements SourceAdapter {
         ids.push(await this.port.send(channelId, parts[i], { replyTo: first ? replyTo : undefined, ...(first && !edited ? { files: out } : {}) }));
       }
     } catch (err) {
-      return { status: 502, body: { ok: false, error: "discord_send_failed", detail: (err as Error).name } };
+      return { status: 502, body: { ok: false, error: "deliver_failed", detail: (err as Error).name } };
     }
     if (replyTo && remembered) this.planner.forget(replyTo);
     let thread = false;
@@ -590,7 +782,8 @@ export class DiscordAdapter implements SourceAdapter {
         this.ctx.log.warn("[discord] thread post failed");
       }
     }
-    return { status: 200, body: { ok: true, messageIds: ids, edited, attachments: files.length, thread } };
+    // messageId + chunks: the older bridge's response shape; messageIds: every message.
+    return { status: 200, body: { ok: true, messageId: ids[0], messageIds: ids, chunks: parts.length, edited, attachments: files.length, thread } };
   }
 }
 
@@ -598,6 +791,26 @@ export interface PlannerStarted {
   planner: true;
   /** Resolves with the planner signal once the HTTP call returns. */
   done: Promise<PlannerUserSignal>;
+}
+
+/** Routes for the dm section: one per dmRoutes user, then allowUsers with the default agent. */
+export function dmRoutesFor(cfg: DiscordAdapterConfig): Route[] {
+  if (!cfg.dm && !cfg.dmRoutes) return [];
+  const d = cfg.dm ?? {};
+  const enabled = (d.policy ?? "allowlist") !== "disabled";
+  const slug = d.slug ?? "dm";
+  const out: Route[] = [];
+  for (const r of cfg.dmRoutes ?? []) {
+    out.push({ id: "dm-user", enabled, match: { dm: "true", user: r.userId }, allowActors: [r.userId], agent: r.agent, slug, ...(r.map ? { map: r.map } : {}) });
+  }
+  if (d.defaultAgent) {
+    const routed = new Set((cfg.dmRoutes ?? []).map((r) => r.userId));
+    for (const u of d.allowUsers ?? []) {
+      if (routed.has(u)) continue;
+      out.push({ id: "dm-default", enabled, match: { dm: "true", user: u }, allowActors: [u], agent: d.defaultAgent, slug, ...(d.map ? { map: d.map } : {}) });
+    }
+  }
+  return out;
 }
 
 function kindsOf(types: string[]): string {

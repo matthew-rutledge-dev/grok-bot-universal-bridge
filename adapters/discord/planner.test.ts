@@ -195,7 +195,7 @@ test("nit 7: an enabled local-planner route without a callback token ref or call
   assert.match(validateDiscordConfig(noToken).join(), /callbackTokenRef required when a local-planner or grokbuild-chat route is enabled/);
   const off = { ...noToken, routes: example.routes.map((r) => (r.handler ? { ...r, enabled: false } : r)) };
   assert.ok(!validateDiscordConfig(off).join().includes("callbackTokenRef required"), "a disabled planner route is fine");
-  const ctx = { callbackUrl: "", dataFile: () => "", authedRoute: () => undefined, secret: () => undefined } as never;
+  const ctx = { callbackUrl: "", dataFile: () => "", authedRoute: () => undefined, secret: () => undefined, log: { info: () => undefined, warn: () => undefined, error: () => undefined } } as never;
   assert.throws(() => new DiscordAdapter(example, new FakeDiscordPort(BOT)).init(ctx), /local-planner \/ grokbuild-chat route needs a callback URL/);
   new DiscordAdapter({ ...example, planner: { ...example.planner!, callbackUrl: "https://bridge.example.com/discord/callback" } }, new FakeDiscordPort(BOT)).init(ctx);
 });

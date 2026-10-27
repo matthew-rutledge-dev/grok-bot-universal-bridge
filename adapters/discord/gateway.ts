@@ -114,7 +114,11 @@ export async function createGatewayPort(): Promise<DiscordPort> {
 
   return {
     voice,
-    async connect(token, onMessage) {
+    async connect(token, onMessage, onUser) {
+      client.on("interactionCreate", (i) => {
+        const member = i.member as { displayName?: string } | null;
+        onUser?.({ id: i.user.id, username: i.user.username, globalName: i.user.globalName, displayName: member?.displayName, bot: i.user.bot });
+      });
       client.on("messageCreate", (msg) => {
         const me = client.user?.id ?? null;
         const m: IncomingDiscordMessage = {
@@ -124,6 +128,9 @@ export async function createGatewayPort(): Promise<DiscordPort> {
           authorId: msg.author.id,
           authorIsBot: msg.author.bot,
           authorLabel: msg.member?.displayName ?? msg.author.globalName ?? msg.author.username,
+          authorUsername: msg.author.username,
+          authorGlobalName: msg.author.globalName,
+          authorDisplayName: msg.member?.displayName,
           roleIds: msg.member ? [...msg.member.roles.cache.keys()] : [],
           content: msg.content,
           mentionsBot: Boolean(me && msg.mentions.users.has(me)),
@@ -147,6 +154,11 @@ export async function createGatewayPort(): Promise<DiscordPort> {
       await client.destroy();
     },
     botUserId: () => client.user?.id ?? null,
+    isReady: () => client.isReady(),
+    async typing(channelId) {
+      const ch = await client.channels.fetch(channelId);
+      if (ch && "sendTyping" in ch) await (ch as { sendTyping(): Promise<unknown> }).sendTyping();
+    },
     async send(channelId, content, opts) {
       const ch = await textChannel(channelId);
       const sent = await ch.send({

@@ -19,18 +19,6 @@
       "slug": "example-chat"
     },
     {
-      "id": "example-dm",
-      "enabled": false,
-      "match": {
-        "dm": "true"
-      },
-      "allowActors": [
-        "333333333333333333"
-      ],
-      "agent": "example-agent",
-      "slug": "dm"
-    },
-    {
       "id": "example-planner",
       "enabled": true,
       "match": {
@@ -82,5 +70,27 @@
   },
   "dmCallbacks": {
     "allowUsers": []
-  }
+  },
+  "dm": {
+    "policy": "allowlist",
+    "allowUsers": [],
+    "defaultAgent": "example-agent",
+    "ownerIds": [
+      "333333333333333333"
+    ],
+    "slug": "dm"
+  },
+  "dmRoutes": [
+    {
+      "userId": "333333333333333333",
+      "agent": "example-agent"
+    }
+  ],
+  "callbackChannels": [],
+  "legacyPaths": {
+    "callback": "/callback",
+    "voicePlay": "/voice/play",
+    "voiceStream": "/voice/stream"
+  },
+  "wakePromptFormat": "compact"
 }

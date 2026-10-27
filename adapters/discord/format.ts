@@ -60,3 +60,33 @@ export function chunk(text: string, max = 2000): string[] {
   if (rest) out.push(rest);
   return out;
 }
+
+export type WakePromptFormat = "compact" | "legacy";
+
+/**
+ * Legacy wake prompt (the older bridge's WAKE_PROMPT_FORMAT=legacy, its 0.2.13 shape):
+ *
+ *   d:<slug>:<msgId>
+ *   {"id":"d:<slug>:<msgId>","g":<guildId|null>,"u":"<userId>","map":"<alias>","un"?,"dn"?,"lb"?,"c":"<channelId>","a"?:[{url,filename?,contentType?,size?}]}
+ *   <text>
+ *
+ * Kept only for rollback of agent-side readers; compact is the default.
+ */
+export function formatLegacyPrompt(a: PromptArgs & { who?: { un?: string; dn?: string; lb?: string } }): string {
+  const id = `d:${a.slug}:${a.messageId}`;
+  const thin: Record<string, unknown> = { id, g: a.guildId, u: a.userId, map: a.alias };
+  if (a.who?.un) thin.un = a.who.un;
+  if (a.who?.dn) thin.dn = a.who.dn;
+  if (a.who?.lb) thin.lb = a.who.lb;
+  if (a.channelId) thin.c = a.channelId;
+  if (a.attachments?.length) {
+    thin.a = a.attachments.map((r) => ({
+      url: r.url,
+      ...(r.filename ? { filename: r.filename } : {}),
+      ...(r.contentType ? { contentType: r.contentType } : {}),
+      ...(typeof r.size === "number" ? { size: r.size } : {}),
+    }));
+  }
+  // The user's text can't fake the first two lines: they are always written by the bridge first.
+  return [id, JSON.stringify(thin), a.text].join("\n");
+}

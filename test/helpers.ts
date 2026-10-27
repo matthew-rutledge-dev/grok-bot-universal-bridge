@@ -186,9 +186,19 @@ export class FakeDiscordPort implements DiscordPort {
   private handler: ((m: IncomingDiscordMessage) => void) | undefined;
   connectedWith = "";
   constructor(private readonly me = "444444444444444444") {}
-  async connect(token: string, onMessage: (m: IncomingDiscordMessage) => void) {
+  userHandler: ((u: { id: string; username?: string; globalName?: string | null; displayName?: string | null; bot?: boolean }) => void) | undefined;
+  ready = true;
+  typings: string[] = [];
+  async connect(token: string, onMessage: (m: IncomingDiscordMessage) => void, onUser?: FakeDiscordPort["userHandler"]) {
     this.connectedWith = token ? "token" : "";
     this.handler = onMessage;
+    this.userHandler = onUser;
+  }
+  isReady() {
+    return this.ready;
+  }
+  async typing(channelId: string) {
+    this.typings.push(channelId);
   }
   async disconnect() {
     this.handler = undefined;
@@ -272,7 +282,12 @@ export async function startBridge(opts: {
   holdFile?: string;
   delayMs?: (f: number) => number;
   rateLimit?: number;
+  /** Extra registry aliases (same mock routine, distinct agent ids). */
+  agents?: Record<string, string>;
 }) {
+  const extra = Object.fromEntries(
+    Object.entries(opts.agents ?? {}).map(([alias, agentId]) => [alias, { agentId, deliver: { kind: "webhook" as const, urlRef: "env:AGENT_URL", keyRef: "env:AGENT_KEY" } }]),
+  );
   const env = { AGENT_URL: opts.routineUrl, AGENT_KEY: "routine-key", ...(opts.env ?? {}) };
   const registry = Registry.fromObject(
     {
@@ -280,6 +295,7 @@ export async function startBridge(opts: {
       agents: {
         "example-agent": { agentId: "11111111-1111-4111-8111-111111111111", deliver: { kind: "webhook", urlRef: "env:AGENT_URL", keyRef: "env:AGENT_KEY" } },
         "broken-agent": { agentId: "x", deliver: { kind: "webhook", urlRef: "env:AGENT_URL", keyRef: "env:MISSING" } },
+        ...extra,
       },
     },
     env,

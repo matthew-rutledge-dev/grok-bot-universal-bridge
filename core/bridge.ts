@@ -34,7 +34,7 @@ export interface AdapterContext {
     subpath: string,
     action: AuditEntry["action"],
     handler: Handler,
-    opts?: { maxBytes?: number },
+    opts?: { maxBytes?: number; legacyPath?: string },
   ): void;
   secret(ref: string | undefined): string | undefined;
   state(eventId: string): EventState | undefined;
@@ -60,6 +60,23 @@ export interface SourceAdapter {
   readonly ui?: Partial<HoldUi>;
   /** Agent reply. Body already authenticated by the core. */
   handleCallback?(body: unknown): Promise<HttpResponse>;
+  /**
+   * Optional extra root path for the same callback (e.g. "/callback" for agents still
+   * configured with an older bridge's URL). Same auth, rate limit and size cap.
+   */
+  readonly legacyCallbackPath?: string;
+  /** Extra /healthz fields under health.<adapter>. A boolean `ready` also shows as `<adapter>Ready`. */
+  health?(): Record<string, unknown>;
+}
+
+/** A legacy root path: "/x" or "/x/y", lowercase, not /healthz and not under an adapter prefix. */
+export function legacyPathProblem(path: unknown, adapterNames: readonly string[]): string | undefined {
+  if (path === undefined) return undefined;
+  if (typeof path !== "string" || !/^\/[a-z0-9][a-z0-9_-]*(\/[a-z0-9][a-z0-9_-]*)*$/.test(path)) return `legacy path ${String(path)} must look like /callback`;
+  if (path === "/healthz") return "legacy path /healthz is reserved";
+  const first = path.split("/")[1];
+  if (adapterNames.includes(first)) return `legacy path ${path} collides with the /${first}/ adapter prefix`;
+  return undefined;
 }
 
 export interface BridgeOptions {
@@ -115,10 +132,21 @@ export class Bridge {
         });
       },
     });
-    opts.http.route("GET", "/healthz", () => ({
-      status: 200,
-      body: { ok: true, adapters: [...this.adapters.keys()], held: this.hold.heldCount() },
-    }));
+    opts.http.route("GET", "/healthz", () => {
+      const health: Record<string, Record<string, unknown>> = {};
+      const flat: Record<string, boolean> = {};
+      for (const [name, a] of this.adapters) {
+        if (!a.health) continue;
+        try {
+          const h = a.health();
+          health[name] = h;
+          if (typeof h.ready === "boolean") flat[`${name}Ready`] = h.ready;
+        } catch {
+          health[name] = { error: "health_failed" };
+        }
+      }
+      return { status: 200, body: { ok: true, adapters: [...this.adapters.keys()], held: this.hold.heldCount(), ...flat, health } };
+    });
   }
 
   async add(adapter: SourceAdapter): Promise<void> {
@@ -134,8 +162,15 @@ export class Bridge {
       check: (event) => authorize(adapter.routes, event),
       audit: (entry) => this.opts.audit.write({ ...entry, adapter: name }),
       route: (method, subpath, handler, o) => this.opts.http.route(method, `/${name}/${subpath.replace(/^\/+/, "")}`, handler, o),
-      authedRoute: (method, subpath, action, handler, o) =>
-        this.opts.http.route(method, `/${name}/${subpath.replace(/^\/+/, "")}`, this.guard(adapter, action, handler), o),
+      authedRoute: (method, subpath, action, handler, o) => {
+        const guarded = this.guard(adapter, action, handler);
+        this.opts.http.route(method, `/${name}/${subpath.replace(/^\/+/, "")}`, guarded, o);
+        if (o?.legacyPath) {
+          const problem = legacyPathProblem(o.legacyPath, [...this.adapters.keys()]);
+          if (problem) throw new Error(`${name}: ${problem}`);
+          this.opts.http.route(method, o.legacyPath, guarded, o);
+        }
+      },
       secret: (ref) => resolveSecret(ref, this.opts.env ?? process.env),
       raw: (ref) => readRef(ref, this.opts.env ?? process.env),
       state: (eventId) => this.stateOf(`${name}:${eventId}`),
@@ -241,12 +276,13 @@ export class Bridge {
   }
 
   private registerCallback(adapter: SourceAdapter): void {
-    this.opts.http.route(
-      "POST",
-      `/${adapter.name}/callback`,
-      this.guard(adapter, "callback", (req) => adapter.handleCallback!(req.body)),
-      { maxBytes: adapter.callbackMaxBytes },
-    );
+    const guarded = this.guard(adapter, "callback", (req) => adapter.handleCallback!(req.body));
+    this.opts.http.route("POST", `/${adapter.name}/callback`, guarded, { maxBytes: adapter.callbackMaxBytes });
+    if (adapter.legacyCallbackPath !== undefined) {
+      const problem = legacyPathProblem(adapter.legacyCallbackPath, [...this.adapters.keys()]);
+      if (problem) throw new Error(`${adapter.name}: ${problem}`);
+      this.opts.http.route("POST", adapter.legacyCallbackPath, guarded, { maxBytes: adapter.callbackMaxBytes });
+    }
   }
 
   /**

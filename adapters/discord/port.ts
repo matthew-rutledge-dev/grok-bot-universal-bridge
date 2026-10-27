@@ -18,6 +18,10 @@ export interface IncomingDiscordMessage {
   authorIsBot: boolean;
   /** Display label (display name / username). Shown to the agent only. */
   authorLabel: string;
+  /** Raw names for the user directory (optional; authorLabel is the fallback). */
+  authorUsername?: string;
+  authorGlobalName?: string | null;
+  authorDisplayName?: string | null;
   roleIds: string[];
   content: string;
   mentionsBot: boolean;
@@ -54,7 +58,16 @@ export interface VoicePort {
 
 export interface DiscordPort {
   /** Connect and call onMessage for every message the bot can see. */
-  connect(token: string, onMessage: (m: IncomingDiscordMessage) => void): Promise<void>;
+  connect(
+    token: string,
+    onMessage: (m: IncomingDiscordMessage) => void,
+    /** Interaction users (names only, for the user directory). */
+    onUser?: (u: { id: string; username?: string; globalName?: string | null; displayName?: string | null; bot?: boolean }) => void,
+  ): Promise<void>;
+  /** Gateway logged in and ready (healthz discordReady). */
+  isReady?(): boolean;
+  /** Show "typing…" in a channel (lasts about 10 s). */
+  typing?(channelId: string): Promise<void>;
   disconnect(): Promise<void>;
   botUserId(): string | null;
   /** Post a message. Returns its id. */
