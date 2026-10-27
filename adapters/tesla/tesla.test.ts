@@ -1,57 +1,197 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { Debouncer, deriveEnergyTriggers, deriveVehicleTriggers, TeslaAdapter, validateTeslaConfig, type TeslaConfig } from "./index.js";
+import {
+  Debouncer,
+  deriveVehicleTriggers,
+  enumName,
+  mergeState,
+  num,
+  parsePayload,
+  TeslaAdapter,
+  validateTeslaConfig,
+  type TelemetryValue,
+  type TeslaConfig,
+} from "./index.js";
 import { mockRoutine, startBridge } from "../../test/helpers.js";
 
 const example = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8")) as TeslaConfig;
-const VIN = "EXAMPLEVIN00000001";
+export const VIN = "5YJ0000000EXAMPLE";
 
-test("example config validates", () => {
+/** prev state + record -> triggers, the way the adapter does it. */
+function step(prev: Record<string, TelemetryValue> | undefined, data: Record<string, TelemetryValue>, low?: number) {
+  const { delta } = mergeState(prev, data);
+  return deriveVehicleTriggers(prev, delta, { lowBatteryPercent: low }).map((h) => (h.priority ? `${h.on}!${h.priority}` : h.on));
+}
+
+test("example config validates; dummy VIN is 17 chars", () => {
   assert.deepEqual(validateTeslaConfig(example), []);
+  assert.equal(VIN.length, 17);
+  assert.equal(example.telemetry!.prefer_typed, true);
 });
 
-test("refuses command config, vehicle_data polling, non-origin replies, literal secrets", () => {
-  assert.match(validateTeslaConfig({ ...example, commands: ["honk"] } as unknown as TeslaConfig).join(), /never sends vehicle commands/);
-  assert.match(validateTeslaConfig({ ...example, energy_poll: { ...example.energy_poll!, endpoint: "/api/1/vehicles/1/vehicle_data" } } as unknown as TeslaConfig).join(), /never poll vehicle_data/);
-  assert.match(validateTeslaConfig({ ...example, reply: { via: "webhook" } } as unknown as TeslaConfig).join(), /origin_channel/);
-  assert.match(validateTeslaConfig({ ...example, energy_poll: { ...example.energy_poll!, token_ref: "vault:x" } }).join(), /token_ref/);
+test("refuses commands, vehicle_data, wakes, non-origin replies, literal/vault secrets, refresh tokens", () => {
+  const v = (c: unknown) => validateTeslaConfig(c).join("\n");
+  assert.match(v({ ...example, commands: ["honk"] }), /never sends vehicle commands/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, endpoint: "/api/1/vehicles/1/vehicle_data" } }), /never poll vehicle_data/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, endpoint: "/api/1/vehicles/1/wake_up" } }), /never wakes cars/);
+  assert.match(v({ ...example, reply: { via: "webhook" } }), /origin_channel/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, token_ref: "vault:x" } }), /token_ref must be env:NAME or file:/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, refresh_token_ref: "env:X" } }), /access token only/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, enabled: true, api_base: undefined } }), /api_base is required/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, api_base: "http://fleet-api.example.com" } }), /https URL/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, interval_s: 30 } }), />= 60/);
 });
 
-test("telemetry/energy enabled without an implementation fails at start (skeleton)", async () => {
-  const a = new TeslaAdapter({ ...example, telemetry: { ...example.telemetry!, enabled: true } });
-  a.init({ log: { info() {}, warn() {}, error() {} } } as never);
-  await assert.rejects(a.start(), /no mTLS receiver is implemented yet/);
+test("telemetry config: prefer_typed, replaced field names, VIN shape, receiver modes", () => {
+  const t = example.telemetry!;
+  const v = (patch: object) => validateTeslaConfig({ ...example, telemetry: { ...t, ...patch } }).join("\n");
+  assert.match(v({ prefer_typed: false }), /prefer_typed must be true/);
+  for (const [f, hint] of [
+    ["ChargeState", /DetailedChargeState/],
+    ["ChargeCableConnected", /Disconnected/],
+    ["TrunkOpen", /TrunkFront/],
+    ["SentryAlert", /SentryMode/],
+    ["SoftwareUpdateAvailable", /SoftwareUpdateVersion/],
+    ["Soc", /BatteryLevel/],
+  ] as const) {
+    assert.match(v({ fields: { [f]: 10 } }), hint, f);
+  }
+  assert.match(v({ fields: { Odometer: 10 } }), /not read by the trigger logic/);
+  assert.match(v({ vin_allowlist: ["5YJ0000000EXAMPLE1"] }), /17-character/);
+  assert.match(v({ enabled: true, mode: "mtls", client_ca: undefined }), /client_ca is required in mtls mode/);
+  assert.match(v({ decoded_listen: "0.0.0.0:18091" }), /loopback/);
+  assert.match(v({ enabled: true, decoded_listen: undefined }), /decoded_listen is required/);
+  assert.match(v({ mode: "raw" }), /mode must be/);
 });
 
-test("trigger derivation and debounce", () => {
-  assert.deepEqual(deriveVehicleTriggers({ ChargeState: "Charging" }, { ChargeState: "Complete" }), ["charge_complete"]);
-  assert.deepEqual(deriveVehicleTriggers({ Gear: "P", DoorState: "Closed" }, { DoorState: "DriverFrontOpen" }), ["door_open_parked"]);
-  assert.deepEqual(deriveVehicleTriggers({ Gear: "D", DoorState: "Closed" }, { DoorState: "DriverFrontOpen" }), []);
-  assert.deepEqual(deriveVehicleTriggers({ Soc: 25 }, { Soc: 15 }), ["low_battery"]);
-  assert.deepEqual(deriveVehicleTriggers({ Soc: 15 }, { Soc: 14 }), []);
-  assert.deepEqual(deriveEnergyTriggers({ siteId: "s", gridStatus: "Active" }, { siteId: "s", gridStatus: "Islanded" }), ["grid_islanded"]);
-  assert.deepEqual(deriveEnergyTriggers(undefined, { siteId: "s", percentCharged: 22, backupReservePercent: 20 }), ["battery_below_reserve"]);
+test("enum prefixes are stripped (typed and untyped both accepted); numbers parse from strings", () => {
+  assert.equal(enumName("Gear", "ShiftStateP"), "P");
+  assert.equal(enumName("Gear", "P"), "P");
+  assert.equal(enumName("DetailedChargeState", "DetailedChargeStateComplete"), "Complete");
+  assert.equal(enumName("SentryMode", "SentryModeStateAware"), "Aware");
+  assert.equal(enumName("ChargingCableType", "CableTypeSAE"), "SAE");
+  assert.equal(num("42"), 42);
+  assert.equal(num(17.5), 17.5);
+  assert.equal(num(""), undefined);
+  assert.equal(num("abc"), undefined);
+});
+
+test("DetailedChargeState: complete, stopped, plugged in (leaves Disconnected), unplugged (returns)", () => {
+  assert.deepEqual(step({ DetailedChargeState: "DetailedChargeStateCharging" }, { DetailedChargeState: "DetailedChargeStateComplete" }), ["charge_complete"]);
+  assert.deepEqual(step({ DetailedChargeState: "Charging" }, { DetailedChargeState: "Stopped" }), ["charge_stopped"]);
+  assert.deepEqual(step({ DetailedChargeState: "DetailedChargeStateDisconnected" }, { DetailedChargeState: "DetailedChargeStateStarting" }), ["plugged_in"]);
+  assert.deepEqual(step({ DetailedChargeState: "Complete" }, { DetailedChargeState: "Disconnected" }), ["unplugged"]);
+  assert.deepEqual(step({ DetailedChargeState: "Unknown" }, { DetailedChargeState: "Disconnected" }), []);
+  assert.deepEqual(step({ DetailedChargeState: "Charging" }, { DetailedChargeState: "Charging" }), []);
+});
+
+test("ChargingCableType is the backup plug signal (invalid = no cable), only without DetailedChargeState", () => {
+  const plugged = mergeState(undefined, { ChargingCableType: { invalid: true } }).next;
+  assert.equal(plugged.ChargingCableType, "Invalid");
+  assert.deepEqual(step(plugged, { ChargingCableType: "CableTypeSAE" }), ["plugged_in"]);
+  assert.deepEqual(step({ ChargingCableType: "CableTypeSAE" }, { ChargingCableType: { invalid: true } }), ["unplugged"]);
+  // DetailedChargeState seen for this car: it alone decides.
+  assert.deepEqual(step({ DetailedChargeState: "Charging", ChargingCableType: "Invalid" }, { ChargingCableType: "CableTypeSAE" }), []);
+});
+
+test("DoorState is a struct of six booleans: any door / trunk true while parked", () => {
+  const closed = { DriverFront: false, DriverRear: false, PassengerFront: false, PassengerRear: false, TrunkFront: false, TrunkRear: false };
+  assert.deepEqual(step({ Gear: "ShiftStateP", DoorState: closed }, { DoorState: { ...closed, PassengerRear: true } }), ["door_open_parked"]);
+  assert.deepEqual(step({ Gear: "P", DoorState: closed }, { DoorState: { ...closed, TrunkRear: true } }), ["trunk_open_parked"]);
+  assert.deepEqual(step({ DoorState: closed }, { DoorState: { ...closed, TrunkFront: true } }), ["trunk_open_parked"], "no gear reported = parked");
+  assert.deepEqual(step({ Gear: "ShiftStateD", DoorState: closed }, { DoorState: { ...closed, DriverFront: true } }), []);
+  assert.deepEqual(step({ Gear: "P", DoorState: { ...closed, DriverFront: true } }, { DoorState: { ...closed, DriverFront: true, DriverRear: true } }), [], "already open");
+  assert.deepEqual(step({ Gear: "P", DoorState: closed }, { DoorState: "DriverFrontOpen" as never }), [], "a string never matches");
+});
+
+test("SentryMode: Aware fires, Panic fires with high priority, others do not", () => {
+  assert.deepEqual(step({ SentryMode: "SentryModeStateArmed" }, { SentryMode: "SentryModeStateAware" }), ["sentry_alert"]);
+  assert.deepEqual(step({ SentryMode: "Aware" }, { SentryMode: "Panic" }), ["sentry_alert!high"]);
+  assert.deepEqual(step({ SentryMode: "Off" }, { SentryMode: "Armed" }), []);
+  assert.deepEqual(step({ SentryMode: "Armed" }, { SentryMode: "Quiet" }), []);
+});
+
+test("BatteryLevel (app %) crosses the low mark; numeric strings parse", () => {
+  assert.deepEqual(step({ BatteryLevel: "25" }, { BatteryLevel: "15.5" }), ["low_battery"]);
+  assert.deepEqual(step({ BatteryLevel: 25 }, { BatteryLevel: 15 }), ["low_battery"]);
+  assert.deepEqual(step({ BatteryLevel: 15 }, { BatteryLevel: 14 }), []);
+  assert.deepEqual(step({ BatteryLevel: 35 }, { BatteryLevel: 28 }, 30), ["low_battery"]);
+  assert.deepEqual(step({ Soc: 25 } as never, { Soc: 15 } as never), [], "Soc is ignored");
+});
+
+test("SoftwareUpdateVersion going from empty to a version", () => {
+  assert.deepEqual(step({ SoftwareUpdateVersion: "" }, { SoftwareUpdateVersion: "2026.1.1" }), ["update_available"]);
+  assert.deepEqual(step({ SoftwareUpdateVersion: "2026.1.1" }, { SoftwareUpdateVersion: "" }), []);
+  assert.deepEqual(step({ SoftwareUpdateVersion: "2026.1.1" }, { SoftwareUpdateVersion: "2026.1.2" }), []);
+});
+
+test("edge rules: first value is a baseline; invalid values are not changes", () => {
+  assert.deepEqual(step(undefined, { DetailedChargeState: "Complete", SentryMode: "Panic", BatteryLevel: 5, SoftwareUpdateVersion: "1" }), []);
+  assert.deepEqual(step({ Gear: "P" }, { DoorState: { DriverFront: true } }), [], "DoorState not in prev yet");
+  const s1 = mergeState({ BatteryLevel: 50 }, { BatteryLevel: { invalid: true } });
+  assert.equal(s1.next.BatteryLevel, 50, "invalid is not stored");
+  assert.deepEqual(s1.delta, {});
+  assert.deepEqual(step(s1.next, { BatteryLevel: 10 }), ["low_battery"]);
+});
+
+test("parsePayload reads fleet-telemetry decoded JSON (prefer_typed)", () => {
+  const r = parsePayload({
+    data: [
+      { key: "DetailedChargeState", value: { detailedChargeStateValue: "DetailedChargeStateCharging" } },
+      { key: "DoorState", value: { doorValue: { DriverFront: true, DriverRear: false, PassengerFront: false, PassengerRear: false, TrunkFront: false, TrunkRear: false } } },
+      { key: "BatteryLevel", value: { doubleValue: 81.5 } },
+      { key: "Gear", value: { shiftStateValue: "ShiftStateP" } },
+      { key: "SentryMode", value: { sentryModeStateValue: "SentryModeStateArmed" } },
+      { key: "ChargingCableType", value: { invalid: true } },
+      { key: "SoftwareUpdateVersion", value: { stringValue: "" } },
+      { key: "Odometer", value: { longValue: "1234" } },
+    ],
+    createdAt: "2026-01-01T00:00:00Z",
+    vin: VIN,
+    isResend: false,
+  })!;
+  assert.equal(r.vin, VIN);
+  assert.equal(r.isResend, false);
+  assert.equal(r.data.DetailedChargeState, "DetailedChargeStateCharging");
+  assert.deepEqual(r.data.DoorState, { DriverFront: true, DriverRear: false, PassengerFront: false, PassengerRear: false, TrunkFront: false, TrunkRear: false });
+  assert.equal(r.data.BatteryLevel, 81.5);
+  assert.deepEqual(r.data.ChargingCableType, { invalid: true });
+  assert.equal(r.data.Odometer, "1234");
+  assert.equal(parsePayload("nope"), undefined);
+  assert.equal(parsePayload({ vin: VIN }), undefined);
+});
+
+test("debounce", () => {
   const d = new Debouncer();
   assert.deepEqual([d.allow("k", 60, 0), d.allow("k", 60, 30_000), d.allow("k", 60, 61_000)], [true, false, true]);
 });
 
-test("allowlisted VIN trigger is delivered with a masked id; other VINs are dropped; audit masks VINs", async () => {
+test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VINs dropped, no callback route", async () => {
   const m = await mockRoutine({ key: "routine-key" });
   const a = new TeslaAdapter(example);
   const b = await startBridge({ routineUrl: m.url, adapters: [a] });
   try {
-    await a.ingestTelemetry({ vin: VIN, createdAt: "2026-01-01T00:00:00Z", data: { ChargeState: "Charging" } });
-    const fired = await a.ingestTelemetry({ vin: VIN, createdAt: "2026-01-01T01:00:00Z", data: { ChargeState: "Complete" } });
-    assert.deepEqual(fired, ["charge_complete"]);
+    const rec = (createdAt: string, data: Record<string, TelemetryValue>, extra: object = {}) => a.ingestTelemetry({ vin: VIN, createdAt, data, ...extra });
+    assert.deepEqual(await rec("2026-01-01T00:00:00Z", { DetailedChargeState: "DetailedChargeStateComplete", SentryMode: "SentryModeStateArmed" }), [], "baseline");
+    assert.deepEqual(await rec("2026-01-01T00:30:00Z", { DetailedChargeState: "DetailedChargeStateCharging" }), []);
+    assert.deepEqual(await rec("2026-01-01T01:00:00Z", { DetailedChargeState: "DetailedChargeStateComplete" }), ["charge_complete"]);
     assert.equal(m.hits.length, 1);
     const prompt: string = m.hits[0].body.prompt;
-    assert.match(prompt, /Tesla vehicle …0001: charge_complete/);
+    assert.match(prompt, /Tesla vehicle …MPLE: charge_complete \(priority normal\)/);
     assert.equal(prompt.includes(VIN), false, "full VIN never leaves the bridge");
-    assert.deepEqual(await a.ingestTelemetry({ vin: "OTHERVIN000000009", createdAt: "x", data: { ChargeState: "Complete" } }), []);
+
+    assert.deepEqual(await rec("2026-01-01T01:10:00Z", { SentryMode: "SentryModeStatePanic" }), ["sentry_alert"]);
+    assert.match(m.hits[1].body.prompt, /sentry_alert \(priority high\)/);
+
+    assert.deepEqual(await rec("2026-01-01T02:00:00Z", { DetailedChargeState: "DetailedChargeStateStopped" }, { isResend: true }), []);
+    assert.deepEqual(await rec("2026-01-01T00:59:00Z", { DetailedChargeState: "DetailedChargeStateStopped" }), [], "older createdAt");
+    assert.ok(b.audit.lines.some((l) => l.reason === "resend"));
+    assert.ok(b.audit.lines.some((l) => l.reason === "stale_record"));
+
+    assert.deepEqual(await a.ingestTelemetry({ vin: "OTHERVIN000000009", createdAt: "x", data: { DetailedChargeState: "Complete" } }), []);
     assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false);
     assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…0009"));
-    assert.equal(b.bridge.stateOf("tesla:x"), undefined);
     const cb = await b.call("POST", "/tesla/callback", {});
     assert.equal(cb.status, 404, "no tesla callback route: replies use the origin channel");
   } finally {

@@ -1,33 +1,39 @@
 {
   "telemetry": {
     "enabled": false,
+    "mode": "decoded",
+    "decoded_listen": "127.0.0.1:18091",
     "listen": "0.0.0.0:4443",
     "public_hostname": "telemetry.example.com",
     "tls_cert": "file:/run/secrets/telemetry.crt",
     "tls_key": "file:/run/secrets/telemetry.key",
-    "client_ca": "file:/run/secrets/telemetry-client-ca.pem",
-    "vin_allowlist": ["EXAMPLEVIN00000001"],
-    "fields": { "ChargeState": 60, "ChargeCableConnected": 60, "DoorState": 10, "TrunkOpen": 10, "SentryAlert": 1, "Soc": 300, "Gear": 10, "SoftwareUpdateAvailable": 3600 },
+    "client_ca": "file:/run/secrets/tesla-vehicle-ca.pem",
+    "vin_allowlist": ["5YJ0000000EXAMPLE"],
+    "prefer_typed": true,
+    "fields": { "DetailedChargeState": 60, "ChargingCableType": 60, "DoorState": 10, "SentryMode": 1, "BatteryLevel": 300, "Gear": 10, "SoftwareUpdateVersion": 3600 },
     "low_battery_percent": 20
   },
   "energy_poll": {
     "enabled": false,
     "interval_s": 300,
     "site_allowlist": ["1111111111111111"],
-    "token_ref": "env:TESLA_ENERGY_TOKEN",
-    "reserve_margin_percent": 5
+    "api_base": "https://fleet-api.example.com",
+    "token_ref": "file:/run/secrets/tesla-energy-access-token",
+    "reserve_margin_percent": 5,
+    "site_info_ttl_s": 600
   },
   "rules": [
     { "on": "charge_complete", "wake": true, "debounce_s": 600, "priority": "normal" },
-    { "on": "sentry_alert", "wake": true, "debounce_s": 120, "priority": "high" },
+    { "on": "sentry_alert", "wake": true, "debounce_s": 120, "priority": "normal" },
     { "on": "door_open_parked", "wake": true, "debounce_s": 300, "priority": "high" },
+    { "on": "trunk_open_parked", "wake": true, "debounce_s": 300, "priority": "high" },
     { "on": "grid_islanded", "wake": true, "debounce_s": 1800, "priority": "high" },
     { "on": "battery_below_reserve", "wake": true, "debounce_s": 3600, "priority": "normal" },
     { "on": "update_available", "wake": false }
   ],
   "reply": { "via": "origin_channel" },
   "routes": [
-    { "id": "example-vehicle", "enabled": true, "match": { "kind": "vehicle" }, "allowActors": ["EXAMPLEVIN00000001"], "agent": "example-agent" },
+    { "id": "example-vehicle", "enabled": true, "match": { "kind": "vehicle" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" },
     { "id": "example-energy", "enabled": true, "match": { "kind": "energy" }, "allowActors": ["1111111111111111"], "agent": "example-agent" }
   ]
 }

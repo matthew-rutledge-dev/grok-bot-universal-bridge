@@ -8,14 +8,16 @@ services:
     build: .
     image: grok-bot-universal-bridge:local
     restart: unless-stopped
-    env_file: .env                     # mode 600, rendered on the host, never in git
+    # Host-only files live OUTSIDE the repo dir (a sibling <repo>-host/ dir), so they are
+    # never in the build context or touched by git pull. Override with BRIDGE_HOST_DIR.
+    env_file: ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/.env   # mode 600, never in git
     # In config/bridge.json inside the container: "bind": "0.0.0.0", "allowNonLoopbackBind": true.
     # The host side stays loopback via the ports line below.
     ports:
       - "127.0.0.1:18090:18090"        # loopback only; the tunnel routes /discord/*, /grokbuild/* here
     volumes:
-      - ./config.host:/app/config:ro   # host-only bridge.json + adapter configs, kept out of the repo's config/ (examples)
-      - ./registry.json:/run/bridge/registry.json:ro
+      - ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/config:/app/config:ro   # host-only bridge.json + adapter configs
+      - ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/registry.json:/run/bridge/registry.json:ro
       - bridge-data:/app/data          # hold file, request records, audit.jsonl
 volumes:
   bridge-data:

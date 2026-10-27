@@ -15,7 +15,7 @@ export function redactUrl(raw: string | undefined): string | undefined {
 
 /**
  * Mask an identifier for audit lines: keep the last 4 characters.
- * "EXAMPLEVIN00000001" -> "…0001". Short values become "…".
+ * "5YJ0000000EXAMPLE" -> "…MPLE". Short values become "…".
  */
 export function maskId(raw: string | undefined | null): string {
   const v = (raw ?? "").trim();

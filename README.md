@@ -6,7 +6,7 @@ A generic, deny-by-default bridge from many sources to Grok Bots. It has one sha
 |---|---|
 | [`discord`](adapters/discord/README.md) | working |
 | [`grokbuild`](adapters/grokbuild/README.md) | working |
-| [`tesla`](adapters/tesla/README.md) | skeleton (no live receiver; never sends commands) |
+| [`tesla`](adapters/tesla/README.md) | telemetry receiver (decoded JSON or mTLS) + energy polling; never sends commands, wakes or polls `vehicle_data` |
 
 Design: [`docs/DESIGN.md`](docs/DESIGN.md).
 
@@ -39,10 +39,12 @@ docker compose up -d
 ```
 
 * **Use `docker compose run -T`** (and `exec -T`) in scripts. Without `-T` the container reads stdin, so in a piped or heredoc script it swallows the rest of the script and the later lines never run.
-* **Keep host configs in their own directory**, e.g. `config.host/` (not in git), and mount it at `/app/config`. The repo's `config/` then stays examples-only and a `git pull` never touches real files:
+* **Keep host files outside the repo dir.** Put the real `bridge.json`, adapter configs, `registry.json`, `.env` and any secrets in a sibling directory such as `<repo>-host/` (for example `../grok-bot-universal-bridge-host/`), owned by the service user, and mount them from there. Then `git pull` never touches them, and they're never part of the Docker build context: a host-only directory inside the checkout (especially one the build user can't read) breaks `docker compose build`. `.dockerignore` also drops `.env`, `config.host/`, `host/`, `registry*.json`, `*.tmp`, `node_modules`, `.git` and test output, as a safety net for older layouts.
   ```yaml
+  env_file: ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/.env
   volumes:
-    - ./config.host:/app/config:ro
+    - ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/config:/app/config:ro
+    - ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/registry.json:/run/bridge/registry.json:ro
   ```
 * `http.publicBaseUrl` is only needed when an enabled adapter has a live callback route (its `callbackTokenRef` is set). Startup fails with a clear message if it's missing then.
 

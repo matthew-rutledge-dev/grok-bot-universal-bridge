@@ -24,7 +24,7 @@ const checks = [
   { name: "url", re: /\bhttps?:\/\/([A-Za-z0-9.\-\[\]:]+)/g, ok: (m) => ALLOWED_HOSTS.some((h) => h.test(m[1].replace(/:\d*$/, ""))) },
   { name: "ipv4", re: /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g, ok: (m) => m[1] === "127" || m[0] === "0.0.0.0" || /^(192\.0\.2|198\.51\.100|203\.0\.113)\./.test(m[0]) || /^\d+\.\d+\.\d+$/.test(m[0]) },
   { name: "snowflake", re: /\b\d{17,20}\b/g, ok: (m) => placeholderNum(m[0]) },
-  { name: "vin", re: /\b[A-HJ-NPR-Z0-9]{17}\b/g, ok: (m) => !/\d/.test(m[0]) || !/[A-Z]/.test(m[0]) || /^(EXAMPLE|OTHER)/.test(m[0]) },
+  { name: "vin", re: /\b[A-HJ-NPR-Z0-9]{17}\b/g, ok: (m) => !/\d/.test(m[0]) || !/[A-Z]/.test(m[0]) || /EXAMPLE|^OTHER/.test(m[0]) },
   { name: "email", re: /\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/g, ok: (m) => /(^|\.)example\.(com|org)$|users\.noreply\.github\.com$/.test(m[1]) },
 ];
 let deny = [];
