@@ -28,6 +28,7 @@ Ground rules:
   ```
 
 - [ ] Message size limit: `message_size_limit 65536` in `mosquitto.conf`. The bridge drops payloads over 64 KB, but only after its MQTT client has buffered the whole packet, so the broker should refuse them first.
+- [ ] Host firewall: if the broker runs on the host (or publishes its port on the host) and the host runs a firewall such as ufw, allow the bridge's compose network to reach it, or the MQTT connection fails silently (connect timeouts and backoff in the audit, no events). Find the subnet with `docker network inspect <bridge-compose-project>_default --format '{{(index .IPAM.Config 0).Subnet}}'`, then for example `sudo ufw allow from <compose-subnet> to any port <mqtt-port> proto tcp`. Not needed when the broker shares the bridge's compose network.
 - [ ] Anonymous access off. Passwords live in host-only files (mode 600).
 - [ ] Optional TLS (`mqtts://`): give the bridge the broker CA through `telemetry.mqtt.ca_file` (`file:` ref).
 

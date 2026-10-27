@@ -6,6 +6,7 @@
 //        [--registry <host>/registry.json] [--seed <old>/config/user-directory.seed.json] \
 //        [--seed-target /app/config/user-directory.seed.json] [--out-dir <host>/migrated] \
 //        [--env-out <host>/migrated/discord-extra.env] [--no-legacy-paths] [--planner-handler <old alias>]
+//        [--gateway-url-ref env:NAME] [--gateway-token-ref env:NAME]
 //
 // Reads: security.json, channel-map.json, and the .env KEY NAMES plus non-secret values
 // (ids, flags, policy, paths). Secret keys are never read for their value: they become
@@ -37,6 +38,10 @@ export const SECRET_KEYS = new Set([
  */
 export const MEDIA_PLANNER_HANDLERS = [];
 const ID = /^\d{5,25}$/;
+
+export const DEFAULT_GATEWAY_URL_REF = "env:GROK_BOT_SENDPROMPT_URL";
+export const DEFAULT_GATEWAY_TOKEN_REF = "env:GROK_BOT_GATEWAY_TOKEN";
+const isRef = (v) => typeof v === "string" && (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(v) || /^file:.+/.test(v));
 
 export function parseEnv(text) {
   const out = {};
@@ -70,7 +75,10 @@ export function isGrokBuildRow(row, handlers = MEDIA_PLANNER_HANDLERS) {
  * existing host registry (aliases are reused by agentId). Returns the bundle plus extraEnv
  * (NAME -> value for per-row sendPrompt URLs; write it only to a mode-600 file).
  */
-export function convert({ security = {}, channelMap = {}, env = {}, registry = { agents: {} }, seedTarget, legacyPaths = true, plannerHandlers = [] }) {
+export function convert({ security = {}, channelMap = {}, env = {}, registry = { agents: {} }, seedTarget, legacyPaths = true, plannerHandlers = [], gatewayUrlRef = DEFAULT_GATEWAY_URL_REF, gatewayTokenRef = DEFAULT_GATEWAY_TOKEN_REF }) {
+  for (const [flag, v] of [["--gateway-url-ref", gatewayUrlRef], ["--gateway-token-ref", gatewayTokenRef]]) {
+    if (!isRef(v)) throw new Error(`${flag} must be an env:NAME or file:/path ref, not a literal`);
+  }
   const handlers = [...MEDIA_PLANNER_HANDLERS, ...plannerHandlers];
   const warnings = [];
   const extraEnv = {};
@@ -87,7 +95,7 @@ export function convert({ security = {}, channelMap = {}, env = {}, registry = {
     for (let n = 2; taken.has(alias); n++) alias = `${base}-${n}`;
     taken.add(alias);
     known.set(agentId, alias);
-    registryAdditions[alias] = { agentId, deliver: { kind: "sendprompt", urlRef, keyRef: "env:GROK_BOT_GATEWAY_TOKEN" } };
+    registryAdditions[alias] = { agentId, deliver: { kind: "sendprompt", urlRef, keyRef: gatewayTokenRef } };
     return alias;
   };
 
@@ -106,7 +114,7 @@ export function convert({ security = {}, channelMap = {}, env = {}, registry = {
   });
   if (!guilds.length) warnings.push("no usable guild in security.json: every channel route is disabled");
 
-  const defaultUrlRef = channelMap.defaultSendPromptUrl ? "env:DISCORD_DEFAULT_SENDPROMPT_URL" : "env:GROK_BOT_SENDPROMPT_URL";
+  const defaultUrlRef = channelMap.defaultSendPromptUrl ? "env:DISCORD_DEFAULT_SENDPROMPT_URL" : gatewayUrlRef;
   if (channelMap.defaultSendPromptUrl) extraEnv.DISCORD_DEFAULT_SENDPROMPT_URL = String(channelMap.defaultSendPromptUrl);
 
   const routes = [];
@@ -174,7 +182,7 @@ export function convert({ security = {}, channelMap = {}, env = {}, registry = {
   const dmOut = { policy, allowUsers, ownerIds };
   if (dm.slug) dmOut.slug = dm.slug;
   if (dm.defaultAgentId && !isZero(dm.defaultAgentId)) {
-    dmOut.defaultAgent = aliasFor(dm.defaultAgentId, dm.alias || "dm-default", "env:GROK_BOT_SENDPROMPT_URL");
+    dmOut.defaultAgent = aliasFor(dm.defaultAgentId, dm.alias || "dm-default", gatewayUrlRef);
     const oldMap = dm.alias || dm.defaultAgentId;
     if (oldMap !== dmOut.defaultAgent) dmOut.map = oldMap;
   }
@@ -187,7 +195,7 @@ export function convert({ security = {}, channelMap = {}, env = {}, registry = {
       warnings.push(`dm.agentsByUser ${userId}: not on dm.allowFrom/DISCORD_ALLOWFROM (the old bridge needed pairing for them); skipped`);
       continue;
     }
-    const agent = aliasFor(agentId, a.alias || `dm-${userId.slice(-4)}`, "env:GROK_BOT_SENDPROMPT_URL");
+    const agent = aliasFor(agentId, a.alias || `dm-${userId.slice(-4)}`, gatewayUrlRef);
     const oldMap = a.alias || dm.alias || agentId;
     dmRoutes.push({ userId, agent, ...(oldMap !== agent ? { map: oldMap } : {}) });
   }
@@ -270,7 +278,7 @@ if (/migrate-old-config\.mjs$/.test(process.argv[1] ?? "")) {
   const sec = arg("--security");
   const map = arg("--channel-map");
   if (!sec || !map) {
-    console.error("usage: migrate-old-config.mjs --security <security.json> --channel-map <channel-map.json> [--env <.env>] [--registry <registry.json>] [--seed <seed.json>] [--seed-target <path in container>] [--out-dir <dir>] [--env-out <file>] [--no-legacy-paths]");
+    console.error("usage: migrate-old-config.mjs --security <security.json> --channel-map <channel-map.json> [--env <.env>] [--registry <registry.json>] [--seed <seed.json>] [--seed-target <path in container>] [--out-dir <dir>] [--env-out <file>] [--no-legacy-paths] [--planner-handler <name>] [--gateway-url-ref <env:NAME|file:path>] [--gateway-token-ref <env:NAME|file:path>]");
     process.exit(2);
   }
   const envFile = arg("--env");
@@ -278,6 +286,12 @@ if (/migrate-old-config\.mjs$/.test(process.argv[1] ?? "")) {
   const registry = arg("--registry") ? readJson(arg("--registry"), "registry") : { agents: {} };
   const seed = arg("--seed");
   const seedTarget = arg("--seed-target") ?? (seed && existsSync(seed) ? "/app/config/user-directory.seed.json" : undefined);
+  for (const flag of ["--gateway-url-ref", "--gateway-token-ref"]) {
+    if (process.argv.includes(flag) && !isRef(arg(flag))) {
+      console.error(`${flag} must be an env:NAME or file:/path ref (literal values are refused)`);
+      process.exit(2);
+    }
+  }
   const { bundle, extraEnv } = convert({
     security: readJson(sec, "security.json"),
     channelMap: readJson(map, "channel-map.json"),
@@ -286,6 +300,8 @@ if (/migrate-old-config\.mjs$/.test(process.argv[1] ?? "")) {
     seedTarget,
     legacyPaths: !process.argv.includes("--no-legacy-paths"),
     plannerHandlers: process.argv.flatMap((a, i) => (a === "--planner-handler" && process.argv[i + 1] ? [process.argv[i + 1]] : [])),
+    gatewayUrlRef: arg("--gateway-url-ref") ?? DEFAULT_GATEWAY_URL_REF,
+    gatewayTokenRef: arg("--gateway-token-ref") ?? DEFAULT_GATEWAY_TOKEN_REF,
   });
   const envOut = arg("--env-out");
   const outDir = arg("--out-dir");
