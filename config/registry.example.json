@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "agents": {
+    "example-agent": {
+      "agentId": "11111111-1111-4111-8111-111111111111",
+      "label": "Example agent (webhook routine)",
+      "deliver": {
+        "kind": "webhook",
+        "urlRef": "env:EXAMPLE_AGENT_WEBHOOK_URL",
+        "keyRef": "env:EXAMPLE_AGENT_WEBHOOK_KEY",
+        "timeoutMs": 8000
+      }
+    },
+    "example-gateway-agent": {
+      "agentId": "22222222-2222-4222-8222-222222222222",
+      "label": "Example agent behind a sendPrompt-style gateway (compatibility)",
+      "deliver": {
+        "kind": "sendprompt",
+        "url": "http://127.0.0.1:1340/api/sendPrompt",
+        "keyRef": "env:EXAMPLE_GATEWAY_TOKEN"
+      }
+    }
+  }
+}

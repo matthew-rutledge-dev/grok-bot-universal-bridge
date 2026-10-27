@@ -1,0 +1,29 @@
+{
+  "name": "grok-bot-universal-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generic, deny-by-default bridge from many sources (chat, CLI, vehicle telemetry, ...) to Grok Bots through pluggable source adapters and a private, read-only registry",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/src/main.js",
+    "dev": "tsx src/main.ts",
+    "test": "node scripts/run-tests.mjs",
+    "check:config": "tsx src/main.ts --check",
+    "leak-check": "node scripts/leak-check.mjs",
+    "smoke": "tsx scripts/smoke-e2e.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

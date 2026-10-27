@@ -1,0 +1,18 @@
+{
+  "readOnlyRef": "env:GROKBUILD_READ_ONLY",
+  "callbackTokenRef": "env:GROKBUILD_CALLBACK_TOKEN",
+  "maxPromptChars": 8000,
+  "replyTtlSec": 3600,
+  "clients": {
+    "example-client": { "tokenRef": "env:GROKBUILD_CLIENT_TOKEN" }
+  },
+  "routes": [
+    {
+      "id": "example-client-to-agent",
+      "enabled": true,
+      "match": { "client": "example-client", "bot": "example-agent" },
+      "allowActors": ["example-client"],
+      "agent": "example-agent"
+    }
+  ]
+}
