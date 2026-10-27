@@ -89,7 +89,7 @@ function writeConfigs(dir: string, routineUrl: string, wakeUrl: string, port: nu
       DISCORD_CALLBACK_TOKEN: "cb-discord",
       GROKBUILD_CLIENT_TOKEN: "client-token",
       GROKBUILD_CALLBACK_TOKEN: "cb-grokbuild",
-      GROKBUILD_READ_ONLY: "",
+      GROKBUILD_READ_ONLY: "0",
       DISCORD_PLANNER_URL: "",
       DISCORD_PLANNER_TOKEN: "",
     },
