@@ -1,0 +1,25 @@
+{
+  "tokenRef": "env:DISCORD_BOT_TOKEN",
+  "callbackTokenRef": "env:DISCORD_CALLBACK_TOKEN",
+  "ignoreBots": true,
+  "routes": [
+    {
+      "id": "example-chat",
+      "enabled": true,
+      "match": { "guild": "111111111111111111", "channel": "222222222222222222" },
+      "allowActors": ["333333333333333333"],
+      "allowGroups": [],
+      "agent": "example-agent",
+      "requireAddressed": true,
+      "slug": "example-chat"
+    },
+    {
+      "id": "example-dm",
+      "enabled": false,
+      "match": { "dm": "true" },
+      "allowActors": ["333333333333333333"],
+      "agent": "example-agent",
+      "slug": "dm"
+    }
+  ]
+}

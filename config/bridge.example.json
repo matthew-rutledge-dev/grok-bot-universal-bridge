@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "http": {
+    "bind": "127.0.0.1",
+    "port": 18090,
+    "publicBaseUrl": "https://bridge.example.com"
+  },
+  "registryPath": "/run/bridge/registry.json",
+  "dataDir": "./data",
+  "hold": { "maxSec": 1800 },
+  "wake": {
+    "urlRef": "env:BRIDGE_WAKE_URL",
+    "keyRef": "env:BRIDGE_WAKE_KEY",
+    "header": "Authorization",
+    "timeoutMs": 5000
+  },
+  "audit": { "path": "./data/audit.jsonl" },
+  "callbackRateLimitPerMin": 90,
+  "adapters": {
+    "discord": { "enabled": true, "configPath": "./config/discord.json" },
+    "grokbuild": { "enabled": true, "configPath": "./config/grokbuild.json" },
+    "tesla": { "enabled": false, "configPath": "./config/tesla.json" }
+  }
+}

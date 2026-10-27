@@ -1,0 +1,14 @@
+node_modules/
+dist/
+data/
+*.log
+.env
+.env.*
+!.env.example
+# Real runtime files live on the deployment host only, never in git.
+config/*.json
+config/*.yaml
+config/*.yml
+!config/*.example.json
+registry.json
+secrets/

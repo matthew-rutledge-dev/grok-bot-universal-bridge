@@ -1,0 +1,19 @@
+# Example only. Copy to the deployment host as compose.yml and adjust paths.
+# Runs side by side with any existing bridge on its own loopback port.
+# After editing .env: docker compose up -d --force-recreate
+services:
+  universal-bridge:
+    build: .
+    image: grok-bot-universal-bridge:local
+    restart: unless-stopped
+    env_file: .env                     # mode 600, rendered on the host, never in git
+    # In config/bridge.json inside the container: "bind": "0.0.0.0", "allowNonLoopbackBind": true.
+    # The host side stays loopback via the ports line below.
+    ports:
+      - "127.0.0.1:18090:18090"        # loopback only; the tunnel routes /discord/*, /grokbuild/* here
+    volumes:
+      - ./config:/app/config:ro        # bridge.json + adapter configs (host-only)
+      - ./registry.json:/run/bridge/registry.json:ro
+      - bridge-data:/app/data          # hold file, request records, audit.jsonl
+volumes:
+  bridge-data:

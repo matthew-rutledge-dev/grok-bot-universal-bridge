@@ -1,0 +1,33 @@
+{
+  "telemetry": {
+    "enabled": false,
+    "listen": "0.0.0.0:4443",
+    "public_hostname": "telemetry.example.com",
+    "tls_cert": "file:/run/secrets/telemetry.crt",
+    "tls_key": "file:/run/secrets/telemetry.key",
+    "client_ca": "file:/run/secrets/telemetry-client-ca.pem",
+    "vin_allowlist": ["EXAMPLEVIN00000001"],
+    "fields": { "ChargeState": 60, "ChargeCableConnected": 60, "DoorState": 10, "TrunkOpen": 10, "SentryAlert": 1, "Soc": 300, "Gear": 10, "SoftwareUpdateAvailable": 3600 },
+    "low_battery_percent": 20
+  },
+  "energy_poll": {
+    "enabled": false,
+    "interval_s": 300,
+    "site_allowlist": ["1111111111111111"],
+    "token_ref": "env:TESLA_ENERGY_TOKEN",
+    "reserve_margin_percent": 5
+  },
+  "rules": [
+    { "on": "charge_complete", "wake": true, "debounce_s": 600, "priority": "normal" },
+    { "on": "sentry_alert", "wake": true, "debounce_s": 120, "priority": "high" },
+    { "on": "door_open_parked", "wake": true, "debounce_s": 300, "priority": "high" },
+    { "on": "grid_islanded", "wake": true, "debounce_s": 1800, "priority": "high" },
+    { "on": "battery_below_reserve", "wake": true, "debounce_s": 3600, "priority": "normal" },
+    { "on": "update_available", "wake": false }
+  ],
+  "reply": { "via": "origin_channel" },
+  "routes": [
+    { "id": "example-vehicle", "enabled": true, "match": { "kind": "vehicle" }, "allowActors": ["EXAMPLEVIN00000001"], "agent": "example-agent" },
+    { "id": "example-energy", "enabled": true, "match": { "kind": "energy" }, "allowActors": ["1111111111111111"], "agent": "example-agent" }
+  ]
+}
