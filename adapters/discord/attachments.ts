@@ -222,7 +222,7 @@ export function ipv6Hextets(ip: string): number[] | undefined {
 }
 
 /**
- * Private, loopback, link-local, CGNAT, benchmarking (198.18.0.0/15), unspecified,
+ * Private, loopback, link-local, CGNAT, benchmarking (198.18/15), unspecified,
  * multicast/reserved, ULA, NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), and every
  * IPv4-compatible (::a.b.c.d) or IPv4-mapped (::ffff:a.b.c.d) form, in any spelling.
  */

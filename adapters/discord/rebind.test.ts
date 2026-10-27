@@ -19,7 +19,7 @@ async function code(p: Promise<unknown>): Promise<string> {
   }
 }
 
-test("isPrivateAddress: NAT64, IPv4-compatible / mapped in any spelling, 198.18.0.0/15", () => {
+test("isPrivateAddress: NAT64, IPv4-compatible / mapped in any spelling, 198.18/15", () => {
   const priv = [
     h6("64", "ff9b", "", v4(8, 8, 8, 8)), // NAT64 well-known prefix, even for a public v4
     h6("64", "ff9b", "", "808", "808"),
