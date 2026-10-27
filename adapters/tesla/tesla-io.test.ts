@@ -278,9 +278,38 @@ test("decoded receiver: loopback only; POST NDJSON from fleet-telemetry -> trigg
     assert.equal(m.hits.length, 1);
     assert.match(m.hits[0].body.prompt, /charge_complete/);
     assert.equal((await fetch(`http://127.0.0.1:${port}/other`, { method: "POST", body: "{}" })).status, 404);
+    const bad = await fetch(`http://127.0.0.1:${port}/records`, { method: "POST", body: "not json\n{\"vin\":\"\"}" });
+    assert.deepEqual(await bad.json(), { accepted: 0 });
+    assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, 2);
   } finally {
     await b.close();
     await m.close();
+  }
+});
+
+test("decoded receiver: optional bearer token; a failing submit is audited, not thrown", async () => {
+  const a = new TeslaAdapter({ ...example, telemetry: { ...example.telemetry!, enabled: true, decoded_listen: "127.0.0.1:0", decoded_token_ref: "env:RELAY_TOKEN" } });
+  const audit: Array<{ reason?: string }> = [];
+  a.init({
+    log: { info() {}, warn() {}, error() {} },
+    audit: (e: { reason?: string }) => audit.push(e),
+    submit: async () => {
+      throw new Error("boom");
+    },
+    secret: (ref: string) => (ref === "env:RELAY_TOKEN" ? "relay-secret" : undefined),
+  } as never);
+  await a.start();
+  try {
+    const url = `http://127.0.0.1:${a.telemetryPort()}/records`;
+    const rec = (t: string, v: string) => JSON.stringify({ data: [{ key: "SentryMode", value: { sentryModeStateValue: v } }], createdAt: t, vin: VIN });
+    assert.equal((await fetch(url, { method: "POST", body: rec("2026-01-01T00:00:00Z", "SentryModeStateArmed") })).status, 401);
+    const ok = { authorization: "Bearer relay-secret" };
+    assert.equal((await fetch(url, { method: "POST", headers: ok, body: rec("2026-01-01T00:00:00Z", "SentryModeStateArmed") })).status, 202);
+    assert.equal((await fetch(url, { method: "POST", headers: ok, body: rec("2026-01-01T00:01:00Z", "SentryModeStateAware") })).status, 202);
+    for (let i = 0; i < 50 && !audit.some((e) => e.reason === "ingest_failed"); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(audit.some((e) => e.reason === "ingest_failed"));
+  } finally {
+    await a.stop();
   }
 });
 

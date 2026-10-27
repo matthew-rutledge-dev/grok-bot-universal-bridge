@@ -98,7 +98,7 @@ export interface TeslaConfig {
 }
 
 const FORBIDDEN_KEYS = /^(commands?|command_tools|vehicle_commands|actions?)$/i;
-const REFRESH_KEYS = /refresh/i;
+const REFRESH_KEYS = /refresh_?token/i;
 const PEM_KEYS = ["tls_cert", "tls_key", "client_ca"] as const;
 
 export function validateTeslaConfig(raw: unknown): string[] {
@@ -250,7 +250,8 @@ export class TeslaAdapter implements SourceAdapter {
           ? new MtlsTelemetryReceiver({ listen: t.listen!, cert: this.pem(t.tls_cert!), key: this.pem(t.tls_key!), clientCa: this.pem(t.client_ca!) })
           : new DecodedJsonReceiver({ listen: t.decoded_listen!, token: t.decoded_token_ref ? () => this.ctx.secret(t.decoded_token_ref) : undefined }));
       await this.receiver.start({
-        record: (r) => void this.ingestTelemetry(r),
+        record: (r) =>
+          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin })),
         drop: (reason, vin) => this.dropped(reason, vin),
       });
     }

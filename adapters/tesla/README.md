@@ -44,6 +44,7 @@ Edge rules:
 * Grid outage (`grid_islanded`): `island_status` starts with `off_grid` (`off_grid_unintentional` is the real outage, and the prompt says so; `off_grid_intentional` is user-chosen) or `grid_status` is `Inactive`.
 * Empty bodies and `{ "response": {} }` are tolerated. A status with no known fields is audited `no_data` and doesn't overwrite the last good status, so a gap can't re-arm `grid_islanded`.
 * Errors are mapped, never swallowed: `fleet_api_unreachable`, `fleet_api_tls_error`, `unauthorized`, `login_required`, `missing_scope`, `rate_limited`, `no_token`, `fleet_api_error`. On a 429 the adapter skips polls until `Retry-After` passes (default 60 s). On auth failures it backs off (interval × 2ⁿ, capped at 1 h).
+* Unlike vehicle fields, energy triggers have no restart baseline: an outage, low reserve or storm watch already in effect at the first poll is reported (debounce state is memory-only).
 * Only `GET /api/1/energy_sites/{id}/live_status` and `/site_info` are called, on the `api_base` you configure (your region's Fleet API base URL).
 
 ### Token

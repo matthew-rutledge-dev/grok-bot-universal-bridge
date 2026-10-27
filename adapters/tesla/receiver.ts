@@ -3,6 +3,7 @@ import { createServer as createHttpsServer, type Server as HttpsServer } from "n
 import type { TLSSocket } from "node:tls";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
+import { safeEqual } from "../../core/http.js";
 import { parsePayload, type TelemetryRecord } from "./fields.js";
 
 /**
@@ -83,7 +84,7 @@ export class DecodedJsonReceiver implements TelemetryReceiver {
         return;
       }
       const want = this.o.token?.();
-      if (want && req.headers.authorization !== `Bearer ${want}`) {
+      if (want && !safeEqual(req.headers.authorization ?? "", `Bearer ${want}`)) {
         res.writeHead(401).end();
         return;
       }

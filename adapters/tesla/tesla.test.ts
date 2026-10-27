@@ -38,6 +38,8 @@ test("refuses commands, vehicle_data, wakes, non-origin replies, literal/vault s
   assert.match(v({ ...example, reply: { via: "webhook" } }), /origin_channel/);
   assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, token_ref: "vault:x" } }), /token_ref must be env:NAME or file:/);
   assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, refresh_token_ref: "env:X" } }), /access token only/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, refreshToken: "file:/x" } }), /access token only/);
+  assert.equal(v({ ...example, energy_poll: { ...example.energy_poll!, refresh_note: "x" } }), "", "only refresh-token keys are refused");
   assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, enabled: true, api_base: undefined } }), /api_base is required/);
   assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, api_base: "http://fleet-api.example.com" } }), /https URL/);
   assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, interval_s: 30 } }), />= 60/);
