@@ -185,7 +185,8 @@ export class MqttTelemetryReceiver implements TelemetryReceiver {
     const c = connect(this.o.url, opts);
     this.client = c;
     c.on("connect", () => {
-      this.failures = 0;
+      // failures is reset only once the subscribe is granted (below): a broker that accepts the
+      // connection but refuses the subscribe must still back off, not retry at reconnect_min_ms.
       this.connectedOnce = true;
       this.event({ outcome: "ok", reason: "connected" });
       c.subscribe(subscriptionFor(this.o.topicBase), { qos: this.o.qos }, (err, granted) => {
@@ -196,6 +197,7 @@ export class MqttTelemetryReceiver implements TelemetryReceiver {
           if (!this.stopped && this.client === c) c.end(true);
           return;
         }
+        this.failures = 0;
         this.event({ outcome: "ok", reason: "subscribed" });
       });
     });

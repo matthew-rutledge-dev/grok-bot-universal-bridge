@@ -29,7 +29,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(cond: () => boolean, ms = 5000) {
   const t0 = Date.now();
   while (!cond()) {
-    if (Date.now() - t0 > ms) throw new Error(`timed out waiting ${(globalThis as any).__dbg?.() ?? ""}`);
+    if (Date.now() - t0 > ms) throw new Error("timed out waiting");
     await sleep(15);
   }
 }
@@ -178,7 +178,6 @@ test("mqtt e2e: publish -> record -> trigger -> wake submit to the routine; Gear
   const a = new TeslaAdapter(mqttCfg(br.url()));
   const b = await startBridge({ routineUrl: m.url, adapters: [a] });
   const p = await publisher(br.url());
-  (globalThis as any).__dbg = () => JSON.stringify({ a: b.audit.lines, h: m.hits.length });
   try {
     await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"));
     assert.ok(b.audit.lines.some((l) => l.action === "connection" && l.reason === "mqtt_connected"));
@@ -246,7 +245,6 @@ test("mqtt: reconnects with backoff after the broker drops; audits disconnect an
   const a = new TeslaAdapter(mqttCfg(br.url()));
   const b = await startBridge({ routineUrl: m.url, adapters: [a] });
   try {
-    (globalThis as any).__dbg = () => JSON.stringify({ a: b.audit.lines.map((l) => [l.reason, l.ms]), h: m.hits.length });
     await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"));
     await br.down();
     await until(() => b.audit.lines.some((l) => l.reason === "mqtt_disconnected"));
@@ -317,7 +315,6 @@ test("mqtt: username/password refs are re-read; bad credentials audited (no secr
   const a = new TeslaAdapter(cfg);
   const b = await startBridge({ routineUrl: m.url, adapters: [a], env });
   try {
-    (globalThis as any).__dbg = () => JSON.stringify({ a: b.audit.lines.map((l) => [l.reason, l.ms]), h: m.hits.length });
     await until(() => b.audit.lines.some((l) => l.reason === "mqtt_connack_not_authorized" || l.reason === "mqtt_connack_bad_credentials"));
     writeFileSync(passFile, "broker-pass-1\n"); // rotated on the host: picked up on the next reconnect
     await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"), 8000);
@@ -344,7 +341,6 @@ test("mqtt: a refused subscribe drops the connection and the backoff reconnects 
   const a = new TeslaAdapter(mqttCfg(br.url()));
   const b = await startBridge({ routineUrl: m.url, adapters: [a] });
   try {
-    (globalThis as any).__dbg = () => JSON.stringify(b.audit.lines.map((l) => l.reason));
     await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"), 10000);
     const reasons = b.audit.lines.map((l) => l.reason);
     assert.equal(reasons.filter((r) => r === "mqtt_subscribe_refused").length, 2);
@@ -434,4 +430,26 @@ test("tesla-live-check: invalid JSON config prints a fixed message, never a snip
   assert.match(out, /setup: invalid JSON in config/);
   assert.equal(out.includes(VIN), false);
   assert.equal(out.includes("vin_allowlist"), false);
+});
+
+test("mqtt: a broker that keeps refusing the subscribe gets exponential backoff, capped at reconnect_max_ms", async () => {
+  const br = await broker({ refuseSubscribe: () => true });
+  const m = await mockRoutine({ key: "routine-key" });
+  const a = new TeslaAdapter(mqttCfg(br.url(), { reconnect_min_ms: 50, reconnect_max_ms: 400 }));
+  const b = await startBridge({ routineUrl: m.url, adapters: [a] });
+  try {
+    const waits = () => b.audit.lines.filter((l) => l.reason === "mqtt_disconnected").map((l) => l.ms as number);
+    await until(() => waits().length >= 6, 15000);
+    const w = waits().slice(0, 6);
+    // Bases 50, 100, 200, 400, 400, 400 with ±20 % jitter: each of the first four is above the last.
+    for (let i = 1; i < 4; i++) assert.ok(w[i] > w[i - 1], `waits grow: ${w}`);
+    assert.ok(w[0] >= 40 && w[0] <= 60, `starts at reconnect_min_ms: ${w}`);
+    for (const x of w.slice(3)) assert.ok(x >= 320 && x <= 480, `capped at reconnect_max_ms: ${w}`);
+    assert.equal(b.audit.lines.some((l) => l.reason === "mqtt_subscribed"), false);
+    assert.ok(b.audit.lines.filter((l) => l.reason === "mqtt_subscribe_refused").length >= 6);
+  } finally {
+    await b.close();
+    await m.close();
+    await br.down();
+  }
 });
