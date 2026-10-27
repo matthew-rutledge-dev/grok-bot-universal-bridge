@@ -5,6 +5,7 @@ import { isSecretRef } from "../../core/secrets.js";
 import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
 import type { HeldItem } from "../../core/hold.js";
 import type { HttpResponse } from "../../core/http.js";
+import { MultipartBody, MultipartError } from "../../core/multipart.js";
 import type { InboundEvent, Route } from "../../core/types.js";
 import type { SubmitResult } from "../../core/bridge.js";
 import {
@@ -15,12 +16,17 @@ import {
   normalizeMime,
   resolveJsonAttachments,
   validateAllowHttpHosts,
+  type UploadedFile,
   wakeRefs,
   type ResolvedAttachment,
 } from "./attachments.js";
 import { chunk, formatPrompt, stripMention } from "./format.js";
 import {
+  CHAT_HANDLER,
+  CHAT_WORKING_DELAY_MS,
+  chatUrlFromPlanner,
   invokePlanner,
+  PROFILE_RE,
   PLANNER_HANDLER,
   PLANNER_PULSE_MS,
   PLANNER_START_FAILED_TEXT,
@@ -51,9 +57,15 @@ import { validateVoiceConfig, VoiceService, type VoiceConfig } from "./voice/ser
  * Voice: POST /discord/voice/play and /discord/voice/stream (callback token),
  * see voice/service.ts.
  *
- * Reply: POST /discord/callback { channelId, content?, attachments?, replyToMessageId?,
- * statusMessageId?, threadContent? }. Only channels that appear in an enabled
- * route (or a DM channel that already passed the allowlist) can be posted to.
+ * Grok Build chat-hop routes (`handler: "grokbuild-chat"`, `profile`) call the local chat
+ * process instead: see CHAT_HANDLER in planner.ts.
+ *
+ * Reply: POST /discord/callback { channelId | userId, content?, attachments?, replyToMessageId?,
+ * statusMessageId?, threadContent? } as JSON, or as multipart/form-data (a `payload_json` part
+ * and/or plain text fields, plus file parts; same caps and MIME rules). Only channels that
+ * appear in an enabled route (or a DM channel that already passed the allowlist) can be posted
+ * to. `userId` opens a DM with that user, only when the user is in dmCallbacks.allowUsers
+ * (empty by default = deny).
  */
 export interface DiscordAdapterConfig {
   tokenRef: string;
@@ -73,7 +85,13 @@ export interface DiscordAdapterConfig {
     callbackUrl?: string;
     /** Stop the 5 s progress edits after this long (default 30 min). The message is left as is. */
     pulseMaxMs?: number;
+    /** Grok Build chat hop: env:/file: ref to the /chat URL. Default: the planner URL with /plan -> /chat. */
+    chatUrlRef?: string;
+    /** Grok Build chat hop: post the working message only after this long (default 15 s). */
+    chatWorkingDelayMs?: number;
   };
+  /** Callbacks that DM a user by id. Deny by default: only these user ids. */
+  dmCallbacks?: { allowUsers: string[] };
   voice?: VoiceConfig;
 }
 
@@ -95,6 +113,7 @@ export const FAILED_TEXT = "❌ Couldn't deliver that message.";
 
 export interface DiscordCallbackBody {
   channelId?: unknown;
+  userId?: unknown;
   content?: unknown;
   replyToMessageId?: unknown;
   statusMessageId?: unknown;
@@ -115,6 +134,7 @@ export function validateDiscordConfig(raw: unknown): string[] {
     ["callbackTokenRef", c.callbackTokenRef],
     ["planner.urlRef", c.planner?.urlRef],
     ["planner.tokenRef", c.planner?.tokenRef],
+    ["planner.chatUrlRef", c.planner?.chatUrlRef],
     ["voice.piperHostRef", c.voice?.piperHostRef],
     ["voice.piperPortRef", c.voice?.piperPortRef],
     ["voice.grokApiKeyRef", c.voice?.grokApiKeyRef],
@@ -129,13 +149,26 @@ export function validateDiscordConfig(raw: unknown): string[] {
     const keys = Object.keys(r.match ?? {});
     const ok = (keys.length === 2 && keys.includes("guild") && keys.includes("channel")) || (keys.length === 1 && keys[0] === "dm");
     if (!ok) p.push(`discord.routes[${i}]: match must be { guild, channel } or { dm: "true" }`);
-    if (r.handler !== undefined && r.handler !== PLANNER_HANDLER) p.push(`discord.routes[${i}]: handler must be "${PLANNER_HANDLER}" or unset`);
+    if (r.handler !== undefined && r.handler !== PLANNER_HANDLER && r.handler !== CHAT_HANDLER) {
+      p.push(`discord.routes[${i}]: handler must be "${PLANNER_HANDLER}", "${CHAT_HANDLER}" or unset`);
+    }
+    if (r.handler === CHAT_HANDLER && (typeof r.profile !== "string" || !PROFILE_RE.test(r.profile))) {
+      p.push(`discord.routes[${i}]: a ${CHAT_HANDLER} route needs a short profile name (letters, digits, . _ -)`);
+    }
   }
-  if ((c.routes ?? []).some((r) => r.handler === PLANNER_HANDLER) && (!c.planner?.urlRef || !c.planner?.tokenRef)) {
-    p.push("discord.planner.urlRef and tokenRef required when a route uses the local-planner handler");
+  const hop = (r: Route) => r.handler === PLANNER_HANDLER || r.handler === CHAT_HANDLER;
+  if ((c.routes ?? []).some(hop) && (!c.planner?.urlRef || !c.planner?.tokenRef)) {
+    p.push("discord.planner.urlRef and tokenRef required when a route uses the local-planner or grokbuild-chat handler");
   }
-  if ((c.routes ?? []).some((r) => r.enabled && r.handler === PLANNER_HANDLER) && !c.callbackTokenRef) {
-    p.push("discord.callbackTokenRef required when a local-planner route is enabled (the planner replies through the callback)");
+  if ((c.routes ?? []).some((r) => r.enabled && hop(r)) && !c.callbackTokenRef) {
+    p.push("discord.callbackTokenRef required when a local-planner or grokbuild-chat route is enabled (the hop replies through the callback)");
+  }
+  if (c.planner?.chatWorkingDelayMs !== undefined && (!Number.isFinite(c.planner.chatWorkingDelayMs) || c.planner.chatWorkingDelayMs < 0)) {
+    p.push("discord.planner.chatWorkingDelayMs must be >= 0");
+  }
+  if (c.dmCallbacks !== undefined) {
+    const u = c.dmCallbacks?.allowUsers;
+    if (!Array.isArray(u) || u.some((x) => typeof x !== "string" || !SNOWFLAKE.test(x))) p.push("discord.dmCallbacks.allowUsers must be an array of user ids (no wildcards)");
   }
   if (c.planner?.callbackUrl !== undefined && !/^https?:\/\/[^\s]+$/.test(String(c.planner.callbackUrl))) {
     p.push("discord.planner.callbackUrl must be an http(s) URL");
@@ -192,6 +225,8 @@ export class DiscordAdapter implements SourceAdapter {
   private dmFile = "";
   readonly planner = new PlannerStatusBook();
   private readonly plannerSeen = new Set<string>();
+  /** Chat hops whose working message isn't posted yet: origin id -> cancel. */
+  private readonly chatHolds = new Map<string, () => void>();
   private voice?: VoiceService;
 
   constructor(
@@ -207,11 +242,18 @@ export class DiscordAdapter implements SourceAdapter {
 
   init(ctx: AdapterContext): void {
     this.ctx = ctx;
-    if (this.routes.some((r) => r.enabled && r.handler === PLANNER_HANDLER) && !(this.cfg.planner?.callbackUrl || ctx.callbackUrl)) {
-      throw new Error("discord: a local-planner route needs a callback URL (set http.publicBaseUrl or discord.planner.callbackUrl)");
+    if (this.routes.some((r) => r.enabled && (r.handler === PLANNER_HANDLER || r.handler === CHAT_HANDLER)) && !(this.cfg.planner?.callbackUrl || ctx.callbackUrl)) {
+      throw new Error("discord: a local-planner / grokbuild-chat route needs a callback URL (set http.publicBaseUrl or discord.planner.callbackUrl)");
     }
+    // Working-message state survives a restart (callbacks after a restart still edit it).
+    this.planner.load(ctx.dataFile("planner-status.json"));
     if (this.cfg.voice) {
-      const voice = new VoiceService(this.cfg.voice, { port: this.port.voice, secret: (r) => ctx.secret(r), grokUrl: this.opts.grokVoiceUrl });
+      const voice = new VoiceService(this.cfg.voice, {
+        port: this.port.voice,
+        secret: (r) => ctx.secret(r),
+        grokUrl: this.opts.grokVoiceUrl,
+        onStreamEnded: () => ctx.audit({ action: "voice", outcome: "skipped", reason: "stream_dropped" }),
+      });
       this.voice = voice;
       const max = { maxBytes: 24 * 1024 * 1024 };
       ctx.authedRoute("POST", "voice/play", "voice", (req) => voice.play(req.body), max);
@@ -253,7 +295,9 @@ export class DiscordAdapter implements SourceAdapter {
 
   async stop(): Promise<void> {
     this.voice?.close();
-    this.planner.clear();
+    this.planner.stopAll();
+    for (const cancel of this.chatHolds.values()) cancel();
+    this.chatHolds.clear();
     await this.port.disconnect();
   }
 
@@ -286,11 +330,12 @@ export class DiscordAdapter implements SourceAdapter {
     // Record an allowlisted DM channel BEFORE delivery, so a crash mid-hold still lets the reply through.
     if (!m.guildId && authz.ok) this.allowDmChannel(m.channelId);
     if (authz.ok && authz.route.handler === PLANNER_HANDLER) return this.startPlanner(m, event.prompt, authz.route, refs);
+    if (authz.ok && authz.route.handler === CHAT_HANDLER) return this.startPlanner(m, event.prompt, authz.route, refs, "chat");
     return this.ctx.submit(event);
   }
 
   /** Planner hop: one working message, pulse edits, no agent wake. */
-  private startPlanner(m: IncomingDiscordMessage, _prompt: string, route: Route, refs: ReturnType<typeof wakeRefs>): PlannerStarted {
+  private startPlanner(m: IncomingDiscordMessage, _prompt: string, route: Route, refs: ReturnType<typeof wakeRefs>, variant: "image" | "chat" = "image"): PlannerStarted {
     const base = { eventId: m.id, lane: m.channelId, actor: m.authorId, route: route.id, agent: route.agent };
     if (this.plannerSeen.has(m.id)) {
       this.ctx.audit({ ...base, action: "inbound", outcome: "deny", reason: "duplicate" });
@@ -298,8 +343,8 @@ export class DiscordAdapter implements SourceAdapter {
     }
     this.plannerSeen.add(m.id);
     if (this.plannerSeen.size > 1000) this.plannerSeen.delete(this.plannerSeen.values().next().value as string);
-    this.ctx.audit({ ...base, action: "inbound", outcome: "allow", reason: "planner" });
-    const done = this.runPlanner(m, route, refs, base);
+    this.ctx.audit({ ...base, action: "inbound", outcome: "allow", reason: variant === "chat" ? "chat_hop" : "planner" });
+    const done = this.runPlanner(m, route, refs, base, variant);
     return { planner: true, done };
   }
 
@@ -308,51 +353,73 @@ export class DiscordAdapter implements SourceAdapter {
     route: Route,
     refs: ReturnType<typeof wakeRefs>,
     base: { eventId: string; lane: string; actor: string; route?: string; agent: string },
+    variant: "image" | "chat" = "image",
   ): Promise<PlannerUserSignal> {
     const t0 = Date.now();
     const slug = typeof route.slug === "string" && route.slug ? route.slug : m.guildId ? "channel" : "dm";
     let workingId: string | undefined;
-    try {
-      workingId = await this.port.send(m.channelId, workingProgressText(0), { replyTo: m.id });
-      const id = workingId;
-      const pulseMs = this.opts.pulseMs ?? PLANNER_PULSE_MS;
-      const maxMs = this.cfg.planner?.pulseMaxMs ?? 30 * 60_000;
-      const timer = setInterval(() => {
-        const elapsed = Date.now() - t0;
-        if (elapsed > maxMs) {
-          this.planner.stopPulse(m.id);
-          return;
-        }
-        void this.port.edit(m.channelId, id, workingProgressText(elapsed)).catch(() => undefined);
-      }, pulseMs);
-      timer.unref?.();
-      this.planner.remember(m.id, m.channelId, id, () => clearInterval(timer));
-    } catch {
-      this.ctx.log.warn("[discord] planner working message failed");
+    const postWorking = async () => {
+      try {
+        workingId = await this.port.send(m.channelId, workingProgressText(Date.now() - t0), { replyTo: m.id });
+        const id = workingId;
+        const pulseMs = this.opts.pulseMs ?? PLANNER_PULSE_MS;
+        const maxMs = this.cfg.planner?.pulseMaxMs ?? 30 * 60_000;
+        const timer = setInterval(() => {
+          const elapsed = Date.now() - t0;
+          if (elapsed > maxMs) {
+            this.planner.stopPulse(m.id);
+            return;
+          }
+          void this.port.edit(m.channelId, id, workingProgressText(elapsed)).catch(() => undefined);
+        }, pulseMs);
+        timer.unref?.();
+        this.planner.remember(m.id, m.channelId, id, () => clearInterval(timer));
+      } catch {
+        this.ctx.log.warn("[discord] planner working message failed");
+      }
+    };
+    let hold: ReturnType<typeof setTimeout> | undefined;
+    if (variant === "chat") {
+      // Chat hop: only post "Working on it." if the reply takes longer than the delay.
+      const delay = this.cfg.planner?.chatWorkingDelayMs ?? CHAT_WORKING_DELAY_MS;
+      hold = setTimeout(() => {
+        this.chatHolds.delete(m.id);
+        void postWorking();
+      }, delay);
+      hold.unref?.();
+      this.chatHolds.set(m.id, () => clearTimeout(hold));
+    } else {
+      await postWorking();
     }
     const text = stripMention(m.content, this.port.botUserId());
+    const plannerUrl = this.ctx.secret(this.cfg.planner?.urlRef);
+    const url = variant === "chat" ? (this.ctx.secret(this.cfg.planner?.chatUrlRef) ?? chatUrlFromPlanner(plannerUrl)) : plannerUrl;
+    const common = {
+      userPrompt: text || "(attachment)",
+      channelId: m.channelId,
+      slug,
+      messageId: m.id,
+      callbackUrl: this.cfg.planner?.callbackUrl ?? this.ctx.callbackUrl,
+      dryRun: false,
+    };
     const result = await invokePlanner(
-      this.ctx.secret(this.cfg.planner?.urlRef),
+      url,
       this.ctx.secret(this.cfg.planner?.tokenRef),
-      {
-        userPrompt: text || "(attachment)",
-        ...plannerImageFields(refs),
-        channelId: m.channelId,
-        slug,
-        messageId: m.id,
-        callbackUrl: this.cfg.planner?.callbackUrl ?? this.ctx.callbackUrl,
-        ...(workingId ? { statusMessageId: workingId } : {}),
-        dryRun: false,
-      },
+      variant === "chat"
+        ? { ...common, imagePath: "", profile: String(route.profile), attachments: refs.map((r) => ({ ...r })) }
+        : { ...common, ...plannerImageFields(refs), ...(workingId ? { statusMessageId: workingId } : {}) },
       this.opts.fetchImpl,
     );
     const signal = plannerUserSignal(result);
-    this.ctx.audit({ ...base, action: "planner", outcome: signal === "accepted" ? "ok" : signal === "start_failed" ? "error" : "skipped", reason: signal, status: result.status, ms: Date.now() - t0 });
+    this.ctx.audit({ ...base, action: "planner", outcome: signal === "accepted" ? "ok" : signal === "start_failed" ? "error" : "skipped", reason: signal, type: variant === "chat" ? "chat_hop" : "planner", status: result.status, ms: Date.now() - t0 });
     if (signal === "accepted") {
       await this.port.react(m.channelId, m.id, PLANNER_DONE_EMOJI).catch(() => undefined);
     } else if (signal === "start_failed") {
+      this.chatHolds.get(m.id)?.();
+      this.chatHolds.delete(m.id);
       this.planner.forget(m.id);
       if (workingId) await this.port.edit(m.channelId, workingId, PLANNER_START_FAILED_TEXT).catch(() => undefined);
+      else if (variant === "chat") await this.port.send(m.channelId, PLANNER_START_FAILED_TEXT, { replyTo: m.id }).catch(() => undefined);
     } else {
       // transport / inconclusive: not a final failure, no red X. The callback may still arrive.
       this.ctx.log.warn(`[discord] planner ${signal} (not a final failure)`);
@@ -391,23 +458,78 @@ export class DiscordAdapter implements SourceAdapter {
     return this.routes.some((r) => r.enabled && r.match.channel === channelId);
   }
 
+  /** multipart/form-data callback -> the JSON body shape plus uploaded files. */
+  private fromMultipart(mp: MultipartBody): { body: DiscordCallbackBody; uploads: UploadedFile[] } {
+    const parts = mp.parse({ maxParts: 32, maxFieldBytes: 64 * 1024 });
+    const body: Record<string, unknown> = {};
+    const uploads: UploadedFile[] = [];
+    const json = parts.find((p) => p.name === "payload_json" && p.filename === undefined);
+    if (json) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(json.data.toString("utf8"));
+      } catch {
+        throw new MultipartError("multipart_invalid");
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new MultipartError("multipart_invalid");
+      Object.assign(body, parsed);
+    }
+    const TEXT = new Set(["channelId", "userId", "content", "replyToMessageId", "statusMessageId", "threadContent"]);
+    for (const p of parts) {
+      if (p.filename !== undefined) uploads.push({ filename: p.filename, contentType: p.contentType, data: p.data });
+      else if (TEXT.has(p.name) && body[p.name] === undefined) body[p.name] = p.data.toString("utf8");
+    }
+    return { body: body as DiscordCallbackBody, uploads };
+  }
+
   async handleCallback(raw: unknown): Promise<HttpResponse> {
-    const b = (raw ?? {}) as DiscordCallbackBody;
-    const channelId = typeof b.channelId === "string" ? b.channelId : "";
+    let b: DiscordCallbackBody;
+    let uploads: UploadedFile[] = [];
+    if (raw instanceof MultipartBody) {
+      try {
+        ({ body: b, uploads } = this.fromMultipart(raw));
+      } catch (err) {
+        const code = err instanceof MultipartError ? err.code : "multipart_invalid";
+        this.ctx.audit({ action: "callback", outcome: "deny", reason: code });
+        return { status: code === "multipart_invalid" ? 400 : 413, body: { ok: false, error: code } };
+      }
+    } else {
+      b = (raw ?? {}) as DiscordCallbackBody;
+    }
+    let channelId = typeof b.channelId === "string" ? b.channelId : "";
+    const userId = typeof b.userId === "string" ? b.userId : "";
     const content = typeof b.content === "string" ? b.content : "";
-    if (!SNOWFLAKE.test(channelId)) return { status: 400, body: { ok: false, error: "channelId required" } };
-    const hasFiles = Array.isArray(b.attachments) && b.attachments.length > 0;
+    if (channelId && userId) return { status: 400, body: { ok: false, error: "channelId_or_userId_not_both" } };
+    if (!userId && !SNOWFLAKE.test(channelId)) return { status: 400, body: { ok: false, error: "channelId required" } };
+    if (userId && !SNOWFLAKE.test(userId)) return { status: 400, body: { ok: false, error: "userId invalid" } };
+    const hasFiles = (Array.isArray(b.attachments) && b.attachments.length > 0) || uploads.length > 0;
     if (!content.trim() && !hasFiles) return { status: 400, body: { ok: false, error: "content_or_attachment_required" } };
     if (content.length > 8000) return { status: 413, body: { ok: false, error: "content too long (max 8000)" } };
-    if (!this.replyAllowed(channelId)) return { status: 403, body: { ok: false, error: "channel_not_allowlisted" } };
+    if (userId) {
+      // DM by user id: deny by default, only explicitly allowlisted users.
+      if (!(this.cfg.dmCallbacks?.allowUsers ?? []).includes(userId)) {
+        this.ctx.audit({ action: "callback", outcome: "deny", reason: "dm_user_not_allowlisted", actor: userId });
+        return { status: 403, body: { ok: false, error: "user_not_allowlisted" } };
+      }
+      if (!this.port.openDm) return { status: 501, body: { ok: false, error: "dm_not_supported" } };
+      try {
+        channelId = await this.port.openDm(userId);
+      } catch (err) {
+        return { status: 502, body: { ok: false, error: "dm_open_failed", detail: (err as Error).name } };
+      }
+      if (!SNOWFLAKE.test(channelId)) return { status: 502, body: { ok: false, error: "dm_open_failed" } };
+      this.ctx.audit({ action: "callback", outcome: "allow", reason: "dm_by_user", actor: userId, lane: channelId });
+    } else if (!this.replyAllowed(channelId)) {
+      return { status: 403, body: { ok: false, error: "channel_not_allowlisted" } };
+    }
     const replyTo = typeof b.replyToMessageId === "string" && SNOWFLAKE.test(b.replyToMessageId) ? b.replyToMessageId : undefined;
     let files: ResolvedAttachment[] = [];
-    if (b.attachments !== undefined) {
+    if (b.attachments !== undefined || uploads.length) {
       try {
-        files = await resolveJsonAttachments(b.attachments, { fetchImpl: this.opts.fetchImpl, allowHttpHosts: this.cfg.attachments?.allowHttpHosts });
+        files = await resolveJsonAttachments(b.attachments, { fetchImpl: this.opts.fetchImpl, allowHttpHosts: this.cfg.attachments?.allowHttpHosts }, uploads);
       } catch (err) {
         const code = err instanceof AttachmentError ? err.code : "invalid_attachment";
-        const n = Array.isArray(b.attachments) ? b.attachments.length : 0;
+        const n = (Array.isArray(b.attachments) ? b.attachments.length : 0) + uploads.length;
         this.ctx.audit({ action: "attachment", outcome: "deny", reason: code, eventId: replyTo, lane: channelId, count: n });
         return { status: attachmentHttpStatus(code), body: { ok: false, error: code } };
       }
@@ -423,6 +545,11 @@ export class DiscordAdapter implements SourceAdapter {
           kinds: kindsOf(files.map((f) => f.contentType)),
         });
       }
+    }
+    // A chat-hop reply that beats the working-message delay: cancel it, answer as a new reply.
+    if (replyTo && this.chatHolds.has(replyTo)) {
+      this.chatHolds.get(replyTo)!();
+      this.chatHolds.delete(replyTo);
     }
     // A planner reply edits its "Working on it." message (success or failure text).
     this.planner.stopPulse(replyTo);

@@ -145,13 +145,24 @@ export class FakeVoicePort implements VoicePort {
     if (this.notVoice.has(channelId)) throw new Error("not_a_voice_channel");
     this.played.push({ channelId, bytes: pcm.length });
   }
-  async openStream(channelId: string, nextFrame: () => Buffer) {
+  private ended: (() => void) | undefined;
+  async openStream(channelId: string, nextFrame: () => Buffer, onEnded?: () => void) {
     if (this.gate) await this.gate;
     if (this.notVoice.has(channelId)) throw new Error("not_a_voice_channel");
     const s = { channelId, closed: false, frames: 0 };
     this.streams.push(s);
     this.pull = nextFrame;
-    return { close: () => { s.closed = true; this.pull = undefined; } };
+    this.ended = onEnded;
+    return { close: () => { s.closed = true; this.pull = undefined; this.ended = undefined; } };
+  }
+  /** Simulate Discord dropping the open stream (no close() from our side). */
+  drop() {
+    const s = this.streams[this.streams.length - 1];
+    if (s) s.closed = true;
+    this.pull = undefined;
+    const cb = this.ended;
+    this.ended = undefined;
+    cb?.();
   }
   /** Pull n 20 ms frames (what the gateway pump does). Returns the frames. */
   pump(n: number): Buffer[] {
@@ -193,6 +204,14 @@ export class FakeDiscordPort implements DiscordPort {
   async edit(channelId: string, messageId: string, content: string, opts?: { files?: OutgoingFile[] }) {
     if (this.failEdits.has(messageId)) throw new Error("Unknown Message");
     this.edits.push({ channelId, messageId, content, ...(opts?.files?.length ? { files: opts.files } : {}) });
+  }
+  dms: string[] = [];
+  /** User ids whose DM can't be opened. */
+  failDm = new Set<string>();
+  async openDm(userId: string) {
+    if (this.failDm.has(userId)) throw new Error("Cannot send messages to this user");
+    this.dms.push(userId);
+    return `6${userId.slice(1)}`;
   }
   async react(channelId: string, messageId: string, emoji: string) {
     this.reactions.push({ channelId, messageId, emoji });

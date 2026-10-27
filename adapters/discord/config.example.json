@@ -44,6 +44,22 @@
       "requireAddressed": true,
       "slug": "example-media",
       "handler": "local-planner"
+    },
+    {
+      "id": "example-chat-hop",
+      "enabled": false,
+      "match": {
+        "guild": "111111111111111111",
+        "channel": "200000000000000002"
+      },
+      "allowActors": [
+        "333333333333333333"
+      ],
+      "agent": "example-agent",
+      "requireAddressed": true,
+      "slug": "example-chat-hop",
+      "handler": "grokbuild-chat",
+      "profile": "example-profile"
     }
   ],
   "attachments": {
@@ -52,7 +68,8 @@
   "planner": {
     "urlRef": "env:DISCORD_PLANNER_URL",
     "tokenRef": "env:DISCORD_PLANNER_TOKEN",
-    "pulseMaxMs": 1800000
+    "pulseMaxMs": 1800000,
+    "chatWorkingDelayMs": 15000
   },
   "voice": {
     "enabled": false,
@@ -62,5 +79,8 @@
     "piperHostRef": "env:PIPER_HOST",
     "piperPortRef": "env:PIPER_PORT",
     "grokApiKeyRef": "env:GROK_VOICE_API_KEY"
+  },
+  "dmCallbacks": {
+    "allowUsers": []
   }
 }
