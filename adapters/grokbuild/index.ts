@@ -19,7 +19,7 @@ import type { Route } from "../../core/types.js";
  *   POST /grokbuild/prompt               client token   { bot, prompt, requestId?, replyHint? }
  *   GET  /grokbuild/requests/:requestId  client token   -> { state, replies[] }
  *   GET  /grokbuild/status               client token   -> { client, readOnly, replyChannel }  (no write)
- *   POST /grokbuild/callback             callback token { requestId, content }   (the agent's reply)
+ *   POST /grokbuild/callback             callback token { requestId, client?, content }   (the agent's reply)
  *
  * Client routes: header-only bearer (?token= refused), 503 while no client
  * token resolves, 401 for a wrong token, a per-client rate limit, then the
@@ -51,12 +51,14 @@ export interface GrokBuildConfig {
   promptsPerMin?: number;
   /** Status / reply reads per client per minute (default 240; 0 = no limit). */
   readsPerMin?: number;
-  /** Open (not yet expired) requests per client (default 200). */
+  /** Open requests per client (default 200; 0 = no cap). A request stops counting once it has a reply or its delivery failed, or at replyTtlSec. */
   maxOpenRequests?: number;
 }
 
 interface RequestRecord {
   client: string;
+  /** The client's own id (records are keyed by client + requestId). */
+  requestId?: string;
   bot: string;
   createdAt: number;
   replies: { content: string; at: string }[];
@@ -70,6 +72,11 @@ const BOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MAX_REPLIES = 20;
 const MAX_REPLY_CHARS = 8000;
 const AUTH_FAIL_AUDITS_PER_MIN = 20;
+
+/** Records are keyed per client, so two clients can use the same requestId. ":" is in neither id alphabet. */
+export function requestKey(client: string, requestId: string): string {
+  return `${client}:${requestId}`;
+}
 
 function isLimit(v: unknown): boolean {
   return v === undefined || (typeof v === "number" && Number.isInteger(v) && v >= 0);
@@ -137,7 +144,12 @@ export class GrokBuildAdapter implements SourceAdapter {
     try {
       const raw = JSON.parse(readFileSync(this.file, "utf8")) as { requests?: Record<string, RequestRecord> };
       const cutoff = Date.now() - this.ttlMs();
-      for (const [id, r] of Object.entries(raw.requests ?? {})) if (r && r.createdAt >= cutoff) this.requests.set(id, r);
+      for (const [id, r] of Object.entries(raw.requests ?? {})) {
+        if (!r || r.createdAt < cutoff) continue;
+        // Older files were keyed by requestId alone.
+        const requestId = r.requestId ?? (id.includes(":") ? id.slice(id.indexOf(":") + 1) : id);
+        this.requests.set(requestKey(r.client, requestId), { ...r, requestId });
+      }
     } catch {
       /* none yet */
     }
@@ -194,6 +206,31 @@ export class GrokBuildAdapter implements SourceAdapter {
     return ro.value;
   }
 
+  /** A callback token that is also a client token would let a client forge agent replies: refuse to start. */
+  private assertDistinctTokens(): void {
+    let cb: string | undefined;
+    try {
+      cb = this.ctx.secret(this.cfg.callbackTokenRef);
+    } catch {
+      cb = undefined;
+    }
+    if (!cb) return;
+    for (const [id, cl] of Object.entries(this.cfg.clients)) {
+      let t: string | undefined;
+      try {
+        t = this.ctx.secret(cl.tokenRef);
+      } catch {
+        t = undefined;
+      }
+      if (t && safeEqual(t, cb)) throw new Error(`grokbuild: the callback token equals the token of client ${id}; give each its own token`);
+    }
+  }
+
+  /** Still counts against maxOpenRequests: no reply yet and delivery not failed. */
+  private isOpen(key: string, r: RequestRecord): boolean {
+    return r.replies.length === 0 && this.ctx.state(key) !== "failed";
+  }
+
   /** The agent can only answer when the callback route is live (token + public URL). */
   replyChannelReady(): boolean {
     if (!this.ctx.callbackUrl) return false;
@@ -206,6 +243,7 @@ export class GrokBuildAdapter implements SourceAdapter {
 
   init(ctx: AdapterContext): void {
     this.ctx = ctx;
+    this.assertDistinctTokens();
     this.file = ctx.dataFile("requests.json");
     this.loadRequests();
     ctx.route("POST", "prompt", (req) => this.onPrompt(req), { maxBytes: 64 * 1024 });
@@ -219,6 +257,7 @@ export class GrokBuildAdapter implements SourceAdapter {
       let n = 0;
       for (const [id, r] of this.requests) if (r.createdAt < cutoff) n += Number(this.requests.delete(id));
       if (n) this.saveRequests();
+      this.flushAuthFails();
     }, 60_000);
     this.sweep.unref?.();
     this.ctx.log.info(
@@ -228,6 +267,15 @@ export class GrokBuildAdapter implements SourceAdapter {
 
   async stop(): Promise<void> {
     if (this.sweep) clearInterval(this.sweep);
+    this.flushAuthFails();
+  }
+
+  /** Write the summary of 401s that were not audited one by one (on the minute timer, a new window, and stop). */
+  flushAuthFails(now = Date.now()): void {
+    if (this.authFails.suppressed) {
+      this.ctx.audit({ action: "ingest", outcome: "deny", reason: "bad_token_suppressed", count: this.authFails.suppressed, status: 401 });
+    }
+    this.authFails = { window: now, audited: 0, suppressed: 0 };
   }
 
   /**
@@ -258,12 +306,7 @@ export class GrokBuildAdapter implements SourceAdapter {
   /** 401 audit lines are capped per minute; the rest are summed into one line. */
   private auditAuthFail(action: "ingest" | "reply_read"): void {
     const now = Date.now();
-    if (now - this.authFails.window >= 60_000) {
-      if (this.authFails.suppressed) {
-        this.ctx.audit({ action, outcome: "deny", reason: "bad_token_suppressed", count: this.authFails.suppressed, status: 401 });
-      }
-      this.authFails = { window: now, audited: 0, suppressed: 0 };
-    }
+    if (now - this.authFails.window >= 60_000) this.flushAuthFails(now);
     if (this.authFails.audited < AUTH_FAIL_AUDITS_PER_MIN) {
       this.authFails.audited += 1;
       this.ctx.audit({ action, outcome: "deny", reason: "bad_token", status: 401 });
@@ -299,9 +342,9 @@ export class GrokBuildAdapter implements SourceAdapter {
     return { ok: true, client: who };
   }
 
-  private refuse(client: string, status: number, error: string, eventId?: string): HttpResponse {
+  private refuse(client: string, status: number, error: string, eventId?: string, headers?: Record<string, string>): HttpResponse {
     this.ctx.audit({ action: "ingest", outcome: "deny", reason: oneLine(error, 40), actor: client, eventId, status });
-    return { status, body: { ok: false, error } };
+    return { status, body: { ok: false, error }, ...(headers ? { headers } : {}) };
   }
 
   private async onPrompt(req: HttpRequest): Promise<HttpResponse> {
@@ -320,16 +363,29 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (prompt.length > max) return this.refuse(client, 413, `prompt longer than ${max} chars`);
     const requestId = typeof b.requestId === "string" ? b.requestId : randomUUID();
     if (!REQUEST_ID.test(requestId)) return this.refuse(client, 400, "requestId must be 8-64 of [A-Za-z0-9_-]");
-    if (this.requests.has(requestId)) return this.refuse(client, 409, "duplicate requestId", requestId);
-    let open = 0;
-    for (const r of this.requests.values()) if (r.client === client) open += 1;
-    if (open >= (this.cfg.maxOpenRequests ?? 200)) return this.refuse(client, 429, "too_many_open_requests");
+    const key = requestKey(client, requestId);
+    if (this.requests.has(key)) return this.refuse(client, 409, "duplicate requestId", requestId);
+    const cap = this.cfg.maxOpenRequests ?? 200;
+    if (cap > 0) {
+      let open = 0;
+      let oldest = Infinity;
+      for (const [k, r] of this.requests) {
+        if (r.client !== client || !this.isOpen(k, r)) continue;
+        open += 1;
+        oldest = Math.min(oldest, r.createdAt);
+      }
+      if (open >= cap) {
+        // The oldest open request stops counting at the latest when it expires.
+        const retry = Math.max(1, Math.ceil((oldest + this.ttlMs() - Date.now()) / 1000));
+        return this.refuse(client, 429, "too_many_open_requests", undefined, { "retry-after": String(retry) });
+      }
+    }
     const replyHint = typeof b.replyHint === "string" ? b.replyHint : undefined;
     // Record first so a fast reply can never arrive before the request is known.
-    this.requests.set(requestId, { client, bot, createdAt: Date.now(), replies: [] });
+    this.requests.set(key, { client, requestId, bot, createdAt: Date.now(), replies: [] });
     this.saveRequests();
     const res = await this.ctx.submit({
-      eventId: requestId,
+      eventId: key,
       lane: client,
       actor: client,
       match: { client, bot },
@@ -338,7 +394,7 @@ export class GrokBuildAdapter implements SourceAdapter {
       metadata: { requestId, replyUrl: this.ctx.callbackUrl },
     });
     if (!res.accepted) {
-      this.requests.delete(requestId);
+      this.requests.delete(key);
       this.saveRequests();
       // The core already wrote the deny line (route, reason).
       const status = res.reason === "agent_not_ready" ? 503 : res.reason === "duplicate" ? 409 : 403;
@@ -351,12 +407,13 @@ export class GrokBuildAdapter implements SourceAdapter {
     const a = this.auth(req, "reply_read");
     if (!a.ok) return a.res;
     const id = req.params.requestId;
-    const rec = this.requests.get(id);
-    // Same answer for "unknown" and "someone else's" so ids cannot be probed.
-    if (!rec || rec.client !== a.client) return { status: 404, body: { ok: false, error: "not_found" } };
+    const key = requestKey(a.client, id);
+    // Only the caller's own records are looked up, so another client's ids cannot be probed.
+    const rec = this.requests.get(key);
+    if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
     this.ctx.audit({ action: "reply_read", outcome: "ok", eventId: id, actor: a.client });
     // Event states are memory-only: after a restart a request that already has replies was delivered.
-    const state = this.ctx.state(id) ?? (rec.replies.length ? "delivered" : "unknown");
+    const state = this.ctx.state(key) ?? (rec.replies.length ? "delivered" : "unknown");
     return { status: 200, body: { ok: true, requestId: id, bot: rec.bot, state, replies: rec.replies } };
   }
 
@@ -372,10 +429,17 @@ export class GrokBuildAdapter implements SourceAdapter {
   }
 
   async handleCallback(raw: unknown): Promise<HttpResponse> {
-    const b = (raw ?? {}) as { requestId?: unknown; content?: unknown };
+    const b = (raw ?? {}) as { requestId?: unknown; client?: unknown; content?: unknown };
     const id = typeof b.requestId === "string" ? b.requestId : "";
     const content = typeof b.content === "string" ? b.content.trim() : "";
-    const rec = this.requests.get(id);
+    // The trailer carries client=<id>; without it the requestId must be unique across clients.
+    let rec: RequestRecord | undefined;
+    if (typeof b.client === "string" && b.client) rec = this.requests.get(requestKey(b.client, id));
+    else {
+      const hits = [...this.requests.values()].filter((r) => r.requestId === id);
+      if (hits.length > 1) return { status: 409, body: { ok: false, error: "client required (requestId is used by more than one client)" } };
+      rec = hits[0];
+    }
     if (!rec) return { status: 404, body: { ok: false, error: "unknown requestId" } };
     if (!content) return { status: 400, body: { ok: false, error: "content required" } };
     if (content.length > MAX_REPLY_CHARS) return { status: 413, body: { ok: false, error: "content too long" } };

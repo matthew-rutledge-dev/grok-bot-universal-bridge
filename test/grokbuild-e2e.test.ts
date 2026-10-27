@@ -109,7 +109,7 @@ test("grokbuild end to end: read-only, flip, prompt -> wake -> callback, refusal
     void fetch(`${bridgeBase}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${CALLBACK_TOKEN}` },
-      body: JSON.stringify({ requestId: m[1], content: m[1].startsWith("live-check-") ? "live-check ok" : "Done: parser refactored." }),
+      body: JSON.stringify({ requestId: m[1], client: m[2], content: m[1].startsWith("live-check-") ? "live-check ok" : "Done: parser refactored." }),
     });
   });
   const wake = await fakeServer([]);
@@ -222,6 +222,7 @@ test("grokbuild end to end: read-only, flip, prompt -> wake -> callback, refusal
     }
     assert.equal(read.body.state, "delivered");
     assert.equal(read.body.replies[0].content, "Done: parser refactored.");
+    assert.equal(wake.hits.length, 1, "still exactly one wake POST for the outage after delivery");
     assert.equal((await new FakeGrokBuildClient(bridgeBase, OTHER_TOKEN).read("e2e-req-00000001")).status, 404, "another client cannot read it");
 
     // 5. Unauthorized requests fail.

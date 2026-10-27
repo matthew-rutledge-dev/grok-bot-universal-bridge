@@ -2,11 +2,16 @@
 
 For the host operator. Goal: real Grok Build clients reach an allowlisted Grok Bot through the universal bridge, after a check while read-only is still on. Every step is reversible. Placeholders below (`example-client`, `example-agent`, `bridge.example.com`) stand for the host's real values, which live only in the host files.
 
+> **Deploy prerequisite: read-only now fails closed.** From this version on, only an explicit `GROKBUILD_READ_ONLY=0` (or `false`/`no`/`off`) lets prompts through. Unset or empty means read-only, which is the reverse of earlier versions. On the live host, do steps 1-3 before or together with the deploy: check while read-only, set `GROKBUILD_READ_ONLY=0`, recreate the container (`docker compose up -d --force-recreate`), then one verified round trip. Otherwise every prompt gets **403 `read_only`**.
+>
+> Also set `callbackTokenRef` in the host `grokbuild.json` (its token in `.env` or a secret file, different from every client token, or the bridge refuses to start) and `http.publicBaseUrl` in the host bridge config. Otherwise prompts get **503 `reply_channel_unset`** and `/grokbuild/callback` answers 503.
+
 ## 0. Before you start
 
 - [ ] The bridge runs at the commit that has this file, and `--check` lists `grokbuild` with every route agent ready.
 - [ ] `config/grokbuild.json` (host copy) has `readOnlyRef` set, one `clients.<id>.tokenRef` per real client, and one route row per client and bot. Everything else stays deny by default.
 - [ ] The host `.env` (or secret files) has the client token(s), `GROKBUILD_CALLBACK_TOKEN`, and **`GROKBUILD_READ_ONLY=1`**. Unset or empty also means read-only, but set `1` explicitly.
+- [ ] `callbackTokenRef` is set in the host `grokbuild.json` and its token differs from every client token.
 - [ ] `http.publicBaseUrl` is set, and the tunnel routes `/grokbuild/*` to the bridge's loopback port. Otherwise prompts answer 503 `reply_channel_unset`.
 - [ ] The agent behind the route knows the callback URL and has the callback token (its reply skill), and its registry entry (webhook routine or sendPrompt Gateway) resolves.
 - [ ] Note the current image tag for rollback (`rollback-pre-<sha>`).
