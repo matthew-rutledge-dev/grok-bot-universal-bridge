@@ -16,7 +16,8 @@
     "test": "node scripts/run-tests.mjs",
     "check:config": "tsx src/main.ts --check",
     "leak-check": "node scripts/leak-check.mjs",
-    "smoke": "tsx scripts/smoke-e2e.ts"
+    "smoke": "tsx scripts/smoke-e2e.ts",
+    "live-check:grokbuild": "node scripts/grokbuild-live-check.mjs"
   },
   "dependencies": {
     "@discordjs/voice": "0.19.2",

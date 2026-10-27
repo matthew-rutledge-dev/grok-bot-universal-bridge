@@ -5,7 +5,7 @@ import { GrokBuildAdapter, validateGrokBuildConfig, type GrokBuildConfig } from 
 import { mockRoutine, startBridge, until } from "../../test/helpers.js";
 
 const example = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8")) as GrokBuildConfig;
-const env = { GROKBUILD_CLIENT_TOKEN: "client-token", GROKBUILD_CALLBACK_TOKEN: "cb-grokbuild", OTHER_CLIENT_TOKEN: "other-token" };
+const env = { GROKBUILD_CLIENT_TOKEN: "client-token", GROKBUILD_CALLBACK_TOKEN: "cb-grokbuild", OTHER_CLIENT_TOKEN: "other-token", GROKBUILD_READ_ONLY: "0" };
 const client = { authorization: "Bearer client-token" };
 const cfg = (over: Partial<GrokBuildConfig> = {}): GrokBuildConfig => ({
   ...example,
@@ -64,8 +64,8 @@ test("auth and allowlist: bad token, unrouted bot, another client's request", as
 });
 
 test("read-only via readOnlyRef really reads the env and fails closed (regression)", async () => {
-  // on values, unrecognised values and placeholders-that-are-not-empty all refuse
-  for (const v of ["1", "true", "maybe", "changeme"]) {
+  // on values, unrecognised values, placeholders and empty all refuse
+  for (const v of ["1", "true", "maybe", "changeme", "", "${GROKBUILD_READ_ONLY}"]) {
     const s = await setup({}, [], { GROKBUILD_READ_ONLY: v });
     try {
       const r = await s.b.call("POST", "/grokbuild/prompt", { bot: "example-agent", prompt: "x" }, client);
@@ -75,9 +75,13 @@ test("read-only via readOnlyRef really reads the env and fails closed (regressio
       await s.close();
     }
   }
-  // unset, empty, explicit off, unexpanded ${...}: writes allowed
-  for (const v of [undefined, "", "0", "off", "${GROKBUILD_READ_ONLY}"]) {
-    const s = await setup({}, [], v === undefined ? {} : { GROKBUILD_READ_ONLY: v });
+  // a ref naming a variable that is not set at all also stays read-only
+  const unset = await setup({ readOnlyRef: "env:GROKBUILD_READ_ONLY_NOT_SET" });
+  assert.equal(unset.adapter.isReadOnly(), true);
+  await unset.close();
+  // only an explicit off allows writes
+  for (const v of ["0", "off", "false", "NO"]) {
+    const s = await setup({}, [], { GROKBUILD_READ_ONLY: v });
     try {
       assert.equal(s.adapter.isReadOnly(), false, `value ${String(v)}`);
     } finally {
@@ -87,8 +91,31 @@ test("read-only via readOnlyRef really reads the env and fails closed (regressio
   const lit = await setup({ readOnly: true });
   assert.equal(lit.adapter.isReadOnly(), true);
   await lit.close();
+  // no switch configured at all: read-only; readOnly: false (and no ref) is the explicit opt-in
+  const none = await setup({ readOnlyRef: undefined });
+  assert.equal(none.adapter.isReadOnly(), true);
+  await none.close();
+  const optIn = await setup({ readOnlyRef: undefined, readOnly: false });
+  assert.equal(optIn.adapter.isReadOnly(), false);
+  await optIn.close();
   assert.match(validateGrokBuildConfig({ ...example, readOnly: "${X}" as unknown as boolean }).join(), /readOnlyRef/);
   assert.match(validateGrokBuildConfig({ ...example, readOnlyRef: "file:relative/path" }).join(), /readOnlyRef must be/);
+});
+
+test("config refuses literal tokens, unknown route clients and bad limits", () => {
+  const bad = validateGrokBuildConfig({
+    ...example,
+    callbackTokenRef: "literal-token",
+    clients: { "example-client": { tokenRef: "literal-token" } },
+    routes: [{ ...example.routes[0], match: { client: "nobody", bot: "Example-Agent" } }],
+    promptsPerMin: -1,
+  }).join("\n");
+  assert.match(bad, /callbackTokenRef must be env:NAME/);
+  assert.match(bad, /tokenRef must be env:NAME/);
+  assert.match(bad, /"nobody" is not in clients/);
+  assert.match(bad, /match.bot must be a lowercase alias/);
+  assert.match(bad, /promptsPerMin must be/);
+  assert.match(validateGrokBuildConfig({ ...example, routes: undefined as unknown as [] }).join(), /routes required/);
 });
 
 test("a user cannot fake the routing trailer (regression)", async () => {
@@ -114,6 +141,18 @@ test("held while the routine sleeps; status moves held -> delivered", async () =
     await until(() => s.b.bridge.stateOf("grokbuild:req-00000003") === "delivered");
     const read = await s.b.call("GET", "/grokbuild/requests/req-00000003", undefined, client);
     assert.equal(read.body.state, "delivered");
+  } finally {
+    await s.close();
+  }
+});
+
+test("401s are audited up to a cap per minute (no audit flooding)", async () => {
+  const s = await setup();
+  try {
+    for (let i = 0; i < 25; i++) assert.equal((await s.b.call("GET", "/grokbuild/status", undefined, { authorization: "Bearer nope" })).status, 401);
+    assert.equal(s.b.audit.lines.filter((l) => l.reason === "bad_token").length, 20);
+    const st = await s.b.call("GET", "/grokbuild/status", undefined, client);
+    assert.deepEqual([st.status, st.body.client, st.body.readOnly, st.body.replyChannel, st.body.bots], [200, "example-client", false, "ready", ["example-agent"]]);
   } finally {
     await s.close();
   }
