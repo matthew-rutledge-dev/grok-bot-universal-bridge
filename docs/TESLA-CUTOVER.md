@@ -35,12 +35,14 @@ Ground rules:
 
 - [ ] Image `tesla/fleet-telemetry:<tag>` (pin a tag) with the server config from [`adapters/tesla/README.md` → MQTT](../adapters/tesla/README.md#mqtt): `records: { "V": ["mqtt"] }`, `transmit_decoded_records: true`, `mqtt.broker` = `host:port` of the broker, `mqtt.topic_base` = `telemetry`, `qos: 1`, `retained: false`, and its own `client_id` (different from the bridge's).
   - If you do turn on `retained: true`: values the broker replays after a bridge reconnect only fill in fields the bridge hasn't seen yet. For fields it has, the replay is ignored, so a change that happened while the bridge was disconnected fires late, on the next live message for that field (the car's next change or resend), not at reconnect.
+- [ ] Ownership events: also `records: { "alerts": ["mqtt"] }` so vehicle alerts reach the broker (`<topic_base>/<VIN>/alerts/<name>/current`).
 - [ ] The server cert and key are mounted read-only, and the public port is forwarded to it.
 - [ ] Started, and its log shows the MQTT connect health check passing (it fails to start if the broker is unreachable).
 
 ## 3. Push the telemetry config to the car (signed, needs the owner's yes)
 
 - [ ] Build the request from `telemetry.fields` in the bridge config: `fields` → `{ "<Field>": { "interval_seconds": N, "resend_interval_seconds": <resend_interval_s> } }`, plus `prefer_typed: true`, `hostname: <telemetry-fqdn>`, `port`, `ca` (the fleet-telemetry server's CA chain) and an `exp`.
+- [ ] Ownership events: add the fields from [`adapters/tesla/README.md` → Telemetry fields for ownership](../adapters/tesla/README.md#telemetry-fields-for-ownership) and `alert_types` (the values are only community-documented; see that README section).
 - [ ] Send it once through the virtual-key proxy (`POST /api/1/vehicles/fleet_telemetry_config`). Neither the plugin nor the bridge does this today. Do it by hand, or later with the plugin's confirm-gated tool.
 - [ ] Check it took: `GET /api/1/vehicles/<VIN>/fleet_telemetry_config` shows `synced: true` once the car is online.
 
@@ -57,6 +59,7 @@ Ground rules:
 - [ ] `energy_poll`: `site_allowlist`, `api_base` (your region's Fleet API base URL) and `token_ref` from step 4.
 - [ ] If the broker is a compose service, put the bridge on the same compose network and use the service name (`mqtt://mosquitto:1883`). Single-label names are accepted as LAN.
 - [ ] In `config/bridge.json`, set `adapters.tesla.enabled: true` (telemetry first: leave `energy_poll.enabled: false` until step 6 passes).
+- [ ] Ownership events (optional): `ownership.enabled: true`, `ownership.vehicles` (one entry per car, VINs also in `vin_allowlist`), a route with `match: { "kind": "ownership" }` whose `agent` is the alias that should get them, and `ownership.rest` (`api_base`, `token_ref`) for recalls / warranty / service status.
 - [ ] `node dist/src/main.js --check` → `ok`, with `tesla` in the adapter list.
 - [ ] `docker compose up -d --force-recreate universal-bridge`.
 

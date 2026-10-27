@@ -118,7 +118,61 @@ Matching fleet-telemetry server config (placeholders; the MQTT part follows `dat
 }
 ```
 
-The MQTT producer always publishes decoded values, whatever `transmit_decoded_records` says (that setting changes what the other dispatchers get). Keep it `true` anyway so a `logger` or other dispatcher you add for debugging emits JSON. `reliable_ack_sources` makes fleet-telemetry ack the car only after the broker took every datum of a payload. Leave `alerts`, `errors` and `connectivity` off `mqtt` unless something else needs them; the bridge doesn't subscribe to them.
+The MQTT producer always publishes decoded values, whatever `transmit_decoded_records` says (that setting changes what the other dispatchers get). Keep it `true` anyway so a `logger` or other dispatcher you add for debugging emits JSON. `reliable_ack_sources` makes fleet-telemetry ack the car only after the broker took every datum of a payload. With [ownership events](#ownership-events) on, also route `alerts` to `mqtt` (`records: { "V": ["mqtt"], "alerts": ["mqtt"] }`): the bridge then subscribes to `<topic_base>/+/alerts/+/current` as well (payload `{"Name", "StartedAt", "EndedAt", "Audiences"}`, `mqtt_payload.go` `processVehicleAlerts`). The `alerts/<name>/history`, `errors` and `connectivity` topics are never subscribed; leave `errors` and `connectivity` off `mqtt` unless something else needs them.
+
+## Ownership events
+
+Optional (`ownership.enabled`). Change-only, deduped facts about each car for an agent that tracks ownership (updates, mileage, alerts, service, tires, battery health, charging faults, safety, Sentry), sent to the route with `match: { "kind": "ownership" }` (actor = VIN; the route's `agent` is the configurable target). Never a raw stream: each event is one change with a `dedupe_key`, and the same change never produces two events, also across restarts (per-car state in `<data dir>/tesla-ownership-state.json`, mode 600, keyed by `vehicle_id`, never the VIN).
+
+Every event carries the same envelope:
+
+```json
+{ "vehicle_id": "example-car", "vin_last6": "000001", "model": "Model 3 Example", "ts": "2026-01-01T12:00:00.000Z",
+  "source": "telemetry", "event_type": "tpms", "tier": "immediate", "priority": "high", "dedupe_key": "tpms:fl:very_low:...",
+  "data": { "tire": "fl", "psi": 36.5, "state": "very_low", "recommended_psi": 42, "low_by_psi": 5.5 } }
+```
+
+`ownership.vehicles` lists the cars (each VIN must also be in `telemetry.vin_allowlist`) with an optional `vehicle_id` (default `car-` + 8 hex of a hash of the VIN), `label` (model/trim; default `CarType` + `Trim` from telemetry, else decoded from the VIN), and `model` / `model_year` for the recall lookup when the VIN can't be decoded. Two or more cars are handled independently: separate state, separate lanes, one digest per car.
+
+### Tiers
+
+* **Immediate** (sent at once): `collision_or_safety` from a safety alert, a **new** recall, a critical `vehicle_alert` (audience in `rules.alerts.immediate_audiences`, default `["Customer"]`, or a name matching `rules.alerts.critical_patterns`), a BMS / HV-interlock fault, a failed software update, and a tire low by more than `rules.tpms.immediate_low_by_psi` (default 5) against `recommended_psi` (default 42).
+* **Weekly digest** (everything else): queued (persisted), coalesced by `dedupe_key` (Sentry entries add up to one count per car), and sent once per car at `digest.weekday` / `digest.hour_utc` (default Sunday 13:00 UTC).
+
+### Field mapping (verified)
+
+Checked against `teslamotors/fleet-telemetry` `protos/vehicle_data.proto` and `protos/vehicle_alert.proto` (last proto change 2026-09-24), `datastore/mqtt/mqtt_payload.go`, and Tesla's Fleet Telemetry *Available Data* page and Fleet API endpoint pages.
+
+| Event | Source (real field / alert / endpoint) | Fires when |
+|---|---|---|
+| `software_update` | `Version` (installed firmware), `SoftwareUpdateVersion` (available update), `SoftwareUpdateInstallationPercentComplete` | `available` (a new version offered), `installing` (progress leaves 0), `done` (`Version` changes; `from` / `to`), `failed`: **no field exists**; inferred when progress drops back to 0 with the old version still installed and the update still offered (`inferred: true`), or an alert matching `update_failed_patterns`. After `done`, `release_notes` (REST) adds the note titles |
+| `odometer_milestone` | `Odometer` (miles) | crosses a multiple of `odometer_step_mi` (default 1000). The current odometer is also attached to every service event (`service_mode`, recalls, warranty, service-audience alerts, safety, HV faults) |
+| `vehicle_alert` | Alerts stream (`VehicleAlert`: `name`, `audiences` Customer / Service / ServiceFix, `started_at`, `ended_at`) | an alert starts (`active: true`) or ends. Deduped on name + start time. Priority high |
+| `service_mode` | `ServiceMode` (boolean) | on / off. **Arriving at / leaving a Service Center**: from `GET /api/1/vehicles/{vin}/service_data` (`service_status` changing into / out of `in_service`; the endpoint is documented, its body isn't, so only `service_status` and `service_etc` are read) |
+| `tpms` | `TpmsPressureFl` / `Fr` / `Rl` / `Rr` (bar; psi = bar × 14.5038), `TpmsSoftWarnings` / `TpmsHardWarnings` (`TireLocation` struct) | a tire enters `low` (< `low_psi`, default recommended − 3), `very_low` (low by more than 5 psi: immediate), `high` (> `high_psi`, default recommended + 6), or recovers (0.5 psi hysteresis); a soft or hard TPMS warning appears on a tire |
+| `12v_or_hv_battery` | 12V: **no field exists**; alert names matching `lv_battery_patterns`. HV: `BMSState` = `Fault`, `Hvil` = `Fault` (immediate). Monthly: `RatedRange`, `EnergyRemaining`, `BatteryLevel` (+ `NominalFullPackEnergyKwh` when streamed; proto-only, firmware 2026.32+) | 12V warning alert; HV fault; one reading per UTC month at `BatteryLevel` ≥ `hv_min_battery_level` (default 50): range and pack energy extrapolated to 100% |
+| `charging_fault` | `DetailedChargeState`, `ChargeEnableRequest`, `ChargeLimitSoc`, `BatteryLevel`; error code: **no field exists**, the name of the last alert matching `charging_patterns` (within 15 min) | `Charging`/`Starting` → `NoPower` (power lost), or → `Stopped` while `ChargeEnableRequest` is still true and below the limit (`inferred: true`; a user stop flips `ChargeEnableRequest` to false); or a charging alert |
+| `collision_or_safety` | Airbag / collision / AEB activation: **not exposed** as telemetry fields (`ForwardCollisionWarning`, `AutomaticEmergencyBrakingOff` are settings). Mapped from alert names matching `safety_patterns`; `AutomaticEmergencyBrakingOff` changes are reported as an `aeb_setting` digest line | a safety alert starts (immediate, with city-level location and odometer) |
+| `sentry_or_security` | `SentryMode` (`Aware`, `Panic`) | entering `Aware` or `Panic` (`Panic` → `Aware` is the same incident). Data is `count` and `last_at` only |
+| `recall` | Fleet API has **no recalls endpoint**. NHTSA `GET https://api.nhtsa.gov/recalls/recallsByVehicle?make=TESLA&model=…&modelYear=…` (model and year decoded from the VIN on this host; neither the VIN, the token nor anything else identifying goes to NHTSA) | a campaign number not seen before (immediate). The first pull is one digest baseline line. Model/year scope: whether a recall is open or done for this exact car is only in the Tesla app or Tesla's VIN recall search |
+| `warranty_status` | `GET /api/1/dx/warranty/details?vin=` (`activeWarranty` / `upcomingWarranty` / `expiredWarranty`, `WarrantyItem` keys) | the summary changes (digest) |
+
+Alert names are not published by Tesla, so the `*_patterns` defaults in `ownership.ts` (`DEFAULT_PATTERNS`) are heuristics, not verified names. Check them against your cars' alerts (the plugin's `get_recent_alerts` read) and override them in `rules.alerts`. An alert that matches a pattern becomes that event type instead of a plain `vehicle_alert`.
+
+The Errors stream (`vehicle_error.proto`) is the car's telemetry client reporting its own problems (bad config, unknown field), not vehicle fault codes: an errors record is only counted in the audit (`telemetry_client_errors`).
+
+### What is never sent
+
+* No location trail: `Location` is rounded to one decimal (about 11 km, city level) the moment it's parsed, the precise value is never stored, and only the last coarse value is kept, in memory. It's attached only to `collision_or_safety` and service events, and `rules.location: false` turns that off.
+* No tokens or keys, no cabin or camera media (no such field is read), no full VIN (the envelope has `vin_last6`; prompts, audit and the state file never hold the VIN), no raw streams (changes only).
+
+### REST pull (`ownership.rest`, off by default)
+
+Daily / weekly per car, never per record: `service_data` every `service_h` (default 24), warranty every `warranty_h` (168), NHTSA recalls every `recalls_h` (168), `recent_alerts` every `recent_alerts_h` (default 0 = off; a backup for cars without the Alerts stream), and `release_notes` once after a version change (`release_notes`, default true). `token_ref` is an access token with `vehicle_device_data` (the plugin's export file works; same security note as [Token](#token)); it's re-read on every call and sent to `api_base` only. On 429 the pull waits for `Retry-After`; on auth errors it backs off an hour. None of these calls touch `vehicle_data`, wake a car or send a command. Tesla bills each Fleet API answer below 500, so the defaults stay at a few calls per car per week.
+
+### Telemetry fields for ownership
+
+Add these to `telemetry.fields` (and so to the pushed `fleet_telemetry_config`): `Version` 3600, `SoftwareUpdateInstallationPercentComplete` 60, `Odometer` 600, `ServiceMode` 60, `TpmsPressureFl` / `Fr` / `Rl` / `Rr` 600, `TpmsSoftWarnings` / `TpmsHardWarnings` 60, `ChargeEnableRequest` 60, `ChargeLimitSoc` 600, `RatedRange` 600, `EnergyRemaining` 600, `BMSState` 60, `Hvil` 60, `AutomaticEmergencyBrakingOff` 3600, `CarType` 86400, `Trim` 86400, `Location` 300 (only if location on safety/service events is wanted; it needs the `vehicle_location` scope). Alerts additionally need `alert_types` in the vehicle config: community examples use `["service"]` (some add `"customer"`, `"service-fix"`, matching the `Audience` enum); Tesla's endpoint page doesn't list the values, so confirm on the first push. The plugin repo's telemetry field doc has the full request body; pushing it is an operator step that needs the owner's yes.
 
 ## Energy polling
 
@@ -141,4 +195,4 @@ The MQTT producer always publishes decoded values, whatever `transmit_decoded_re
 
 ## Config
 
-See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN) or `{ "kind": "energy" }` (actor = site id). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited.
+See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN), `{ "kind": "energy" }` (actor = site id) or `{ "kind": "ownership" }` (actor = VIN; ownership events and digests). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited.

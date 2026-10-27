@@ -59,7 +59,8 @@ test("telemetry config: prefer_typed, replaced field names, VIN shape, receiver 
   ] as const) {
     assert.match(v({ fields: { [f]: 10 } }), hint, f);
   }
-  assert.match(v({ fields: { Odometer: 10 } }), /not read by the trigger logic/);
+  assert.match(v({ fields: { VehicleSpeed: 10 } }), /not read by the trigger logic or ownership events/);
+  assert.equal(v({ fields: { ...t.fields!, Odometer: 600 } }), "", "ownership fields are accepted");
   assert.equal(v({ fields: { ...t.fields!, Soc: 300 } }), "", "Soc is accepted as stream-only (low_battery still reads BatteryLevel)");
   assert.match(v({ fields: { ...t.fields!, Gear: 0 } }), /whole seconds >= 1/);
   assert.match(v({ resend_interval_s: 5 }), /resend_interval_s must be an integer >= 60/);

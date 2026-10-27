@@ -14,6 +14,7 @@ import {
   isLanHost,
   parseMqttTopic,
   parseMqttValue,
+  alertSubscriptionFor,
   subscriptionFor,
   TeslaAdapter,
   validateTeslaConfig,
@@ -114,7 +115,9 @@ test("mqtt: topic layout <base>/<VIN>/v/<Field>; VIN from the topic", () => {
   assert.equal(subscriptionFor("telemetry"), "telemetry/+/v/+");
   assert.deepEqual(parseMqttTopic("telemetry", `telemetry/${VIN}/v/DetailedChargeState`), { vin: VIN, field: "DetailedChargeState" });
   assert.deepEqual(parseMqttTopic("a/b", `a/b/${VIN}/v/Gear`), { vin: VIN, field: "Gear" });
-  assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/alerts/X/current`), undefined);
+  assert.deepEqual(parseMqttTopic("telemetry", `telemetry/${VIN}/alerts/X/current`), { vin: VIN, field: "", alert: "X" });
+  assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/alerts/X/history`), undefined);
+  assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/errors/X`), undefined);
   assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/connectivity`), undefined);
   assert.equal(parseMqttTopic("telemetry", "telemetry/not-a-vin/v/Gear"), undefined);
   assert.equal(parseMqttTopic("telemetry", `other/${VIN}/v/Gear`), undefined);
@@ -448,6 +451,48 @@ test("mqtt: a broker that keeps refusing the subscribe gets exponential backoff,
     assert.equal(b.audit.lines.some((l) => l.reason === "mqtt_subscribed"), false);
     assert.ok(b.audit.lines.filter((l) => l.reason === "mqtt_subscribe_refused").length >= 6);
   } finally {
+    await b.close();
+    await m.close();
+    await br.down();
+  }
+});
+
+test("mqtt: with ownership on, alerts/<name>/current is subscribed and feeds ownership events; history/errors ignored", async () => {
+  const br = await broker();
+  const m = await mockRoutine({ key: "routine-key" });
+  const dir = mkdtempSync(join(tmpdir(), "mqtt-own-"));
+  const base = mqttCfg(br.url());
+  const cfg: TeslaConfig = {
+    ...base,
+    ownership: { enabled: true, vehicles: [{ vin: VIN, vehicle_id: "car-a" }] },
+    routes: [...base.routes.filter((r) => r.match.kind !== "ownership"), { id: "example-ownership", enabled: true, match: { kind: "ownership" }, allowActors: [VIN], agent: "example-agent" }],
+  };
+  assert.deepEqual(validateTeslaConfig(cfg), []);
+  assert.equal(alertSubscriptionFor(BASE), "telemetry/+/alerts/+/current");
+  const a = new TeslaAdapter(cfg);
+  const b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") });
+  const p = await publisher(br.url());
+  try {
+    await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"));
+    const alert = { Name: "UI_a001_Example", StartedAt: "2026-10-27T12:00:00Z", Audiences: ["Customer"] };
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/history`, JSON.stringify([alert]));
+    await p.raw(`${BASE}/${VIN}/errors/some_error`, JSON.stringify({ Name: "some_error", Body: "x" }));
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/current`, JSON.stringify(alert));
+    await until(() => m.hits.length === 1);
+    assert.match(m.hits[0].body.prompt, /ownership event for car-a .*vehicle_alert \(tier immediate, priority high\)/);
+    assert.match(m.hits[0].body.prompt, /"name":"UI_a001_Example","audiences":\["Customer"\]/);
+    // Same alert again (fleet-telemetry republishes current state): deduped. Name/topic mismatch: bad_record.
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/current`, JSON.stringify(alert));
+    await p.raw(`${BASE}/${VIN}/alerts/Other_a002/current`, JSON.stringify(alert));
+    await until(() => b.audit.lines.some((l) => l.reason === "bad_record"));
+    await sleep(100);
+    assert.equal(m.hits.length, 1);
+    // Ended: goes to the digest, not sent now.
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/current`, JSON.stringify({ ...alert, EndedAt: "2026-10-27T12:10:00Z" }));
+    await until(() => a.ownershipRuntime()!.pending()["car-a"] === 1);
+    assert.equal(m.hits.length, 1);
+  } finally {
+    await p.close();
     await b.close();
     await m.close();
     await br.down();
