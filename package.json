@@ -19,10 +19,14 @@
     "smoke": "tsx scripts/smoke-e2e.ts"
   },
   "dependencies": {
-    "discord.js": "^14.16.3"
+    "@discordjs/voice": "0.19.2",
+    "discord.js": "^14.16.3",
+    "opusscript": "0.0.8",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "@types/ws": "^8.18.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

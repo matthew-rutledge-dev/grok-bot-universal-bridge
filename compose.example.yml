@@ -1,6 +1,8 @@
 # Example only. Copy to the deployment host as compose.yml and adjust paths.
 # Runs side by side with any existing bridge on its own loopback port.
 # After editing .env: docker compose up -d --force-recreate
+# In scripts use `docker compose run -T` / `exec -T`: without -T the container reads
+# stdin and eats the rest of a piped script.
 services:
   universal-bridge:
     build: .
@@ -12,7 +14,7 @@ services:
     ports:
       - "127.0.0.1:18090:18090"        # loopback only; the tunnel routes /discord/*, /grokbuild/* here
     volumes:
-      - ./config:/app/config:ro        # bridge.json + adapter configs (host-only)
+      - ./config.host:/app/config:ro   # host-only bridge.json + adapter configs, kept out of the repo's config/ (examples)
       - ./registry.json:/run/bridge/registry.json:ro
       - bridge-data:/app/data          # hold file, request records, audit.jsonl
 volumes:

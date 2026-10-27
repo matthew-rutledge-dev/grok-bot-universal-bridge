@@ -39,7 +39,12 @@ export function formatPrompt(a: PromptArgs): string {
   if (a.guildId) trailer.push(`g=${a.guildId}`);
   if (a.alias) trailer.push(`map=${enc(a.alias)}`);
   for (const r of a.attachments ?? []) trailer.push(`a=${r.url.replace(/\s/g, "%20")}`);
-  return `${where} from ${who}: ${escapeTrailerMark(a.text)}\n${trailer.join(" ")}`;
+  // Same header as the existing bridge: "(N attachment[s])", and no ": text" when the message is attachment-only.
+  const n = a.attachments?.length ?? 0;
+  const att = n > 0 ? ` (${n} attachment${n === 1 ? "" : "s"})` : "";
+  const header = `${where} from ${who}${att}:`;
+  const body = a.text ? `${header} ${escapeTrailerMark(a.text)}` : header;
+  return `${body}\n${trailer.join(" ")}`;
 }
 
 /** Split text into Discord-sized chunks (2000 chars), preferring line breaks. */

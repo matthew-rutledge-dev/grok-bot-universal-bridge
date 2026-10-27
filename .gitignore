@@ -12,3 +12,4 @@ config/*.yml
 !config/*.example.json
 registry.json
 secrets/
+config.host/
