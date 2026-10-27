@@ -5,6 +5,8 @@ import type { AddressInfo } from "node:net";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Aedes } from "aedes";
 import { connect, type MqttClient } from "mqtt";
 import {
@@ -15,6 +17,7 @@ import {
   subscriptionFor,
   TeslaAdapter,
   validateTeslaConfig,
+  VIN_DENY_AUDIT_MAX,
   type TeslaConfig,
 } from "./index.js";
 import { mockRoutine, startBridge } from "../../test/helpers.js";
@@ -32,7 +35,7 @@ async function until(cond: () => boolean, ms = 5000) {
 }
 
 /** In-process MQTT broker (aedes, pure JS) on 127.0.0.1. restart() reuses the same port. */
-async function broker(opts: { auth?: { user: string; pass: string } } = {}) {
+async function broker(opts: { auth?: { user: string; pass: string }; refuseSubscribe?: () => boolean } = {}) {
   let aedes: Aedes;
   let server: Server;
   const sockets = new Set<Socket>();
@@ -47,6 +50,11 @@ async function broker(opts: { auth?: { user: string; pass: string } } = {}) {
         const err = Object.assign(new Error("bad"), { returnCode: 5 });
         done(err as never, false);
       };
+    }
+    if (opts.refuseSubscribe) {
+      const refuse = opts.refuseSubscribe;
+      // null subscription = negated: SUBACK return code 0x80 (128).
+      aedes.authorizeSubscribe = (_c, sub, done) => (refuse() ? done(null, null as never) : done(null, sub));
     }
     server = createServer((s) => {
       sockets.add(s);
@@ -131,6 +139,15 @@ test("mqtt: broker URL rules (literal = loopback/LAN, no credentials; refs ok)",
     assert.equal(isLanHost(h), true, h);
   }
   for (const h of [ip(8, 8, 8, 8), "broker.example.com", ip(172, 32, 0, 1), ip(192, 0, 2, 1), "[2001:db8::1]"]) assert.equal(isLanHost(h), false, h);
+  // Integer / hex hosts and IPv4 shorthand resolve to addresses the name rules can't see: refused.
+  const asInt = (...o: number[]) => String(o.reduce((n, x) => n * 256 + x, 0));
+  const asHex = (...o: number[]) => `0x${o.map((x) => x.toString(16).padStart(2, "0")).join("")}`;
+  for (const h of [asInt(8, 8, 8, 8), asInt(127, 0, 0, 1), asHex(8, 8, 8, 8), asHex(127, 0, 0, 1), "0X7F000001", "127.1", "10.1", "10.0.1", "0177.0.0.1", "0x7f.0.0.1", "127.0.0.0x1", "0", "0x"]) {
+    assert.equal(isLanHost(h), false, h);
+    assert.match(brokerUrlProblem(`mqtt://${h}:1883`, true) ?? "", /loopback or LAN/, h);
+  }
+  // Names that merely contain digits are still names.
+  for (const h of ["mqtt1", "broker-01", "nas2.lan"]) assert.equal(isLanHost(h), true, h);
   assert.equal(brokerUrlProblem("mqtt://127.0.0.1:1883", true), undefined);
   assert.match(brokerUrlProblem("mqtt://broker.example.com:1883", true)!, /loopback or LAN/);
   assert.match(brokerUrlProblem("mqtt://u:p@127.0.0.1:1883", true)!, /credentials/);
@@ -318,4 +335,103 @@ test("mqtt: username/password refs are re-read; bad credentials audited (no secr
   const a3 = new TeslaAdapter(mqttCfg("mqtt://127.0.0.1:1", { username_ref: "env:U", password_ref: "env:P" }));
   a3.init(ctx);
   await assert.rejects(a3.start(), /username_ref is set but does not resolve/);
+});
+
+test("mqtt: a refused subscribe drops the connection and the backoff reconnects and subscribes", async () => {
+  let refusals = 2;
+  const br = await broker({ refuseSubscribe: () => refusals-- > 0 });
+  const m = await mockRoutine({ key: "routine-key" });
+  const a = new TeslaAdapter(mqttCfg(br.url()));
+  const b = await startBridge({ routineUrl: m.url, adapters: [a] });
+  try {
+    (globalThis as any).__dbg = () => JSON.stringify(b.audit.lines.map((l) => l.reason));
+    await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"), 10000);
+    const reasons = b.audit.lines.map((l) => l.reason);
+    assert.equal(reasons.filter((r) => r === "mqtt_subscribe_refused").length, 2);
+    assert.ok(reasons.filter((r) => r === "mqtt_connected").length >= 3, "reconnected after each refusal");
+    assert.ok(reasons.includes("mqtt_disconnected"), "the refused connection was closed (backoff path)");
+    const p = await publisher(br.url());
+    try {
+      await p.datum("SentryMode", "SentryModeStateArmed");
+      await sleep(100);
+      await p.datum("SentryMode", "SentryModeStateAware");
+      await until(() => m.hits.length === 1);
+    } finally {
+      await p.close();
+    }
+  } finally {
+    await b.close();
+    await m.close();
+    await br.down();
+  }
+});
+
+test("mqtt: VINs not allowlisted are dropped before parsing or batching; the audit line is rate-limited", async () => {
+  const br = await broker();
+  const m = await mockRoutine({ key: "routine-key" });
+  let clock = Date.parse("2026-01-01T00:00:00Z");
+  const a = new TeslaAdapter(mqttCfg(br.url()), { now: () => clock });
+  const b = await startBridge({ routineUrl: m.url, adapters: [a] });
+  const p = await publisher(br.url());
+  const OTHER = "5YJ000000EXAMPLE9";
+  const denies = () => b.audit.lines.filter((l) => l.reason === "vin_not_allowlisted");
+  try {
+    await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"));
+    // Garbage and oversized payloads from an unknown VIN are never parsed: no bad_record.
+    await p.raw(`${BASE}/${OTHER}/v/SentryMode`, "not json{");
+    await p.raw(`${BASE}/${OTHER}/v/SentryMode`, JSON.stringify("x".repeat(70 * 1024)));
+    for (let i = 0; i < 20; i++) await p.datum("SentryMode", i % 2 ? "SentryModeStateAware" : "SentryModeStateArmed", false, OTHER);
+    // A known VIN after them proves the stream was consumed in order.
+    await p.datum("SentryMode", "SentryModeStateArmed");
+    await sleep(100);
+    await p.datum("SentryMode", "SentryModeStateAware");
+    await until(() => m.hits.length === 1);
+    assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, 0, "unknown VIN payloads are not parsed");
+    assert.equal(denies().length, 1, "22 messages, one audit line");
+    assert.equal(denies()[0].actor, "…PLE9");
+    assert.equal(JSON.stringify(b.audit.lines).includes(OTHER), false, "masked only");
+    // Ten minutes on, the next line carries the count suppressed in between.
+    clock += 10 * 60_000;
+    await p.datum("SentryMode", "SentryModeStateArmed", false, OTHER);
+    await until(() => denies().length === 2);
+    assert.equal(denies()[1].count, 21);
+    assert.equal(m.hits.length, 1, "only the allowlisted VIN fired");
+  } finally {
+    await p.close();
+    await b.close();
+    await m.close();
+    await br.down();
+  }
+});
+
+test("adapter: the vin_not_allowlisted map is capped; a flood of distinct VINs can't grow it", async () => {
+  const m = await mockRoutine({ key: "routine-key" });
+  const a = new TeslaAdapter(example, { now: () => 0 });
+  const b = await startBridge({ routineUrl: m.url, adapters: [a] });
+  try {
+    const vin = (i: number) => `OTHERVIN${String(i).padStart(9, "0")}`;
+    for (let i = 0; i < VIN_DENY_AUDIT_MAX + 50; i++) await a.ingestTelemetry({ vin: vin(i), createdAt: "x", data: {} });
+    assert.equal((a as any).vinDenyAudit.size, VIN_DENY_AUDIT_MAX);
+    // The oldest were evicted, so they audit again; the newest are still suppressed.
+    const before = b.audit.lines.length;
+    await a.ingestTelemetry({ vin: vin(0), createdAt: "x", data: {} });
+    await a.ingestTelemetry({ vin: vin(VIN_DENY_AUDIT_MAX + 49), createdAt: "x", data: {} });
+    assert.equal(b.audit.lines.length - before, 1);
+  } finally {
+    await b.close();
+    await m.close();
+  }
+});
+
+test("tesla-live-check: invalid JSON config prints a fixed message, never a snippet of the file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tesla-live-"));
+  const file = join(dir, "tesla.json");
+  writeFileSync(file, `{"telemetry": {"vin_allowlist": ["${VIN}"], "x": `);
+  const script = fileURLToPath(new URL("../../scripts/tesla-live-check.mjs", import.meta.url));
+  const r = spawnSync(process.execPath, [script, "--tesla-config", file], { encoding: "utf8", env: { PATH: process.env.PATH ?? "" } });
+  assert.equal(r.status, 1);
+  const out = r.stdout + r.stderr;
+  assert.match(out, /setup: invalid JSON in config/);
+  assert.equal(out.includes(VIN), false);
+  assert.equal(out.includes("vin_allowlist"), false);
 });

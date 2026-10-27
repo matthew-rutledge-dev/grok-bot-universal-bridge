@@ -43,6 +43,11 @@ export interface MqttReceiverOptions {
   connectTimeoutMs?: number;
   keepaliveS?: number;
   now?: () => number;
+  /**
+   * VIN allowlist check, applied right after the topic is parsed: a VIN that isn't allowlisted is
+   * dropped (`vin_not_allowlisted`) before its payload is parsed or batched.
+   */
+  vinAllowed?: (vin: string) => boolean;
 }
 
 export type MqttEvent =
@@ -94,6 +99,13 @@ export function parseMqttValue(field: string, v: unknown): TelemetryValue | unde
 const PRIVATE_V4 = [/^127\./, /^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./];
 const LAN_SUFFIX = [".local", ".lan", ".home.arpa", ".internal"];
 
+/** Integer, hex, or dotted-shorthand IPv4 forms that isIP() doesn't accept as a canonical dotted quad. */
+function looksNumericV4(h: string): boolean {
+  if (/^(0x[0-9a-f]*|\d+)$/i.test(h)) return true;
+  const parts = h.split(".");
+  return parts.length > 1 && parts.every((x) => /^(0x[0-9a-f]*|\d+)$/i.test(x));
+}
+
 /** Literal broker hosts allowed in config: loopback, RFC 1918 / link-local, ULA, or a LAN-only name. */
 export function isLanHost(host: string): boolean {
   const h = host.replace(/^\[|\]$/g, "").toLowerCase();
@@ -101,6 +113,10 @@ export function isLanHost(host: string): boolean {
   const fam = isIP(h);
   if (fam === 4) return PRIVATE_V4.some((r) => r.test(h));
   if (fam === 6) return h === "::1" || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe[89ab][0-9a-f]:/.test(h);
+  // Numeric hosts that aren't a plain dotted quad are refused: integer / hex forms (2130706433,
+  // 0x7f000001) and IPv4 shorthand (127.1, 10.0.1, octal 0177.0.0.1, hex 0x7f.0.0.1) resolve to an
+  // address the name rules below can't see, so they could point a "LAN" literal anywhere.
+  if (looksNumericV4(h)) return false;
   // Single-label names (a compose service such as "mosquitto") and LAN-only suffixes.
   if (/^[a-z0-9-]+$/.test(h)) return true;
   return LAN_SUFFIX.some((s) => h.endsWith(s));
@@ -175,6 +191,9 @@ export class MqttTelemetryReceiver implements TelemetryReceiver {
       c.subscribe(subscriptionFor(this.o.topicBase), { qos: this.o.qos }, (err, granted) => {
         if (err || !granted?.length || (granted[0].qos as number) === 128) {
           this.event({ outcome: "error", reason: "subscribe_refused" });
+          // Connected but subscribed to nothing would be silent forever: drop the connection and
+          // let the close handler's backoff reconnect and subscribe again.
+          if (!this.stopped && this.client === c) c.end(true);
           return;
         }
         this.event({ outcome: "ok", reason: "subscribed" });
@@ -235,6 +254,11 @@ export class MqttTelemetryReceiver implements TelemetryReceiver {
     const t = parseMqttTopic(this.o.topicBase, topic);
     if (!t) {
       this.sink?.drop("bad_record");
+      return;
+    }
+    // Allowlist first: an unknown VIN is never parsed or batched.
+    if (this.o.vinAllowed && !this.o.vinAllowed(t.vin)) {
+      this.sink?.drop("vin_not_allowlisted", t.vin);
       return;
     }
     if (payload.length > MAX_MQTT_PAYLOAD) {

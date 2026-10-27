@@ -583,3 +583,23 @@ test("energy state persists (mode 600, atomic): a restart during an outage doesn
     await r.close();
   }
 });
+
+test("energy polling on: one startup warning that the exported token carries every plugin scope", async () => {
+  const warns: string[] = [];
+  const a = new TeslaAdapter(
+    { ...example, energy_poll: { ...example.energy_poll!, enabled: true, api_base: API, token_ref: "env:TESLA_TOKEN" } },
+    { fetchImpl: fakeApi(() => live({})).f, pollOnStart: false },
+  );
+  a.init({ log: { info() {}, warn: (s: string) => warns.push(s), error() {} }, audit() {}, submit: async () => ({ accepted: false, reason: "no_route" }), secret: () => "access-value-1" } as never);
+  await a.start();
+  await a.stop();
+  assert.equal(warns.length, 1);
+  assert.match(warns[0], /every scope/);
+  assert.equal(warns[0].includes("access-value-1"), false, "the token itself is never logged");
+  const quiet: string[] = [];
+  const b = new TeslaAdapter({ ...example, energy_poll: { ...example.energy_poll!, enabled: false } });
+  b.init({ log: { info() {}, warn: (s: string) => quiet.push(s), error() {} }, audit() {}, submit: async () => ({ accepted: false, reason: "no_route" }), secret: () => undefined } as never);
+  await b.start();
+  await b.stop();
+  assert.equal(quiet.length, 0, "no warning when energy polling is off");
+});

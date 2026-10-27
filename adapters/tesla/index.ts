@@ -261,6 +261,10 @@ export class Debouncer {
   }
 }
 
+/** vin_not_allowlisted audit: once per VIN per 10 min, at most this many VINs remembered. */
+export const VIN_DENY_AUDIT_MS = 10 * 60_000;
+export const VIN_DENY_AUDIT_MAX = 256;
+
 /** Persisted energy state older than this is ignored at start (the outage it describes is history). */
 export const ENERGY_STATE_MAX_AGE_MS = 24 * 3600 * 1000;
 
@@ -304,6 +308,8 @@ export class TeslaAdapter implements SourceAdapter {
   private readonly now: () => number;
   private energyFile = "";
   private readonly energySavedAt = new Map<string, number>();
+  /** Last vin_not_allowlisted audit line per VIN, and lines suppressed since (bounded). */
+  private readonly vinDenyAudit = new Map<string, { at: number; suppressed: number }>();
 
   constructor(
     private readonly cfg: TeslaConfig,
@@ -354,6 +360,11 @@ export class TeslaAdapter implements SourceAdapter {
     }
     const e = this.cfg.energy_poll;
     if (e?.enabled) {
+      // Accepted residual, stated once at start: the plugin exports one access token for all of its
+      // scopes, so the file this adapter reads can do more than energy_device_data.
+      this.ctx.log.warn(
+        "[tesla] energy polling on: the exported access token carries every scope the Tesla plugin was granted, not only energy_device_data; keep token_ref host-only (mode 600)",
+      );
       this.loadEnergyState();
       this.energy = this.deps.energy ?? new FleetEnergyClient({ apiBase: e.api_base!, getToken: () => this.token(), fetchImpl: this.deps.fetchImpl });
       const every = Math.max(60, e.interval_s ?? 300) * 1000;
@@ -394,6 +405,7 @@ export class TeslaAdapter implements SourceAdapter {
       reconnectMinMs: m.reconnect_min_ms,
       reconnectMaxMs: m.reconnect_max_ms,
       now: this.deps.now,
+      vinAllowed: (vin) => this.vinAllowed(vin),
     });
   }
 
@@ -435,13 +447,32 @@ export class TeslaAdapter implements SourceAdapter {
   }
 
   private dropped(reason: DropReason, vin?: string, count?: number): void {
+    if (reason === "vin_not_allowlisted" && vin) return this.vinDenied(vin);
     this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin, ...(count !== undefined ? { count } : {}) });
+  }
+
+  /**
+   * vin_not_allowlisted is audited at most once per VIN per VIN_DENY_AUDIT_MS; the next line carries
+   * the count suppressed in between. The map is capped (oldest entry evicted) so a flood of
+   * distinct VINs can't grow it.
+   */
+  private vinDenied(vin: string): void {
+    const now = this.now();
+    const seen = this.vinDenyAudit.get(vin);
+    if (seen && now - seen.at < VIN_DENY_AUDIT_MS) {
+      seen.suppressed++;
+      return;
+    }
+    this.vinDenyAudit.delete(vin);
+    while (this.vinDenyAudit.size >= VIN_DENY_AUDIT_MAX) this.vinDenyAudit.delete(this.vinDenyAudit.keys().next().value!);
+    this.vinDenyAudit.set(vin, { at: now, suppressed: 0 });
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: vin, ...(seen?.suppressed ? { count: seen.suppressed } : {}) });
   }
 
   /** Feed one decoded telemetry record (called by the receiver). Returns triggers submitted. */
   async ingestTelemetry(r: TelemetryRecord): Promise<TeslaTrigger[]> {
     if (!this.vinAllowed(r.vin)) {
-      this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: r.vin });
+      this.vinDenied(r.vin);
       return [];
     }
     if (r.baseline) {

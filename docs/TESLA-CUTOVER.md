@@ -27,12 +27,14 @@ Ground rules:
   topic read telemetry/+/v/+
   ```
 
+- [ ] Message size limit: `message_size_limit 65536` in `mosquitto.conf`. The bridge drops payloads over 64 KB, but only after its MQTT client has buffered the whole packet, so the broker should refuse them first.
 - [ ] Anonymous access off. Passwords live in host-only files (mode 600).
 - [ ] Optional TLS (`mqtts://`): give the bridge the broker CA through `telemetry.mqtt.ca_file` (`file:` ref).
 
 ## 2. fleet-telemetry container
 
 - [ ] Image `tesla/fleet-telemetry:<tag>` (pin a tag) with the server config from [`adapters/tesla/README.md` → MQTT](../adapters/tesla/README.md#mqtt): `records: { "V": ["mqtt"] }`, `transmit_decoded_records: true`, `mqtt.broker` = `host:port` of the broker, `mqtt.topic_base` = `telemetry`, `qos: 1`, `retained: false`, and its own `client_id` (different from the bridge's).
+  - If you do turn on `retained: true`: values the broker replays after a bridge reconnect only fill in fields the bridge hasn't seen yet. For fields it has, the replay is ignored, so a change that happened while the bridge was disconnected fires late, on the next live message for that field (the car's next change or resend), not at reconnect.
 - [ ] The server cert and key are mounted read-only, and the public port is forwarded to it.
 - [ ] Started, and its log shows the MQTT connect health check passing (it fails to start if the broker is unreachable).
 
@@ -69,7 +71,8 @@ Ground rules:
   ```
 
   Expect `connected`, `subscribed`, and field counts for your masked VIN (wake the car with the app first, or wait for a resend). Add `--energy` once energy polling is on, for one read-only `live_status` per site.
-- [ ] Audit (`data/audit.jsonl`): `connection` lines `mqtt_connected` and `mqtt_subscribed`, no `bad_record`, no `vin_not_allowlisted` for your car.
+- [ ] Audit (`data/audit.jsonl`): `connection` lines `mqtt_connected` and `mqtt_subscribed`, no `bad_record`, no `vin_not_allowlisted` for your car (that line is rate-limited to once per VIN per 10 min, so one line can stand for many messages; see its `count`). Repeated `mqtt_subscribe_refused` means the broker ACL doesn't let the `bridge` user read `telemetry/+/v/+`; the bridge keeps retrying with backoff.
+- [ ] With energy polling on, the bridge log shows one `[tesla] energy polling on: the exported access token carries every scope…` warning at start. That's expected (see the token security note in the adapter README).
 - [ ] End to end: with the car parked, open a door → one `door_open_parked` wake for the routed agent within seconds. Plug in and charge → `plugged_in`; let it finish → `charge_complete` (if those rules wake).
 - [ ] Then turn on `energy_poll.enabled`, recreate, and check the audit for `observe` lines without errors. `data/tesla-energy-state.json` appears (mode 600).
 - [ ] Restart the bridge once. No duplicate vehicle wakes (the first value after a restart is a baseline) and no repeated energy alert (saved state).

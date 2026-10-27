@@ -51,17 +51,26 @@ function resolveRef(ref) {
   return undefined;
 }
 
+/** JSON.parse whose error never echoes the input (Node 20+ messages quote a snippet of the file). */
+function parseConfig(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("invalid JSON in config");
+  }
+}
+
 function loadTeslaConfig() {
   const direct = arg("--tesla-config");
-  if (direct) return { file: resolve(direct), cfg: JSON.parse(readFileSync(direct, "utf8")) };
+  if (direct) return { file: resolve(direct), cfg: parseConfig(readFileSync(direct, "utf8")) };
   const bridgeFile = process.env.BRIDGE_CONFIG;
   if (!bridgeFile) throw new Error("set BRIDGE_CONFIG or pass --tesla-config");
-  const bridge = JSON.parse(readFileSync(bridgeFile, "utf8"));
+  const bridge = parseConfig(readFileSync(bridgeFile, "utf8"));
   const p = bridge?.adapters?.tesla?.configPath;
   if (!p) throw new Error("bridge config has no adapters.tesla.configPath");
   const file = isAbsolute(p) ? p : resolve(process.cwd(), p);
   if (!bridge.adapters.tesla.enabled) info("note: adapters.tesla.enabled is false in the bridge config");
-  return { file, cfg: JSON.parse(readFileSync(file, "utf8")) };
+  return { file, cfg: parseConfig(readFileSync(file, "utf8")) };
 }
 
 async function checkMqtt(t) {
@@ -193,7 +202,9 @@ try {
     else if (token) info("energy API not called (add --energy for one read-only live_status per site)");
   } else info("energy polling disabled");
 } catch (err) {
-  bad(`setup: ${err?.message ?? err}`);
+  // Never a parser's text (it can quote the config); config parse errors are already the fixed
+  // "invalid JSON in config" from parseConfig().
+  bad(`setup: ${err instanceof SyntaxError ? "invalid JSON in config" : (err?.message ?? err)}`);
 }
 console.log(failed ? `\n${failed} check(s) failed` : "\nall checks passed");
 process.exit(failed ? 1 : 0);

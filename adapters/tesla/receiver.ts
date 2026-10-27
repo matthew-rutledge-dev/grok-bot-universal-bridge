@@ -23,7 +23,7 @@ import { parsePayload, type TelemetryRecord } from "./fields.js";
  *    "decoded" mode for real cars.
  */
 
-export type DropReason = "vin_cert_mismatch" | "no_client_cert" | "undecodable_frame" | "bad_record" | "tls_handshake_failed";
+export type DropReason = "vin_cert_mismatch" | "no_client_cert" | "undecodable_frame" | "bad_record" | "tls_handshake_failed" | "vin_not_allowlisted";
 
 export interface ReceiverSink {
   record(r: TelemetryRecord): void;
