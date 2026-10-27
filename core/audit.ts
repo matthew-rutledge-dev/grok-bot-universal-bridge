@@ -22,7 +22,9 @@ export type AuditAction =
   | "observe"
   | "attachment"
   | "planner"
-  | "voice";
+  | "voice"
+  /** A source's upstream connection (e.g. the Tesla MQTT broker): connected / disconnected / connect_failed. */
+  | "connection";
 
 export interface AuditEntry {
   adapter: string;

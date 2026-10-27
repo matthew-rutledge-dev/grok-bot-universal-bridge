@@ -1,7 +1,16 @@
 {
   "telemetry": {
     "enabled": false,
-    "mode": "decoded",
+    "mode": "mqtt",
+    "mqtt": {
+      "broker": "mqtt://127.0.0.1:1883",
+      "client_id": "bridge-tesla",
+      "topic_base": "telemetry",
+      "qos": 1,
+      "username_ref": "env:TESLA_MQTT_USERNAME",
+      "password_ref": "file:/run/secrets/tesla-mqtt-password",
+      "batch_ms": 250
+    },
     "decoded_listen": "127.0.0.1:18091",
     "listen": "0.0.0.0:4443",
     "public_hostname": "telemetry.example.com",
@@ -10,7 +19,8 @@
     "client_ca": "file:/run/secrets/tesla-vehicle-ca.pem",
     "vin_allowlist": ["5YJ0000000EXAMPLE"],
     "prefer_typed": true,
-    "fields": { "DetailedChargeState": 60, "ChargingCableType": 60, "DoorState": 10, "SentryMode": 1, "BatteryLevel": 300, "Gear": 10, "SoftwareUpdateVersion": 3600 },
+    "fields": { "DetailedChargeState": 60, "ChargingCableType": 60, "DoorState": 10, "SentryMode": 10, "Gear": 10, "Soc": 300, "BatteryLevel": 300, "SoftwareUpdateVersion": 3600 },
+    "resend_interval_s": 21600,
     "low_battery_percent": 20
   },
   "energy_poll": {
@@ -18,7 +28,7 @@
     "interval_s": 300,
     "site_allowlist": ["1111111111111111"],
     "api_base": "https://fleet-api.example.com",
-    "token_ref": "file:/run/secrets/tesla-energy-access-token",
+    "token_ref": "file:/run/secrets/tesla-fleet/access-token",
     "reserve_margin_percent": 5,
     "site_info_ttl_s": 600
   },

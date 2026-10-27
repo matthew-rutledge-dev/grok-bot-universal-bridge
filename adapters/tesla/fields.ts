@@ -21,9 +21,8 @@ export type KnownField = (typeof KNOWN_FIELDS)[number];
 
 /**
  * Names from older drafts that must not be used, with the replacement. ChargeCableConnected,
- * TrunkOpen and SentryAlert do not exist in the proto. ChargeState exists but is deprecated,
- * SoftwareUpdateAvailable exists but is undocumented, and Soc exists but means usable charge,
- * not the app's battery %.
+ * TrunkOpen and SentryAlert do not exist in the proto. ChargeState exists but is deprecated
+ * and SoftwareUpdateAvailable exists but is undocumented. (Soc is allowed as stream-only below.)
  */
 export const REPLACED_FIELDS: Record<string, string> = {
   ChargeState: "DetailedChargeState (ChargeState is deprecated)",
@@ -31,8 +30,14 @@ export const REPLACED_FIELDS: Record<string, string> = {
   TrunkOpen: "DoorState.TrunkFront / DoorState.TrunkRear",
   SentryAlert: "SentryMode (Aware, Panic)",
   SoftwareUpdateAvailable: "SoftwareUpdateVersion (empty -> a version)",
-  Soc: "BatteryLevel (Soc is usable charge, not the app %)",
 };
+
+/**
+ * Fields accepted in telemetry.fields although no trigger reads them (streamed for context,
+ * e.g. by the plugin's tools). Soc is usable charge, not the app's battery %: low_battery
+ * reads BatteryLevel only.
+ */
+export const STREAM_ONLY_FIELDS: readonly string[] = ["Soc"];
 
 /** Doors struct (proto message Doors). */
 export const DOOR_KEYS = ["DriverFront", "DriverRear", "PassengerFront", "PassengerRear"] as const;
@@ -104,6 +109,8 @@ export interface TelemetryRecord {
   vin: string;
   createdAt: string;
   isResend?: boolean;
+  /** A replayed value (e.g. an MQTT retained message): folded into state as a baseline, never fires. */
+  baseline?: boolean;
   data: Record<string, TelemetryValue>;
 }
 
@@ -203,7 +210,8 @@ export function deriveVehicleTriggers(
     const was = enumName("DetailedChargeState", p.DetailedChargeState);
     const now = enumName("DetailedChargeState", delta.DetailedChargeState);
     if (now === "Complete") out.push({ on: "charge_complete" });
-    if (now === "Stopped") out.push({ on: "charge_stopped" });
+    // Only a session that was actually charging can stop (Disconnected -> Stopped is a plug-in).
+    if (now === "Stopped" && (was === "Charging" || was === "Starting")) out.push({ on: "charge_stopped" });
     if (was === "Disconnected" && now !== "Disconnected" && now !== "Unknown") out.push({ on: "plugged_in" });
     if (was !== "Disconnected" && was !== "Unknown" && now === "Disconnected") out.push({ on: "unplugged" });
   } else if (!("DetailedChargeState" in p) && !("DetailedChargeState" in delta) && changed("ChargingCableType")) {
@@ -224,8 +232,10 @@ export function deriveVehicleTriggers(
   }
 
   if (changed("SentryMode")) {
+    const was = enumName("SentryMode", p.SentryMode);
     const now = enumName("SentryMode", delta.SentryMode);
-    if (now === "Aware") out.push({ on: "sentry_alert" });
+    // Panic -> Aware is the same incident winding down: no second (normal) alert.
+    if (now === "Aware" && was !== "Panic") out.push({ on: "sentry_alert" });
     if (now === "Panic") out.push({ on: "sentry_alert", priority: "high" });
   }
 

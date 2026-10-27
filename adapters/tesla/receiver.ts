@@ -23,12 +23,14 @@ import { parsePayload, type TelemetryRecord } from "./fields.js";
  *    "decoded" mode for real cars.
  */
 
-export type DropReason = "vin_cert_mismatch" | "no_client_cert" | "undecodable_frame" | "bad_record" | "tls_handshake_failed";
+export type DropReason = "vin_cert_mismatch" | "no_client_cert" | "undecodable_frame" | "bad_record" | "tls_handshake_failed" | "vin_not_allowlisted";
 
 export interface ReceiverSink {
   record(r: TelemetryRecord): void;
   /** count: how many events this line stands for (rate-limited handshake failures). */
   drop(reason: DropReason, vin?: string, count?: number): void;
+  /** Upstream connection events (mqtt mode). Reason codes only. */
+  event?(e: { outcome: "ok" | "error"; reason: string; ms?: number }): void;
 }
 
 export interface TelemetryReceiver {

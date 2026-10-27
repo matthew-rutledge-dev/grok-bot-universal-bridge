@@ -56,11 +56,13 @@ test("telemetry config: prefer_typed, replaced field names, VIN shape, receiver 
     ["TrunkOpen", /TrunkFront/],
     ["SentryAlert", /SentryMode/],
     ["SoftwareUpdateAvailable", /SoftwareUpdateVersion/],
-    ["Soc", /BatteryLevel/],
   ] as const) {
     assert.match(v({ fields: { [f]: 10 } }), hint, f);
   }
   assert.match(v({ fields: { Odometer: 10 } }), /not read by the trigger logic/);
+  assert.equal(v({ fields: { ...t.fields!, Soc: 300 } }), "", "Soc is accepted as stream-only (low_battery still reads BatteryLevel)");
+  assert.match(v({ fields: { ...t.fields!, Gear: 0 } }), /whole seconds >= 1/);
+  assert.match(v({ resend_interval_s: 5 }), /resend_interval_s must be an integer >= 60/);
   const noGear = { ...t.fields! };
   delete noGear.Gear;
   assert.match(v({ fields: noGear }), /must include Gear when door_open_parked\/trunk_open_parked wakes/);
@@ -68,7 +70,7 @@ test("telemetry config: prefer_typed, replaced field names, VIN shape, receiver 
   assert.match(v({ vin_allowlist: ["5YJ0000000EXAMPLE1"] }), /17-character/);
   assert.match(v({ enabled: true, mode: "mtls", client_ca: undefined }), /client_ca is required in mtls mode/);
   assert.match(v({ decoded_listen: "0.0.0.0:18091" }), /loopback/);
-  assert.match(v({ enabled: true, decoded_listen: undefined }), /decoded_listen is required/);
+  assert.match(v({ enabled: true, mode: "decoded", decoded_listen: undefined }), /decoded_listen is required/);
   assert.match(v({ mode: "raw" }), /mode must be/);
 });
 
@@ -209,6 +211,42 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
     assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…0009"));
     const cb = await b.call("POST", "/tesla/callback", {});
     assert.equal(cb.status, 404, "no tesla callback route: replies use the origin channel");
+  } finally {
+    await b.close();
+    await m.close();
+  }
+});
+
+test("charge_stopped only after Charging/Starting; Disconnected -> Stopped is just plugged_in", () => {
+  assert.deepEqual(step({ DetailedChargeState: "Disconnected" }, { DetailedChargeState: "Stopped" }), ["plugged_in"]);
+  assert.deepEqual(step({ DetailedChargeState: "DetailedChargeStateCharging" }, { DetailedChargeState: "DetailedChargeStateStopped" }), ["charge_stopped"]);
+  assert.deepEqual(step({ DetailedChargeState: "Starting" }, { DetailedChargeState: "Stopped" }), ["charge_stopped"]);
+  assert.deepEqual(step({ DetailedChargeState: "NoPower" }, { DetailedChargeState: "Stopped" }), []);
+  assert.deepEqual(step({ DetailedChargeState: "Complete" }, { DetailedChargeState: "Stopped" }), []);
+});
+
+test("SentryMode Panic -> Aware does not fire a second, normal alert", () => {
+  assert.deepEqual(step({ SentryMode: "SentryModeStatePanic" }, { SentryMode: "SentryModeStateAware" }), []);
+  assert.deepEqual(step({ SentryMode: "Panic" }, { SentryMode: "Armed" }), []);
+  assert.deepEqual(step({ SentryMode: "Armed" }, { SentryMode: "Aware" }), ["sentry_alert"], "a fresh Aware still fires");
+});
+
+test("resend records update the stored state without firing", async () => {
+  const m = await mockRoutine({ key: "routine-key" });
+  const a = new TeslaAdapter(example);
+  const b = await startBridge({ routineUrl: m.url, adapters: [a] });
+  try {
+    const rec = (createdAt: string, data: Record<string, TelemetryValue>, extra: object = {}) => a.ingestTelemetry({ vin: VIN, createdAt, data, ...extra });
+    assert.deepEqual(await rec("2026-01-01T00:00:00Z", { DetailedChargeState: "Charging" }), [], "baseline");
+    assert.deepEqual(await rec("2026-01-01T00:10:00Z", { DetailedChargeState: "Complete" }, { isResend: true }), [], "resend never fires");
+    assert.ok(b.audit.lines.some((l) => l.reason === "resend"));
+    // State moved to Complete: the live Complete is no change, so it doesn't fire either.
+    assert.deepEqual(await rec("2026-01-01T00:11:00Z", { DetailedChargeState: "Complete" }), []);
+    assert.deepEqual(await rec("2026-01-01T00:20:00Z", { DetailedChargeState: "Charging" }), []);
+    assert.deepEqual(await rec("2026-01-01T00:30:00Z", { DetailedChargeState: "Complete" }), ["charge_complete"]);
+    assert.deepEqual(await rec("2026-01-01T00:05:00Z", { DetailedChargeState: "Stopped" }, { isResend: true }), [], "an older resend");
+    assert.ok(b.audit.lines.some((l) => l.reason === "stale_record"), "older resends don't touch state");
+    assert.equal(m.hits.length, 1);
   } finally {
     await b.close();
     await m.close();

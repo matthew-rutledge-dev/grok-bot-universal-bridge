@@ -6,7 +6,7 @@ A generic, deny-by-default bridge from many sources to Grok Bots. It has one sha
 |---|---|
 | [`discord`](adapters/discord/README.md) | working |
 | [`grokbuild`](adapters/grokbuild/README.md) | working |
-| [`tesla`](adapters/tesla/README.md) | telemetry receiver (decoded JSON or mTLS) + energy polling; never sends commands, wakes or polls `vehicle_data` |
+| [`tesla`](adapters/tesla/README.md) | telemetry receiver (fleet-telemetry over MQTT, decoded JSON, or mTLS) + energy polling; never sends commands, wakes or polls `vehicle_data` |
 
 Design: [`docs/DESIGN.md`](docs/DESIGN.md).
 
