@@ -33,7 +33,7 @@ export async function createGatewayPort(): Promise<DiscordPort> {
     if (!ch || !("send" in ch) || !("messages" in ch)) throw new Error("channel is not text-capable");
     return ch as unknown as {
       send(o: Record<string, unknown>): Promise<{ id: string }>;
-      messages: { edit(id: string, o: Record<string, unknown>): Promise<unknown>; fetch(id: string): Promise<Msg> };
+      messages: { edit(id: string, o: Record<string, unknown>): Promise<unknown>; delete(id: string): Promise<unknown>; fetch(id: string): Promise<Msg> };
     };
   }
   const files = (f: OutgoingFile[] | undefined) => (f?.length ? { files: f.map((x) => new AttachmentBuilder(x.buffer, { name: x.filename })) } : {});
@@ -65,7 +65,7 @@ export async function createGatewayPort(): Promise<DiscordPort> {
     }
   }
 
-  async function openNow(channelId: string, nextFrame: () => Buffer) {
+  async function openNow(channelId: string, nextFrame: () => Buffer, onEnded?: () => void) {
     const ch = await voiceChannel(channelId);
     const v = await import("@discordjs/voice");
     const connection = v.joinVoiceChannel({ channelId: ch.id, guildId: ch.guild.id, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true });
@@ -86,18 +86,39 @@ export async function createGatewayPort(): Promise<DiscordPort> {
       if (!stream.push(nextFrame())) stream.resume();
     }, 20);
     timer.unref?.();
-    return {
-      close() {
-        clearInterval(timer);
-        stream.push(null);
+    let done = false;
+    const end = (byUs: boolean) => {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      stream.push(null);
+      try {
         connection.destroy();
-      },
+      } catch {
+        /* already destroyed */
+      }
+      if (!byUs) onEnded?.();
     };
+    // Discord dropped us: give it 5 s to reconnect on its own (standard @discordjs/voice
+    // pattern), otherwise end the stream so the busy lock is released.
+    connection.on(v.VoiceConnectionStatus.Disconnected, () => {
+      Promise.race([
+        v.entersState(connection, v.VoiceConnectionStatus.Signalling, 5_000),
+        v.entersState(connection, v.VoiceConnectionStatus.Connecting, 5_000),
+      ]).catch(() => end(false));
+    });
+    connection.on(v.VoiceConnectionStatus.Destroyed, () => end(false));
+    player.on("error", () => end(false));
+    return { close: () => end(true) };
   }
 
   return {
     voice,
-    async connect(token, onMessage) {
+    async connect(token, onMessage, onUser) {
+      client.on("interactionCreate", (i) => {
+        const member = i.member as { displayName?: string } | null;
+        onUser?.({ id: i.user.id, username: i.user.username, globalName: i.user.globalName, displayName: member?.displayName, bot: i.user.bot });
+      });
       client.on("messageCreate", (msg) => {
         const me = client.user?.id ?? null;
         const m: IncomingDiscordMessage = {
@@ -107,6 +128,9 @@ export async function createGatewayPort(): Promise<DiscordPort> {
           authorId: msg.author.id,
           authorIsBot: msg.author.bot,
           authorLabel: msg.member?.displayName ?? msg.author.globalName ?? msg.author.username,
+          authorUsername: msg.author.username,
+          authorGlobalName: msg.author.globalName,
+          authorDisplayName: msg.member?.displayName,
           roleIds: msg.member ? [...msg.member.roles.cache.keys()] : [],
           content: msg.content,
           mentionsBot: Boolean(me && msg.mentions.users.has(me)),
@@ -130,6 +154,11 @@ export async function createGatewayPort(): Promise<DiscordPort> {
       await client.destroy();
     },
     botUserId: () => client.user?.id ?? null,
+    isReady: () => client.isReady(),
+    async typing(channelId) {
+      const ch = await client.channels.fetch(channelId);
+      if (ch && "sendTyping" in ch) await (ch as { sendTyping(): Promise<unknown> }).sendTyping();
+    },
     async send(channelId, content, opts) {
       const ch = await textChannel(channelId);
       const sent = await ch.send({
@@ -139,9 +168,17 @@ export async function createGatewayPort(): Promise<DiscordPort> {
       });
       return sent.id;
     },
+    async openDm(userId) {
+      const user = await client.users.fetch(userId);
+      return (await user.createDM()).id;
+    },
     async edit(channelId, messageId, content, opts) {
       const ch = await textChannel(channelId);
       await ch.messages.edit(messageId, { content, ...files(opts?.files) });
+    },
+    async delete(channelId, messageId) {
+      const ch = await textChannel(channelId);
+      await ch.messages.delete(messageId);
     },
     async react(channelId, messageId, emoji) {
       const ch = await textChannel(channelId);

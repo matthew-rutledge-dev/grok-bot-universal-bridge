@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { MultipartBody, multipartBoundary } from "./multipart.js";
 import { consoleLogger, type Logger } from "./types.js";
 
 /** Minimal JSON HTTP router on node:http (no framework). Binds loopback by default. */
@@ -49,7 +50,7 @@ export function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(da, db);
 }
 
-function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
+function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
@@ -62,7 +63,7 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -149,7 +150,10 @@ export class HttpServer {
     try {
       if (method === "POST" || method === "PUT") {
         const raw = await readBody(req, m.def.maxBytes);
-        body = raw ? JSON.parse(raw) : {};
+        const boundary = multipartBoundary(req.headers["content-type"]);
+        // multipart/form-data stays raw until the handler parses it (after auth).
+        if (boundary) body = new MultipartBody(raw, boundary);
+        else body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
       }
     } catch (err) {
       const status = (err as { status?: number }).status ?? 400;

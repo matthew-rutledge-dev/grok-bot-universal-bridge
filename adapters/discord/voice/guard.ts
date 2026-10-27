@@ -22,12 +22,18 @@ export function guardVoice(raw: VoicePort): VoicePort {
         busy = false;
       }
     },
-    async openStream(channelId, nextFrame): Promise<VoiceStreamHandle> {
+    async openStream(channelId, nextFrame, onEnded): Promise<VoiceStreamHandle> {
       claim();
+      let closed = false;
       try {
-        const h = await raw.openStream(channelId, nextFrame);
-        streamOpen = true;
-        let closed = false;
+        const h = await raw.openStream(channelId, nextFrame, () => {
+          // Discord dropped the stream: release the lock so play doesn't stay 409.
+          if (closed) return;
+          closed = true;
+          streamOpen = false;
+          onEnded?.();
+        });
+        if (!closed) streamOpen = true;
         return {
           close() {
             if (closed) return;

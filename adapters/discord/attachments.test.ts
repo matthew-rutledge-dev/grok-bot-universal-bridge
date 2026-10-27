@@ -245,12 +245,12 @@ test("nit 1: redirects are followed manually (max 3), every hop re-checked; priv
   for (const ip of [v4(10, 0, 0, 1), v4(172, 16, 0, 1), v4(192, 168, 1, 1), "127.0.0.1", META, v4(100, 64, 0, 1), v4(0, 0, 0, 0), "::1", "fd00::1", LL6, `::ffff:${v4(10, 0, 0, 1)}`]) {
     assert.equal(isPrivateAddress(ip), true, ip);
   }
-  assert.equal(isPrivateAddress("203.0.113.10"), false);
+  assert.equal(isPrivateAddress(v4(8, 8, 8, 8)), false);
   assert.equal(await code(fetchUrlAttachment({ url: `https://${META}/latest` })), "invalid_attachment_url");
-  const rebind = { lookup: async () => [{ address: "203.0.113.10" }, { address: v4(10, 0, 0, 7) }] };
+  const rebind = { lookup: async () => [{ address: v4(8, 8, 8, 8) }, { address: v4(10, 0, 0, 7) }] };
   assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a.png" }, rebind)), "invalid_attachment_url", "any private answer refuses");
   let fetched = 0;
-  const pub = { lookup: async () => [{ address: "203.0.113.10" }], fetchImpl: (async () => (fetched++, new Response(PNG_1X1, { headers: { "content-type": "image/png" } }))) as typeof fetch };
+  const pub = { lookup: async () => [{ address: v4(8, 8, 8, 8) }], fetchImpl: (async () => (fetched++, new Response(PNG_1X1, { headers: { "content-type": "image/png" } }))) as typeof fetch };
   assert.equal((await fetchUrlAttachment({ url: "https://cdn.example.com/a.png" }, pub)).contentType, "image/png");
   assert.equal(fetched, 1);
 });
@@ -264,8 +264,8 @@ test("nit 2: exe/msi/dmg/iso/appimage/bat/cmd/scr/com refused by extension whate
   assert.equal(await code(Promise.resolve().then(() => decodeBase64Attachment({ filename: "run.bat. ", contentType: "text/plain", data: "aGk=" }))), "unsupported_media_type", "trailing dot/space");
   let fetched = 0;
   const f = (async () => (fetched++, new Response("x", { headers: { "content-type": "text/plain" } }))) as typeof fetch;
-  assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a/tool.scr", contentType: "text/plain" }, { fetchImpl: f, lookup: async () => [{ address: "203.0.113.10" }] })), "unsupported_media_type");
-  assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a/notes.txt", filename: "notes.cmd" }, { fetchImpl: f, lookup: async () => [{ address: "203.0.113.10" }] })), "unsupported_media_type");
+  assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a/tool.scr", contentType: "text/plain" }, { fetchImpl: f, lookup: async () => [{ address: v4(8, 8, 8, 8) }] })), "unsupported_media_type");
+  assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a/notes.txt", filename: "notes.cmd" }, { fetchImpl: f, lookup: async () => [{ address: v4(8, 8, 8, 8) }] })), "unsupported_media_type");
   assert.equal(fetched, 0, "refused before fetching");
 });
 

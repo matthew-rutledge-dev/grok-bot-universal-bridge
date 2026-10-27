@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import { connect as netConnect } from "node:net";
-import forge from "node-forge";
+import { issue, makeCa } from "../../test/certs.js";
 import WebSocket from "ws";
 import {
+  MtlsTelemetryReceiver,
   deriveEnergyTriggers,
   EnergyApiError,
   FleetEnergyClient,
@@ -386,36 +387,6 @@ test("decoded receiver: optional bearer token; a failing submit is audited, not 
 
 // ---------- mTLS receiver ----------
 
-function makeCa(cn: string) {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  cert.serialNumber = "01";
-  cert.validity.notBefore = new Date(Date.now() - 60_000);
-  cert.validity.notAfter = new Date(Date.now() + 86_400_000);
-  const attrs = [{ name: "commonName", value: cn }];
-  cert.setSubject(attrs);
-  cert.setIssuer(attrs);
-  cert.setExtensions([{ name: "basicConstraints", cA: true }, { name: "keyUsage", keyCertSign: true, cRLSign: true, digitalSignature: true }]);
-  cert.sign(keys.privateKey, forge.md.sha256.create());
-  return { keys, cert, pem: forge.pki.certificateToPem(cert) };
-}
-function issue(ca: ReturnType<typeof makeCa>, cn: string, server: boolean) {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  cert.serialNumber = String(Math.floor(Math.random() * 1e6) + 2);
-  cert.validity.notBefore = new Date(Date.now() - 60_000);
-  cert.validity.notAfter = new Date(Date.now() + 86_400_000);
-  cert.setSubject([{ name: "commonName", value: cn }]);
-  cert.setIssuer(ca.cert.subject.attributes);
-  const ext: object[] = [{ name: "basicConstraints", cA: false }, { name: "extKeyUsage", serverAuth: server, clientAuth: !server }];
-  if (server) ext.push({ name: "subjectAltName", altNames: [{ type: 7, ip: "127.0.0.1" }, { type: 2, value: "localhost" }] });
-  cert.setExtensions(ext);
-  cert.sign(ca.keys.privateKey, forge.md.sha256.create());
-  return { cert: forge.pki.certificateToPem(cert), key: forge.pki.privateKeyToPem(keys.privateKey) };
-}
-
 test("mtls receiver: client cert required and verified; VIN from cert CN; payload VIN mismatch dropped; binary frames dropped", async () => {
   const serverCa = makeCa("example server ca");
   const vehicleCa = makeCa("example vehicle ca");
@@ -493,6 +464,7 @@ test("mtls receiver: client cert required and verified; VIN from cert CN; payloa
       }
       for (let i = 0; i < 50 && b.audit.lines.filter((l) => l.reason === "bad_record").length < dropsBefore + 2; i++) await new Promise((r) => setTimeout(r, 20));
       assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, dropsBefore + 2);
+      assert.ok(b.audit.lines.filter((l) => l.reason === "bad_record").slice(-2).every((l) => l.actor === "…MPLE"), "frame errors carry the captured cert VIN (masked)");
       assert.equal(unhandled, 0);
       const again = await open(car);
       again.close();
@@ -509,4 +481,39 @@ test("EnergyApiError carries only a code", () => {
   const e = new EnergyApiError("rate_limited", 429, 5);
   assert.equal(e.message, "rate_limited");
   assert.throws(() => new FleetEnergyClient({ apiBase: "http://x.example.com", getToken: () => "t" }), /https/);
+});
+
+test("mtls: failed TLS handshakes are counted and rate-limited, not one audit line per scanner hit", async () => {
+  const serverCa = makeCa("example server ca");
+  const vehicleCa = makeCa("example vehicle ca");
+  const server = issue(serverCa, "localhost", true);
+  let clock = 1_000_000;
+  const drops: Array<{ reason: string; count?: number }> = [];
+  const r = new MtlsTelemetryReceiver({ listen: "127.0.0.1:0", cert: server.cert, key: server.key, clientCa: vehicleCa.pem, tlsAuditWindowMs: 60_000, now: () => clock });
+  await r.start({ record() {}, drop: (reason, _vin, count) => drops.push({ reason, count }) });
+  const hit = () =>
+    new Promise<void>((resolve) => {
+      const ws = new WebSocket(`wss://127.0.0.1:${r.port()}/`, { ca: serverCa.pem });
+      ws.on("error", () => resolve());
+      ws.on("close", () => resolve());
+    });
+  const settle = async (n: number) => {
+    for (let i = 0; i < 100 && drops.reduce((a, d) => a + (d.count ?? 0), 0) + r.pendingTlsFailures() < n; i++) await new Promise((x) => setTimeout(x, 20));
+  };
+  try {
+    for (let i = 0; i < 20; i++) await hit();
+    await settle(20);
+    assert.deepEqual(drops, [{ reason: "tls_handshake_failed", count: 1 }], "one line for the first failure in the window");
+    assert.equal(r.pendingTlsFailures(), 19);
+    clock += 60_000;
+    await hit();
+    await settle(21);
+    assert.deepEqual(drops.at(-1), { reason: "tls_handshake_failed", count: 20 }, "the next window's line carries the count");
+    await hit();
+    await settle(22);
+  } finally {
+    await r.stop();
+  }
+  assert.deepEqual(drops.at(-1), { reason: "tls_handshake_failed", count: 1 }, "stop() flushes the remainder");
+  assert.equal(drops.length, 3);
 });

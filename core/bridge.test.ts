@@ -98,7 +98,7 @@ test("callback auth: fail-closed without a token, header only, constant-time com
     const reasons = b.audit.lines.filter((l) => l.action === "callback").map((l) => l.reason ?? l.outcome);
     assert.deepEqual(reasons, ["callback_token_unset", "bad_token", "bad_token", "query_token_refused", "ok", "ok", "ok", "rate_limited"]);
     const health = await b.call("GET", "/healthz");
-    assert.deepEqual(health.body, { ok: true, adapters: ["echo", "echo2"], held: 0 });
+    assert.deepEqual(health.body, { ok: true, adapters: ["echo", "echo2"], held: 0, health: {} });
   } finally {
     await b.close();
     await m.close();

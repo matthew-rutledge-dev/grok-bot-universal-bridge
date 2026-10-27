@@ -9,6 +9,8 @@ const example = JSON.parse(readFileSync(new URL("./config.example.json", import.
 const env = { DISCORD_BOT_TOKEN: "aaa.bbb.ccc", DISCORD_CALLBACK_TOKEN: "cb-discord" };
 const cfg = (): DiscordAdapterConfig => ({
   ...example,
+  dm: undefined,
+  dmRoutes: undefined,
   routes: [
     ...example.routes.filter((r) => r.id !== "example-dm"),
     { id: "dm", enabled: true, match: { dm: "true" }, allowActors: [USER], agent: "example-agent", slug: "dm" },
@@ -33,6 +35,17 @@ test("prompt keeps the existing compact wake grammar", () => {
   const p = formatPrompt({ slug: "example-chat", messageId: "5", guildId: GUILD, channelId: CHANNEL, userId: USER, label: "example-user", alias: "example-agent", text: "hi", channelName: "example-chat" });
   assert.equal(p, `Discord #example-chat from example-user: hi\n\u27C2 d:example-chat:5 u=${USER} c=${CHANNEL} g=${GUILD} map=example-agent`);
   assert.deepEqual(chunk("a".repeat(4500)).map((c) => c.length), [2000, 2000, 500]);
+});
+
+test("chunk never splits a UTF-16 surrogate pair at the 2000 cut", () => {
+  const emoji = "\u{1F600}"; // two UTF-16 units
+  const text = "a".repeat(1999) + emoji + "b".repeat(10);
+  const parts = chunk(text);
+  assert.deepEqual(parts.map((c) => c.length), [1999, 12]);
+  assert.equal(parts.join(""), text);
+  assert.ok(parts.every((p) => !/[\uD800-\uDBFF]$/.test(p) && !/^[\uDC00-\uDFFF]/.test(p)), "no lone surrogate at a cut");
+  // A pair that ends exactly at 2000 stays whole in the first chunk.
+  assert.deepEqual(chunk("a".repeat(1998) + emoji + "c").map((c) => c.length), [2000, 1]);
 });
 
 test("allowlisted mention is delivered to the routine with the wake prompt", async () => {

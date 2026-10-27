@@ -145,13 +145,24 @@ export class FakeVoicePort implements VoicePort {
     if (this.notVoice.has(channelId)) throw new Error("not_a_voice_channel");
     this.played.push({ channelId, bytes: pcm.length });
   }
-  async openStream(channelId: string, nextFrame: () => Buffer) {
+  private ended: (() => void) | undefined;
+  async openStream(channelId: string, nextFrame: () => Buffer, onEnded?: () => void) {
     if (this.gate) await this.gate;
     if (this.notVoice.has(channelId)) throw new Error("not_a_voice_channel");
     const s = { channelId, closed: false, frames: 0 };
     this.streams.push(s);
     this.pull = nextFrame;
-    return { close: () => { s.closed = true; this.pull = undefined; } };
+    this.ended = onEnded;
+    return { close: () => { s.closed = true; this.pull = undefined; this.ended = undefined; } };
+  }
+  /** Simulate Discord dropping the open stream (no close() from our side). */
+  drop() {
+    const s = this.streams[this.streams.length - 1];
+    if (s) s.closed = true;
+    this.pull = undefined;
+    const cb = this.ended;
+    this.ended = undefined;
+    cb?.();
   }
   /** Pull n 20 ms frames (what the gateway pump does). Returns the frames. */
   pump(n: number): Buffer[] {
@@ -175,9 +186,19 @@ export class FakeDiscordPort implements DiscordPort {
   private handler: ((m: IncomingDiscordMessage) => void) | undefined;
   connectedWith = "";
   constructor(private readonly me = "444444444444444444") {}
-  async connect(token: string, onMessage: (m: IncomingDiscordMessage) => void) {
+  userHandler: ((u: { id: string; username?: string; globalName?: string | null; displayName?: string | null; bot?: boolean }) => void) | undefined;
+  ready = true;
+  typings: string[] = [];
+  async connect(token: string, onMessage: (m: IncomingDiscordMessage) => void, onUser?: FakeDiscordPort["userHandler"]) {
     this.connectedWith = token ? "token" : "";
     this.handler = onMessage;
+    this.userHandler = onUser;
+  }
+  isReady() {
+    return this.ready;
+  }
+  async typing(channelId: string) {
+    this.typings.push(channelId);
   }
   async disconnect() {
     this.handler = undefined;
@@ -187,12 +208,34 @@ export class FakeDiscordPort implements DiscordPort {
   }
   async send(channelId: string, content: string, opts?: { replyTo?: string; files?: OutgoingFile[] }) {
     const id = String(this.next++);
+    if (this.sendDelayMs) {
+      this.sending++;
+      await new Promise((r) => setTimeout(r, this.sendDelayMs));
+      this.sending--;
+    }
     this.sent.push({ id, channelId, content, replyTo: opts?.replyTo, ...(opts?.files?.length ? { files: opts.files } : {}) });
     return id;
   }
   async edit(channelId: string, messageId: string, content: string, opts?: { files?: OutgoingFile[] }) {
     if (this.failEdits.has(messageId)) throw new Error("Unknown Message");
     this.edits.push({ channelId, messageId, content, ...(opts?.files?.length ? { files: opts.files } : {}) });
+  }
+  deleted: { channelId: string; messageId: string }[] = [];
+  /** Delay (ms) before send() resolves (simulates a slow Discord API). */
+  sendDelayMs = 0;
+  /** Sends currently waiting on sendDelayMs. */
+  sending = 0;
+  async delete(channelId: string, messageId: string) {
+    this.deleted.push({ channelId, messageId });
+    this.sent = this.sent.filter((m) => m.id !== messageId);
+  }
+  dms: string[] = [];
+  /** User ids whose DM can't be opened. */
+  failDm = new Set<string>();
+  async openDm(userId: string) {
+    if (this.failDm.has(userId)) throw new Error("Cannot send messages to this user");
+    this.dms.push(userId);
+    return `6${userId.slice(1)}`;
   }
   async react(channelId: string, messageId: string, emoji: string) {
     this.reactions.push({ channelId, messageId, emoji });
@@ -253,7 +296,12 @@ export async function startBridge(opts: {
   holdFile?: string;
   delayMs?: (f: number) => number;
   rateLimit?: number;
+  /** Extra registry aliases (same mock routine, distinct agent ids). */
+  agents?: Record<string, string>;
 }) {
+  const extra = Object.fromEntries(
+    Object.entries(opts.agents ?? {}).map(([alias, agentId]) => [alias, { agentId, deliver: { kind: "webhook" as const, urlRef: "env:AGENT_URL", keyRef: "env:AGENT_KEY" } }]),
+  );
   const env = { AGENT_URL: opts.routineUrl, AGENT_KEY: "routine-key", ...(opts.env ?? {}) };
   const registry = Registry.fromObject(
     {
@@ -261,6 +309,7 @@ export async function startBridge(opts: {
       agents: {
         "example-agent": { agentId: "11111111-1111-4111-8111-111111111111", deliver: { kind: "webhook", urlRef: "env:AGENT_URL", keyRef: "env:AGENT_KEY" } },
         "broken-agent": { agentId: "x", deliver: { kind: "webhook", urlRef: "env:AGENT_URL", keyRef: "env:MISSING" } },
+        ...extra,
       },
     },
     env,

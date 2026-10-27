@@ -23,11 +23,12 @@ import { parsePayload, type TelemetryRecord } from "./fields.js";
  *    "decoded" mode for real cars.
  */
 
-export type DropReason = "vin_cert_mismatch" | "no_client_cert" | "undecodable_frame" | "bad_record";
+export type DropReason = "vin_cert_mismatch" | "no_client_cert" | "undecodable_frame" | "bad_record" | "tls_handshake_failed";
 
 export interface ReceiverSink {
   record(r: TelemetryRecord): void;
-  drop(reason: DropReason, vin?: string): void;
+  /** count: how many events this line stands for (rate-limited handshake failures). */
+  drop(reason: DropReason, vin?: string, count?: number): void;
 }
 
 export interface TelemetryReceiver {
@@ -168,7 +169,15 @@ export function vinFromSocket(sock: TLSSocket): string | undefined {
 export class MtlsTelemetryReceiver implements TelemetryReceiver {
   private server?: HttpsServer;
   private wss?: WebSocketServer;
-  constructor(private readonly o: { listen: string; cert: string; key: string; clientCa: string }) {}
+  private tlsFailures = 0;
+  private tlsLastEmit = -Infinity;
+  private flushTls: () => void = () => undefined;
+  constructor(private readonly o: { listen: string; cert: string; key: string; clientCa: string; tlsAuditWindowMs?: number; now?: () => number }) {}
+
+  /** Handshake failures counted but not yet written. */
+  pendingTlsFailures(): number {
+    return this.tlsFailures;
+  }
 
   async start(sink: ReceiverSink): Promise<void> {
     const { host, port } = splitListen(this.o.listen);
@@ -181,17 +190,34 @@ export class MtlsTelemetryReceiver implements TelemetryReceiver {
       minVersion: "TLSv1.2",
     });
     this.server.on("request", (_req, res) => res.writeHead(426).end());
-    this.server.on("tlsClientError", () => sink.drop("no_client_cert"));
+    // Failed handshakes (scanners, no/foreign client cert) are counted, not logged one by one:
+    // the first failure in a window writes a line, the rest are summed into the next line.
+    // No timer: a pending count stays unwritten until the next failure after the window or
+    // stop() (flushTls), so the audit file can lag behind a burst.
+    this.server.on("tlsClientError", (_e, sock) => {
+      sock.destroy();
+      this.tlsFailures++;
+      const now = (this.o.now ?? Date.now)();
+      if (now - this.tlsLastEmit >= (this.o.tlsAuditWindowMs ?? 60_000)) {
+        sink.drop("tls_handshake_failed", undefined, this.tlsFailures);
+        this.tlsFailures = 0;
+        this.tlsLastEmit = now;
+      }
+    });
+    this.flushTls = () => {
+      if (this.tlsFailures) sink.drop("tls_handshake_failed", undefined, this.tlsFailures);
+      this.tlsFailures = 0;
+    };
     this.wss = new WebSocketServer({ server: this.server, maxPayload: MAX_BODY });
     // Server-level errors (e.g. a failed upgrade) must never crash the process.
     this.wss.on("error", () => sink.drop("bad_record"));
     this.wss.on("connection", (ws, req) => {
+      const certVin = vinFromSocket(req.socket as TLSSocket);
       // Frame errors (over maxPayload, invalid UTF-8 text, bad opcode) emit 'error' on the socket.
       ws.on("error", () => {
-        sink.drop("bad_record", vinFromSocket(req.socket as TLSSocket));
+        sink.drop("bad_record", certVin);
         ws.terminate();
       });
-      const certVin = vinFromSocket(req.socket as TLSSocket);
       if (!certVin) {
         sink.drop("no_client_cert");
         ws.close(1008);
@@ -227,6 +253,7 @@ export class MtlsTelemetryReceiver implements TelemetryReceiver {
   }
 
   async stop(): Promise<void> {
+    this.flushTls();
     for (const c of this.wss?.clients ?? []) c.terminate();
     this.wss?.close();
     await new Promise<void>((r) => (this.server ? this.server.close(() => r()) : r()));

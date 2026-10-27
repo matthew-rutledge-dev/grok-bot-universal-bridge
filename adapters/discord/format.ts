@@ -47,16 +47,49 @@ export function formatPrompt(a: PromptArgs): string {
   return `${body}\n${trailer.join(" ")}`;
 }
 
-/** Split text into Discord-sized chunks (2000 chars), preferring line breaks. */
+/** Split text into Discord-sized chunks (2000 UTF-16 units), preferring line breaks, never inside a surrogate pair. */
 export function chunk(text: string, max = 2000): string[] {
   const out: string[] = [];
   let rest = text;
   while (rest.length > max) {
     let cut = rest.lastIndexOf("\n", max);
     if (cut < max / 2) cut = max;
+    // Never split a UTF-16 surrogate pair: back off one unit when the cut lands after a high surrogate.
+    const hi = rest.charCodeAt(cut - 1);
+    if (hi >= 0xd800 && hi <= 0xdbff) cut--;
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n/, "");
   }
   if (rest) out.push(rest);
   return out;
+}
+
+export type WakePromptFormat = "compact" | "legacy";
+
+/**
+ * Legacy wake prompt (the older bridge's WAKE_PROMPT_FORMAT=legacy, its 0.2.13 shape):
+ *
+ *   d:<slug>:<msgId>
+ *   {"id":"d:<slug>:<msgId>","g":<guildId|null>,"u":"<userId>","map":"<alias>","un"?,"dn"?,"lb"?,"c":"<channelId>","a"?:[{url,filename?,contentType?,size?}]}
+ *   <text>
+ *
+ * Kept only for rollback of agent-side readers; compact is the default.
+ */
+export function formatLegacyPrompt(a: PromptArgs & { who?: { un?: string; dn?: string; lb?: string } }): string {
+  const id = `d:${a.slug}:${a.messageId}`;
+  const thin: Record<string, unknown> = { id, g: a.guildId, u: a.userId, map: a.alias };
+  if (a.who?.un) thin.un = a.who.un;
+  if (a.who?.dn) thin.dn = a.who.dn;
+  if (a.who?.lb) thin.lb = a.who.lb;
+  if (a.channelId) thin.c = a.channelId;
+  if (a.attachments?.length) {
+    thin.a = a.attachments.map((r) => ({
+      url: r.url,
+      ...(r.filename ? { filename: r.filename } : {}),
+      ...(r.contentType ? { contentType: r.contentType } : {}),
+      ...(typeof r.size === "number" ? { size: r.size } : {}),
+    }));
+  }
+  // The user's text can't fake the first two lines: they are always written by the bridge first.
+  return [id, JSON.stringify(thin), a.text].join("\n");
 }
