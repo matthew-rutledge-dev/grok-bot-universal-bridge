@@ -32,6 +32,14 @@ export function safeErr(err: unknown): string {
   return typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? `${name}/${code}${status}` : `${name}${status}`;
 }
 
+/**
+ * Neutralise the routing-trailer mark (U+27C2) in untrusted text, so a sender
+ * cannot fake a "⟂ d:..." / "⟂ gb:..." line. The mark becomes the literal text "\u27C2".
+ */
+export function escapeTrailerMark(s: string): string {
+  return s.replace(/\u27C2/g, "\\u27C2");
+}
+
 /** One line, no control characters, trimmed and capped. */
 export function oneLine(s: string, max = 80): string {
   const flat = s.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { filePermissionWarning, isPlaceholderSecret, requireSecret, resolveSecret } from "./secrets.js";
+import { filePermissionWarning, isPlaceholderSecret, isSecretRef, requireSecret, resolveSecret } from "./secrets.js";
 import { tmp } from "../test/helpers.js";
 
 test("env: and file: references resolve", () => {
@@ -15,7 +15,7 @@ test("env: and file: references resolve", () => {
 });
 
 test("literal values are refused", () => {
-  assert.throws(() => resolveSecret("sk-literal-value"), /env:NAME or file:\/path/);
+  assert.throws(() => resolveSecret("sk-literal-value"), /env:NAME or file:/);
 });
 
 test("placeholders count as missing", () => {
@@ -37,4 +37,10 @@ test("file permission warning on group/world readable files (POSIX)", { skip: pr
   assert.match(filePermissionWarning(f) ?? "", /expected 600/);
   chmodSync(f, 0o600);
   assert.equal(filePermissionWarning(f), undefined);
+});
+
+test("file: references must be absolute", () => {
+  assert.equal(isSecretRef("file:relative/key"), false);
+  assert.throws(() => resolveSecret("file:./key"), /absolute/);
+  assert.equal(isSecretRef(`file:${join(tmp(), "k")}`), true);
 });

@@ -1,4 +1,4 @@
-import { oneLine } from "../../core/redact.js";
+import { escapeTrailerMark, oneLine } from "../../core/redact.js";
 import type { DiscordAttachmentRef } from "./port.js";
 
 /**
@@ -32,13 +32,14 @@ export function stripMention(content: string, botUserId: string | null): string 
 }
 
 export function formatPrompt(a: PromptArgs): string {
-  const who = oneLine(a.label) || `user ${a.userId}`;
-  const where = a.guildId ? `Discord #${oneLine(a.channelName ?? "") || a.slug}` : "Discord DM";
+  // Only the bridge may write the trailer mark: escape it in everything a user controls.
+  const who = escapeTrailerMark(oneLine(a.label)) || `user ${a.userId}`;
+  const where = a.guildId ? `Discord #${escapeTrailerMark(oneLine(a.channelName ?? "")) || a.slug}` : "Discord DM";
   const trailer = [TRAILER_MARK, `d:${a.slug}:${a.messageId}`, `u=${a.userId}`, `c=${a.channelId}`];
   if (a.guildId) trailer.push(`g=${a.guildId}`);
   if (a.alias) trailer.push(`map=${enc(a.alias)}`);
   for (const r of a.attachments ?? []) trailer.push(`a=${r.url.replace(/\s/g, "%20")}`);
-  return `${where} from ${who}: ${a.text}\n${trailer.join(" ")}`;
+  return `${where} from ${who}: ${escapeTrailerMark(a.text)}\n${trailer.join(" ")}`;
 }
 
 /** Split text into Discord-sized chunks (2000 chars), preferring line breaks. */

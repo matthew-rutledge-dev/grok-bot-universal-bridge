@@ -1,11 +1,12 @@
 import { readFileSync, statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 
 /**
  * Secret references. Config and registry files never hold secret values,
  * only references:
  *
  *   env:NAME          -> process.env.NAME (the host renders .env, mode 600)
- *   file:/abs/path    -> first line of that file (e.g. a mounted secret)
+ *   file:/abs/path    -> first line of that file (e.g. a mounted secret); the path must be absolute
  *
  * Anything else is refused, so a pasted literal key fails at startup instead
  * of sitting in a config file. Values are never logged or returned.
@@ -24,7 +25,11 @@ export function isPlaceholderSecret(v: string | undefined): boolean {
 }
 
 export function isSecretRef(ref: unknown): ref is string {
-  return typeof ref === "string" && /^(env:[A-Za-z_][A-Za-z0-9_]*|file:.+)$/.test(ref.trim());
+  if (typeof ref !== "string") return false;
+  const r = ref.trim();
+  if (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(r)) return true;
+  // Relative file refs would depend on the working directory: refuse them.
+  return r.startsWith("file:") && r.length > 5 && isAbsolute(r.slice(5));
 }
 
 export class SecretError extends Error {
@@ -38,7 +43,7 @@ export class SecretError extends Error {
 export function resolveSecret(ref: string | undefined, env: SecretEnv = process.env): string | undefined {
   if (ref === undefined || ref === null || ref === "") return undefined;
   if (!isSecretRef(ref)) {
-    throw new SecretError("secret reference must be env:NAME or file:/path (literal values are refused)");
+    throw new SecretError("secret reference must be env:NAME or file:/absolute/path (literal values are refused)");
   }
   const r = ref.trim();
   let value: string | undefined;
@@ -55,6 +60,21 @@ export function resolveSecret(ref: string | undefined, env: SecretEnv = process.
   if (value === undefined) return undefined;
   const t = value.trim();
   return isPlaceholderSecret(t) ? undefined : t;
+}
+
+/**
+ * The raw value behind a reference, WITHOUT placeholder filtering (for flags,
+ * where "changeme" must not silently mean "off"). undefined = unset. Throws on a bad shape.
+ */
+export function readRef(ref: string, env: SecretEnv = process.env): string | undefined {
+  if (!isSecretRef(ref)) throw new SecretError("reference must be env:NAME or file:/absolute/path");
+  const r = ref.trim();
+  if (r.startsWith("env:")) return env[r.slice(4)];
+  try {
+    return readFileSync(r.slice(5), "utf8").split(/\r?\n/)[0];
+  } catch {
+    return undefined;
+  }
 }
 
 /** Like resolveSecret but throws (naming only the label and reference kind) when missing. */

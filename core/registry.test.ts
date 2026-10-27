@@ -33,3 +33,13 @@ test("resolve fails closed without a key, and refuses plain http off loopback", 
   assert.equal(pub.target, "https://example.com/automations/webhook/…");
   assert.equal(JSON.stringify(pub).includes("k1"), false);
 });
+
+test("a literal deliver.url is only accepted for loopback / example.com / .test hosts", () => {
+  const mk = (url: string) => ({ version: 1, agents: { a: { agentId: "x", deliver: { kind: "webhook", url, keyRef: "env:K" } } } });
+  for (const ok of ["http://127.0.0.1:1340/api/sendPrompt", "https://example.com/a", "https://hooks.example.com/a", "https://routine.test/a"]) {
+    assert.deepEqual(validateRegistry(mk(ok)), [], ok);
+  }
+  for (const bad of ["https://hooks.real-service.invalid/automations/webhook/abc", "https://example.com.attacker.invalid/x"]) {
+    assert.ok(validateRegistry(mk(bad)).some((p) => /use urlRef/.test(p)), bad);
+  }
+});

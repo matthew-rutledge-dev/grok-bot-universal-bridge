@@ -6,7 +6,7 @@ import { HoldQueue, type HeldItem, type HoldUi } from "./hold.js";
 import { safeEqual, tokenFromHeaders, type Handler, type HttpResponse, HttpServer } from "./http.js";
 import { SlidingWindowRateLimiter } from "./rate-limit.js";
 import type { Registry } from "./registry.js";
-import { resolveSecret, type SecretEnv } from "./secrets.js";
+import { readRef, resolveSecret, type SecretEnv } from "./secrets.js";
 import { NO_WAKE, type WakeHook } from "./wake.js";
 import { consoleLogger, type DenyReason, type InboundEvent, type Logger, type Route } from "./types.js";
 
@@ -30,6 +30,8 @@ export interface AdapterContext {
   route(method: "GET" | "POST", subpath: string, handler: Handler, opts?: { maxBytes?: number }): void;
   secret(ref: string | undefined): string | undefined;
   state(eventId: string): EventState | undefined;
+  /** Raw value of an env:/file: reference (no placeholder filtering). Throws on a bad shape. */
+  raw(ref: string): string | undefined;
   /** Path for adapter-owned state under the data dir ("" = memory only). */
   dataFile(name: string): string;
 }
@@ -65,8 +67,11 @@ export interface BridgeOptions {
   env?: SecretEnv;
   fetchImpl?: FetchLike;
   delayMs?: (failures: number) => number;
+  /** Cap on remembered event states (default 10000). Oldest are dropped first. */
+  maxStates?: number;
 }
 
+const DEFAULT_MAX_STATES = 10_000;
 const STATE_TTL_MS = 6 * 60 * 60 * 1000;
 
 export class Bridge {
@@ -121,6 +126,7 @@ export class Bridge {
       audit: (entry) => this.opts.audit.write({ ...entry, adapter: name }),
       route: (method, subpath, handler, o) => this.opts.http.route(method, `/${name}/${subpath.replace(/^\/+/, "")}`, handler, o),
       secret: (ref) => resolveSecret(ref, this.opts.env ?? process.env),
+      raw: (ref) => readRef(ref, this.opts.env ?? process.env),
       state: (eventId) => this.stateOf(`${name}:${eventId}`),
       dataFile: (file) => (this.opts.holdFile ? join(dirname(this.opts.holdFile), `${name}-${file}`) : ""),
     };
@@ -148,8 +154,28 @@ export class Bridge {
     return s.state;
   }
 
+  private stateWrites = 0;
+
   private setState(id: string, state: EventState): void {
+    // Re-insert so Map order is oldest-update first.
+    this.states.delete(id);
     this.states.set(id, { state, at: Date.now() });
+    const max = this.opts.maxStates ?? DEFAULT_MAX_STATES;
+    if (++this.stateWrites % 256 === 0 || this.states.size > max) this.sweepStates(max);
+  }
+
+  /** Drop expired states, then the oldest ones above the cap. */
+  sweepStates(max = this.opts.maxStates ?? DEFAULT_MAX_STATES): void {
+    const cutoff = Date.now() - STATE_TTL_MS;
+    for (const [id, s] of this.states) if (s.at < cutoff) this.states.delete(id);
+    for (const id of this.states.keys()) {
+      if (this.states.size <= max) break;
+      this.states.delete(id);
+    }
+  }
+
+  stateCount(): number {
+    return this.states.size;
   }
 
   async submit(adapter: SourceAdapter, event: InboundEvent): Promise<SubmitResult> {

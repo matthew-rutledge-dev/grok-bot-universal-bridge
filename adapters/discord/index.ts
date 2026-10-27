@@ -1,3 +1,5 @@
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { validateRoutes } from "../../core/allowlist.js";
 import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
 import type { HeldItem } from "../../core/hold.js";
@@ -86,7 +88,7 @@ export function messageToEvent(
         attachments: m.attachments,
       }),
       metadata: { hop: `d:${slug}:${m.id}` },
-      ref: { channelId: m.channelId, messageId: m.id },
+      ref: m.guildId ? { channelId: m.channelId, messageId: m.id } : { channelId: m.channelId, messageId: m.id, dm: "true" },
     },
   };
 }
@@ -97,8 +99,9 @@ export class DiscordAdapter implements SourceAdapter {
   readonly callbackTokenRef?: string;
   readonly callbackMaxBytes = 64 * 1024;
   private ctx!: AdapterContext;
-  /** DM channels that already passed the allowlist (replies may go there). */
+  /** DM channels that already passed the allowlist (replies may go there). Persisted in the data dir. */
   private readonly dmChannels = new Set<string>();
+  private dmFile = "";
 
   constructor(
     private readonly cfg: DiscordAdapterConfig,
@@ -112,6 +115,31 @@ export class DiscordAdapter implements SourceAdapter {
 
   init(ctx: AdapterContext): void {
     this.ctx = ctx;
+    this.dmFile = ctx.dataFile("dm-channels.json");
+    if (this.dmFile) {
+      try {
+        const raw = JSON.parse(readFileSync(this.dmFile, "utf8")) as { channels?: unknown };
+        for (const c of Array.isArray(raw.channels) ? raw.channels : []) if (typeof c === "string" && SNOWFLAKE.test(c)) this.dmChannels.add(c);
+      } catch {
+        /* none yet */
+      }
+    }
+  }
+
+  /** Remember a DM channel that passed the allowlist (survives restarts). */
+  private allowDmChannel(channelId: string): void {
+    if (!SNOWFLAKE.test(channelId) || this.dmChannels.has(channelId)) return;
+    this.dmChannels.add(channelId);
+    if (!this.dmFile) return;
+    try {
+      mkdirSync(dirname(this.dmFile), { recursive: true });
+      const tmp = `${this.dmFile}.tmp`;
+      rmSync(tmp, { force: true });
+      writeFileSync(tmp, JSON.stringify({ version: 1, channels: [...this.dmChannels] }), { mode: 0o600 });
+      renameSync(tmp, this.dmFile);
+    } catch {
+      this.ctx.log.warn("[discord] dm channel file write failed (memory only)");
+    }
   }
 
   async start(): Promise<void> {
@@ -136,15 +164,17 @@ export class DiscordAdapter implements SourceAdapter {
       this.ctx.audit({ action: "inbound", outcome: "skipped", reason: skip, eventId: m.id, lane: m.channelId });
       return undefined;
     }
-    const res = await this.ctx.submit(event);
-    if (res.accepted && !m.guildId) this.dmChannels.add(m.channelId);
-    return res;
+    // Record an allowlisted DM channel BEFORE delivery, so a crash mid-hold still lets the reply through.
+    if (!m.guildId && this.ctx.check(event).ok) this.allowDmChannel(m.channelId);
+    return this.ctx.submit(event);
   }
 
   readonly ui = {
     holding: async (item: HeldItem) => {
       const ch = item.ref?.channelId;
       if (!ch) return undefined;
+      // A held DM reloaded after a restart re-allows its reply channel.
+      if (item.ref?.dm === "true") this.allowDmChannel(ch);
       if (item.statusRef) {
         await this.port.edit(ch, item.statusRef, HOLD_STATUS_TEXT);
         return item.statusRef;

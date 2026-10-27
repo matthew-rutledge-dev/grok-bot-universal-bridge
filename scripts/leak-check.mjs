@@ -14,7 +14,7 @@ const files = execFileSync("git", ["ls-files"], { encoding: "utf8" }).split("\n"
 const extra = process.argv.slice(2);
 
 const ALLOWED_HOSTS = [
-  /(^|\.)example\.(com|org|net)$/, /^127\.0\.0\.1$/, /^localhost$/, /^\[::1\]$/,
+  /(^|\.)example\.(com|org|net)$/, /\.(test|invalid)$/, /^127\.0\.0\.1$/, /^localhost$/, /^\[::1\]$/,
   /^github\.com$/, /^docs\.github\.com$/, /^nodejs\.org$/, /^discord\.com$/, /^developer\.tesla\.com$/,
 ];
 const placeholderNum = (n) => /^(\d)\1+$/.test(n) || /^[1-9]0+\d{0,2}$/.test(n);

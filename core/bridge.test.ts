@@ -104,3 +104,35 @@ test("callback auth: fail-closed without a token, header only, constant-time com
     await m.close();
   }
 });
+
+test("remembered event states are capped (oldest dropped first)", async () => {
+  const { Bridge } = await import("./bridge.js");
+  const { MemoryAudit } = await import("./audit.js");
+  const { HttpServer } = await import("./http.js");
+  const { Registry } = await import("./registry.js");
+  const { silentLogger } = await import("./types.js");
+  const m = await mockRoutine();
+  const env = { U: m.url, K: "k" };
+  const bridge = new Bridge({
+    registry: Registry.fromObject({ version: 1, agents: { "example-agent": { agentId: "1", deliver: { kind: "webhook", urlRef: "env:U", keyRef: "env:K" } } } }, env),
+    audit: new MemoryAudit(),
+    http: new HttpServer(silentLogger),
+    holdFile: "",
+    holdMaxSec: 60,
+    publicBaseUrl: "https://bridge.example.com",
+    log: silentLogger,
+    env,
+    maxStates: 5,
+  });
+  const a = new EchoAdapter(routes);
+  await bridge.add(a);
+  try {
+    for (let i = 0; i < 12; i++) await a.ctx.submit(ev({ eventId: `cap-${i}`, lane: `l${i}` }));
+    assert.equal(bridge.stateCount(), 5);
+    assert.equal(bridge.stateOf("echo:cap-0"), undefined, "oldest dropped");
+    assert.equal(bridge.stateOf("echo:cap-11"), "delivered", "newest kept");
+  } finally {
+    await bridge.stop();
+    await m.close();
+  }
+});

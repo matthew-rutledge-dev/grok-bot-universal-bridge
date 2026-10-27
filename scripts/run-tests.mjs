@@ -21,5 +21,5 @@ for (const r of roots) {
   }
 }
 files.sort();
-const r = spawnSync(process.execPath, ["--import", "tsx", "--test", "--test-concurrency=1", ...files], { stdio: "inherit" });
+const r = spawnSync(process.execPath, ["--import", "tsx", "--test", "--test-concurrency=1", "--test-timeout=60000", ...files], { stdio: "inherit" });
 process.exit(r.status ?? 1);

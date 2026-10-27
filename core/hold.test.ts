@@ -178,3 +178,49 @@ test("restart: held events reload from the file and are retried; expired ones fa
   assert.ok(events.includes("failed:dead:held=true:expired=true"));
   q.stop();
 });
+
+test("two restarts with an expired item: ONE failure call and an empty file (regression)", async () => {
+  const file = join(tmp(), "hold.json");
+  const now = Date.now();
+  writeFileSync(file, JSON.stringify({ version: 1, items: [{ ...input("old"), seq: 1, submittedAt: now - 5000, deadline: now - 1, holding: true, tries: 3, failures: 3 }] }));
+  let failedCalls = 0;
+  const ui: HoldUi = { holding: async () => undefined, delivered: async () => undefined, failed: async () => void (failedCalls += 1) };
+  for (let restart = 0; restart < 2; restart++) {
+    const q = new HoldQueue({ filePath: file, maxMs: 60_000, ui, log: silentLogger, send: async () => ({ status: 200, body: {} }) });
+    await q.load();
+    q.stop();
+  }
+  assert.equal(failedCalls, 1);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).items, []);
+});
+
+test("the event is on disk before the first delivery try finishes (crash safety)", async () => {
+  const file = join(tmp(), "hold.json");
+  const { ui } = recorder();
+  let onDisk = -1;
+  const q = new HoldQueue({
+    filePath: file,
+    maxMs: 60_000,
+    ui,
+    log: silentLogger,
+    send: async () => {
+      onDisk = JSON.parse(readFileSync(file, "utf8")).items.length;
+      return { status: 200, body: {} };
+    },
+  });
+  await q.submit(input("c"));
+  assert.equal(onDisk, 1);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).items.length, 0);
+  q.stop();
+});
+
+test("a stale .tmp from a crash does not block the next write", async () => {
+  const file = join(tmp(), "hold.json");
+  writeFileSync(`${file}.tmp`, "garbage");
+  const { ui } = recorder();
+  const q = new HoldQueue({ filePath: file, maxMs: 60_000, ui, log: silentLogger, send: async () => ({ status: 200, body: {} }) });
+  await q.submit(input("t"));
+  assert.equal(existsSync(`${file}.tmp`), false);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).items, []);
+  q.stop();
+});

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { failureCode, isRetryable } from "./deliver.js";
 import { NO_WAKE, type WakeHook } from "./wake.js";
@@ -119,6 +119,8 @@ export class HoldQueue {
     const lane = this.lanes.get(item.lane) ?? [];
     lane.push(item);
     this.lanes.set(item.lane, lane);
+    // Write before the first try so a crash mid-delivery cannot lose the event.
+    this.persist();
     if (lane.length === 1) {
       await this.attempt(item.lane);
       return;
@@ -138,6 +140,9 @@ export class HoldQueue {
       return { kept: 0, expired: 0 };
     }
     const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    // The file on disk has entries: the next persist() must rewrite it even if
+    // nothing survives, or expired items would be failed again on every restart.
+    if (items.length > 0) this.wroteEntries = true;
     const now = this.now();
     const expired: HeldItem[] = [];
     for (const it of items.sort((a, b) => a.seq - b.seq)) {
@@ -287,11 +292,14 @@ export class HoldQueue {
   private persist(): void {
     const path = this.opts.filePath;
     if (!path) return;
-    const items = this.snapshot().filter((h) => h.holding);
+    // Every queued item, held or in flight, so a crash never loses one.
+    const items = this.snapshot();
     if (items.length === 0 && !this.wroteEntries) return;
     try {
       mkdirSync(dirname(path), { recursive: true });
       const tmp = `${path}.tmp`;
+      // A stale tmp from a crash may carry old permissions; start fresh. (Mode 600 is a no-op on Windows.)
+      rmSync(tmp, { force: true });
       writeFileSync(tmp, JSON.stringify({ version: 1, items } satisfies HoldFile), { mode: 0o600 });
       renameSync(tmp, path);
       this.wroteEntries = items.length > 0;

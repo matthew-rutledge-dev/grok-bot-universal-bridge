@@ -1,5 +1,5 @@
 {
-  "readOnly": "${GROKBUILD_READ_ONLY}",
+  "readOnlyRef": "env:GROKBUILD_READ_ONLY",
   "callbackTokenRef": "env:GROKBUILD_CALLBACK_TOKEN",
   "maxPromptChars": 8000,
   "replyTtlSec": 3600,

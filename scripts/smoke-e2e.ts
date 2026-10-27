@@ -140,6 +140,9 @@ async function partA() {
     const h = await waitHealthy(base);
     check("service process starts on loopback and answers /healthz", h.ok && h.adapters.join() === "grokbuild", `adapters=${h.adapters.join()}`);
 
+    const mal = await fetch(`${base}/grokbuild/requests/%E0`, { headers: client });
+    const alive = await waitHealthy(base);
+    check("malformed path encoding answers 400 and the process stays up", mal.status === 400 && alive.ok && child.exitCode === null, `HTTP ${mal.status}`);
     const bad = await api(base, "POST", "/grokbuild/prompt", { bot: "example-agent", prompt: "x" }, { authorization: "Bearer wrong" });
     check("wrong client token is refused", bad.status === 401, `HTTP ${bad.status}`);
     const unrouted = await api(base, "POST", "/grokbuild/prompt", { bot: "not-routed", prompt: "x" }, client);

@@ -22,7 +22,7 @@ export interface RegistryAgentFile {
   label?: string;
   deliver: {
     kind: DeliveryKind;
-    /** Literal URL is allowed for loopback/example hosts; prefer urlRef (routine URLs are secrets). */
+    /** Literal URL only for loopback, example.com or *.test hosts; anything else must be urlRef (routine URLs are secrets). */
     url?: string;
     urlRef?: string;
     keyRef?: string;
@@ -136,6 +136,16 @@ export function isAllowedUrl(raw: string): boolean {
   }
 }
 
+/** Hosts a literal deliver.url may point at. Real routine URLs carry a secret id, so they must be refs. */
+export function isLiteralUrlHostAllowed(raw: string): boolean {
+  try {
+    const h = new URL(raw).hostname.toLowerCase();
+    return ["127.0.0.1", "localhost", "[::1]", "::1"].includes(h) || h === "example.com" || h.endsWith(".example.com") || h.endsWith(".test");
+  } catch {
+    return false;
+  }
+}
+
 export function validateRegistry(raw: unknown): string[] {
   const p: string[] = [];
   if (!raw || typeof raw !== "object") return ["not an object"];
@@ -152,6 +162,9 @@ export function validateRegistry(raw: unknown): string[] {
     const d = a.deliver;
     if (!d || (d.kind !== "webhook" && d.kind !== "sendprompt")) p.push(`${alias}: deliver.kind must be webhook or sendprompt`);
     if (d && !d.url && !d.urlRef) p.push(`${alias}: deliver.url or deliver.urlRef required`);
+    if (d?.url !== undefined && !isLiteralUrlHostAllowed(d.url)) {
+      p.push(`${alias}: literal deliver.url only for loopback/example.com/.test hosts; use urlRef (env:/file:) for real routine URLs`);
+    }
     if (d?.urlRef !== undefined && !isSecretRef(d.urlRef)) p.push(`${alias}: deliver.urlRef must be env:NAME or file:/path`);
     if (d && !isSecretRef(d.keyRef)) p.push(`${alias}: deliver.keyRef must be env:NAME or file:/path`);
     for (const k of Object.keys(d ?? {})) {

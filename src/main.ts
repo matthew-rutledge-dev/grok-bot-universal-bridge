@@ -5,6 +5,11 @@ import { buildService } from "./service.js";
  *   BRIDGE_CONFIG   path to the bridge config (default ./config/bridge.json)
  *   --check         validate config, registry and adapter configs; print readiness (no secrets); exit
  */
+// Log, never crash silently. Messages can echo URLs, so only the error class is logged.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[bridge] unhandledRejection ${(reason as Error)?.name ?? typeof reason}`);
+});
+
 async function main(): Promise<void> {
   const file = process.env.BRIDGE_CONFIG?.trim() || "./config/bridge.json";
   const svc = await buildService(file);

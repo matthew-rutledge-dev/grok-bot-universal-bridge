@@ -10,5 +10,5 @@ Status: **working**. Lets a coding harness (Grok Build, Cursor or any MCP client
 
 * **Matches.** Routes match `{ "client": "<client id>", "bot": "<alias>" }`. Actor = client id.
 * **Prompt.** The agent receives the prompt labelled as untrusted data, plus `⟂ gb:<requestId> client=<id> reply=<callback URL>`.
-* **Read-only.** `readOnly` fails closed: `1/true/yes/on` turns it on, and so does any unrecognised value; unset, empty or `${...}` leaves it off. When on, new prompts are refused with 403.
+* **Read-only.** Set `"readOnly": true`, or `"readOnlyRef": "env:GROKBUILD_READ_ONLY"` (or a `file:` path), which is re-read on every request. The ref fails closed: `1/true/yes/on` turn it on, and so does any unrecognised value or an unreadable ref. Unset, empty, `0/false/no/off` or an unexpanded `${...}` leave it off. When on, new prompts are refused with 403.
 * **Persistence.** Request records and replies are kept for `replyTtlSec` in `data/grokbuild-requests.json` (mode 600), so a reply that arrives after a restart still lands.

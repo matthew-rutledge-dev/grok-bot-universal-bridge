@@ -81,7 +81,8 @@ export class HttpServer {
     this.routes.push({ method, parts, handler, maxBytes: opts?.maxBytes ?? DEFAULT_MAX_BODY });
   }
 
-  private match(method: string, path: string): { def: RouteDef; params: Record<string, string> } | undefined {
+  /** undefined = no route; "bad_path" = a parameter is not valid percent-encoding. */
+  private match(method: string, path: string): { def: RouteDef; params: Record<string, string> } | "bad_path" | undefined {
     const segs = path.split("/").filter(Boolean);
     for (const def of this.routes) {
       if (def.method !== method || def.parts.length !== segs.length) continue;
@@ -89,8 +90,13 @@ export class HttpServer {
       let ok = true;
       for (let i = 0; i < segs.length; i++) {
         const p = def.parts[i];
-        if (p.startsWith(":")) params[p.slice(1)] = decodeURIComponent(segs[i]);
-        else if (p !== segs[i]) {
+        if (p.startsWith(":")) {
+          try {
+            params[p.slice(1)] = decodeURIComponent(segs[i]);
+          } catch {
+            return "bad_path";
+          }
+        } else if (p !== segs[i]) {
           ok = false;
           break;
         }
@@ -101,12 +107,24 @@ export class HttpServer {
   }
 
   async listen(bind: string, port: number): Promise<number> {
+    if (!bind || !bind.trim()) throw new Error("http bind address required (an empty bind listens on every interface)");
     this.server = createServer((req, res) => {
-      void this.handle(req).then((out) => {
-        const body = JSON.stringify(out.body ?? {});
-        res.writeHead(out.status, { "content-type": "application/json", "cache-control": "no-store", ...(out.headers ?? {}) });
-        res.end(body);
-      });
+      void this.handle(req)
+        .then((out) => {
+          const body = JSON.stringify(out.body ?? {});
+          res.writeHead(out.status, { "content-type": "application/json", "cache-control": "no-store", ...(out.headers ?? {}) });
+          res.end(body);
+        })
+        .catch((err) => {
+          // Never let one request take the process down.
+          this.log.error(`[http] request failed ${(err as Error)?.name ?? typeof err}`);
+          try {
+            if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "internal" }));
+          } catch {
+            res.destroy();
+          }
+        });
     });
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
@@ -125,6 +143,7 @@ export class HttpServer {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const method = (req.method ?? "GET").toUpperCase();
     const m = this.match(method, url.pathname);
+    if (m === "bad_path") return { status: 400, body: { ok: false, error: "bad_path_encoding" } };
     if (!m) return { status: 404, body: { ok: false, error: "not_found" } };
     let body: unknown = undefined;
     try {

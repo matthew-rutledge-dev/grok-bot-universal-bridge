@@ -45,7 +45,9 @@ export function validateBridgeConfig(raw: unknown): string[] {
   const c = raw as Partial<BridgeConfig>;
   if (c.version !== 1) p.push("version must be 1");
   if (!c.http || typeof c.http.port !== "number") p.push("http.port required");
-  if (c.http && typeof c.http.bind === "string" && !["127.0.0.1", "::1", "localhost"].includes(c.http.bind) && c.http.allowNonLoopbackBind !== true) {
+  if (c.http && (typeof c.http.bind !== "string" || c.http.bind.trim() === "")) {
+    p.push("http.bind required (127.0.0.1; an unset bind would listen on every interface)");
+  } else if (c.http && !["127.0.0.1", "::1", "localhost"].includes(c.http.bind) && c.http.allowNonLoopbackBind !== true) {
     p.push("http.bind must be loopback (put the tunnel in front); inside a container set allowNonLoopbackBind and publish on 127.0.0.1 only");
   }
   if (!c.http?.publicBaseUrl) p.push("http.publicBaseUrl required");
