@@ -1,4 +1,4 @@
-import { EnergyApiError, mapFetchError, mapHttpError, type FetchLike } from "./energy.js";
+import { EnergyApiError, FLEET_API_HOSTS, NHTSA_HOSTS, baseUrlProblem, guardedGet, mapHttpError, type FetchLike, type TestHostOverride } from "./energy.js";
 
 /**
  * Slow REST pulls for ownership events (daily / weekly, never per telemetry record):
@@ -23,6 +23,10 @@ export interface OwnershipRestOptions {
   nhtsaBase?: string;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** Response body cap (default MAX_BODY_BYTES, 1 MiB). */
+  maxBodyBytes?: number;
+  /** TESTS ONLY (see TestHostOverride): extra hosts for both bases. */
+  testHosts?: TestHostOverride;
 }
 
 const VIN_RE = /^[A-HJ-NPR-Z0-9]{17}$/;
@@ -31,23 +35,19 @@ export class OwnershipRestClient {
   private readonly fetchImpl: FetchLike;
   readonly nhtsaBase: string;
   constructor(private readonly o: OwnershipRestOptions) {
-    if (!/^https:\/\//.test(o.apiBase)) throw new Error("tesla.ownership.rest.api_base must be an https URL");
+    const p = baseUrlProblem(o.apiBase, FLEET_API_HOSTS, "tesla.ownership.rest.api_base", o.testHosts);
+    if (p) throw new Error(p);
     this.nhtsaBase = (o.nhtsaBase ?? "https://api.nhtsa.gov").replace(/\/+$/, "");
-    if (!/^https:\/\//.test(this.nhtsaBase)) throw new Error("tesla.ownership.rest.nhtsa_base must be an https URL");
+    const q = baseUrlProblem(this.nhtsaBase, NHTSA_HOSTS, "tesla.ownership.rest.nhtsa_base", o.testHosts);
+    if (q) throw new Error(q);
     this.fetchImpl = o.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
   }
 
   private async get(url: string, token: string | undefined): Promise<unknown> {
     const headers: Record<string, string> = { accept: "application/json" };
     if (token) headers.authorization = `Bearer ${token}`;
-    let res;
-    try {
-      res = await this.fetchImpl(url, { method: "GET", headers, signal: AbortSignal.timeout(this.o.timeoutMs ?? 15_000) });
-    } catch (e) {
-      throw mapFetchError(e);
-    }
-    const body = await res.text().catch(() => "");
-    if (res.status < 200 || res.status >= 300) throw mapHttpError(res.status, body, res.headers.get("retry-after"));
+    const { status, body, retryAfter } = await guardedGet(this.fetchImpl, url, headers, this.o.timeoutMs ?? 15_000, this.o.maxBodyBytes);
+    if (status < 200 || status >= 300) throw mapHttpError(status, body, retryAfter);
     if (!body.trim()) return {};
     try {
       return JSON.parse(body);

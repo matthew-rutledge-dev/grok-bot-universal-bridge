@@ -34,7 +34,7 @@
     "enabled": false,
     "interval_s": 300,
     "site_allowlist": ["1111111111111111"],
-    "api_base": "https://fleet-api.example.com",
+    "api_base": "https://fleet-api.prd.na.vn.cloud.tesla.com",
     "token_ref": "file:/run/secrets/tesla-fleet/access-token",
     "reserve_margin_percent": 5,
     "site_info_ttl_s": 600
@@ -52,7 +52,7 @@
     "digest": { "weekday": 0, "hour_utc": 13 },
     "rest": {
       "enabled": false,
-      "api_base": "https://fleet-api.example.com",
+      "api_base": "https://fleet-api.prd.na.vn.cloud.tesla.com",
       "token_ref": "file:/run/secrets/tesla-fleet/access-token",
       "service_h": 24,
       "warranty_h": 168,

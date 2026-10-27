@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, posix, win32 } from "node:path";
 import type { AdapterContext } from "../../core/bridge.js";
-import { EnergyApiError, type FetchLike } from "./energy.js";
+import { baseUrlProblem, EnergyApiError, FLEET_API_HOSTS, NHTSA_HOSTS, type FetchLike, type TestHostOverride } from "./energy.js";
 import type { TelemetryRecord, TelemetryValue } from "./fields.js";
 import {
   addToDigest,
@@ -15,6 +15,8 @@ import {
   parseReleaseNotes,
   parseServiceData,
   parseWarranty,
+  sanitizeCarState,
+  sanitizeDigest,
   validateOwnershipRules,
   type CarState,
   type DigestState,
@@ -79,8 +81,10 @@ export function validateOwnership(o: OwnershipConfig | undefined, vinAllowlist: 
   if (d.hour_utc !== undefined && !(Number.isInteger(d.hour_utc) && d.hour_utc >= 0 && d.hour_utc <= 23)) p.push(`${at}.digest.hour_utc must be 0-23`);
   const r = o.rest;
   if (r) {
-    if (r.api_base !== undefined && !/^https:\/\/[^/]+/.test(r.api_base)) p.push(`${at}.rest.api_base must be an https URL`);
-    if (r.nhtsa_base !== undefined && !/^https:\/\/[^/]+/.test(r.nhtsa_base)) p.push(`${at}.rest.nhtsa_base must be an https URL`);
+    const badApi = r.api_base !== undefined ? baseUrlProblem(r.api_base, FLEET_API_HOSTS, `${at}.rest.api_base`) : undefined;
+    if (badApi) p.push(badApi);
+    const badNhtsa = r.nhtsa_base !== undefined ? baseUrlProblem(r.nhtsa_base, NHTSA_HOSTS, `${at}.rest.nhtsa_base`) : undefined;
+    if (badNhtsa) p.push(badNhtsa);
     if (r.token_ref !== undefined && !isTokenRef(r.token_ref)) p.push(`${at}.rest.token_ref must be env:NAME or file:/path`);
     if (r.enabled && !r.api_base) p.push(`${at}.rest.api_base is required when rest is enabled`);
     if (r.enabled && !r.token_ref) p.push(`${at}.rest.token_ref is required when rest is enabled`);
@@ -100,20 +104,26 @@ interface StateFile {
 }
 
 const SAVE_EVERY_MS = 30_000;
+/** After ANY failed REST pull, that pull kind waits this long before it is tried again (persisted). */
+export const PULL_RETRY_MS = 3600_000;
 
 export interface OwnershipDeps {
   now: () => number;
   fetchImpl?: FetchLike;
+  /** TESTS ONLY: extra hosts for the REST client. */
+  testHosts?: TestHostOverride;
 }
 
 /**
  * env:NAME, or file:<absolute path>. Absolute means POSIX (/...) or Windows (C:\..., C:/..., or a UNC path \\server\share\...),
  * whatever OS validates the config, so a config written for one host checks the same everywhere.
  * Relative and drive-relative (C:foo) paths are refused: they depend on the working directory.
+ * Any whitespace or control character anywhere (file:\t..., embedded newlines, padding) is refused.
  */
 export function isTokenRef(ref: unknown): boolean {
   if (typeof ref !== "string") return false;
-  const r = ref.trim();
+  if (/[\s\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(ref)) return false;
+  const r = ref;
   if (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(r)) return true;
   if (!r.startsWith("file:") || r.length <= 5) return false;
   const f = r.slice(5);
@@ -131,6 +141,7 @@ export class OwnershipRuntime {
   private timer?: ReturnType<typeof setInterval>;
   private rest?: OwnershipRestClient;
   private pulling = false;
+  private flushing = false;
   private restBackoffUntil = 0;
   /** Release notes to fetch (vehicle_id -> version). */
   private readonly pendingNotes = new Map<string, string>();
@@ -169,6 +180,7 @@ export class OwnershipRuntime {
         nhtsaBase: r.nhtsa_base,
         getToken: () => this.ctx.secret(r.token_ref),
         fetchImpl: this.deps.fetchImpl,
+        testHosts: this.deps.testHosts,
       });
     }
     for (const v of this.cfg.vehicles ?? []) this.tracker(v.vin);
@@ -191,7 +203,7 @@ export class OwnershipRuntime {
   async tick(): Promise<void> {
     const now = this.deps.now();
     if (this.digest.next_at !== undefined && now >= this.digest.next_at) await this.flushDigest();
-    if (this.rest && !this.pulling && now >= this.restBackoffUntil) {
+    if (this.rest && !this.pulling) {
       this.pulling = true;
       try {
         await this.pullDue();
@@ -208,7 +220,7 @@ export class OwnershipRuntime {
       return await this.recordUnsafe(r, quiet);
     } catch {
       // Ownership must never break the wake triggers that share the record.
-      this.ctx.audit({ action: "observe", outcome: "error", reason: "ownership_ingest_failed", actor: r.vin });
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "ownership_ingest_failed", actor: r.vin, actorKeep: 6 });
       return [];
     }
   }
@@ -260,6 +272,7 @@ export class OwnershipRuntime {
       eventId,
       lane: `ownership:${vehicleId}`,
       actor: vin,
+      actorKeep: 6,
       match: { kind: "ownership" },
       addressed: true,
       prompt: [
@@ -270,25 +283,32 @@ export class OwnershipRuntime {
       ].join("\n"),
       metadata: { kind: "ownership", digest, event_types: [...new Set(events.map((e) => e.event_type))].join(","), priority: events.some((e) => e.priority === "high") ? "high" : "normal" },
     });
-    this.ctx.audit({ action: "observe", outcome: res.accepted ? "ok" : "skipped", reason: res.accepted ? (digest ? "ownership_digest" : "ownership_immediate") : `ownership_${res.reason}`, type: digest ? "digest" : e0.event_type, actor: vin, count: events.length });
+    this.ctx.audit({ action: "observe", outcome: res.accepted ? "ok" : "skipped", reason: res.accepted ? (digest ? "ownership_digest" : "ownership_immediate") : `ownership_${res.reason}`, type: digest ? "digest" : e0.event_type, actor: vin, actorKeep: 6, count: events.length });
     return res.accepted;
   }
 
   /** Send each car's queued digest-tier events as one message, then schedule the next digest. */
   async flushDigest(): Promise<number> {
-    let sent = 0;
-    for (const [vehicleId, list] of Object.entries(this.digest.items)) {
-      if (!list.length) continue;
-      const ok = await this.submit(list, vehicleId, `digest:${this.digest.next_at ?? this.deps.now()}`);
-      if (ok) {
-        sent += list.length;
-        this.digest.items[vehicleId] = [];
+    // Overlap guard: a slow submit must not let the next tick send the same digest twice.
+    if (this.flushing) return 0;
+    this.flushing = true;
+    try {
+      let sent = 0;
+      for (const [vehicleId, list] of Object.entries(this.digest.items)) {
+        if (!list.length) continue;
+        const ok = await this.submit(list, vehicleId, `digest:${this.digest.next_at ?? this.deps.now()}`);
+        if (ok) {
+          sent += list.length;
+          this.digest.items[vehicleId] = [];
+        }
       }
+      this.digest.next_at = this.nextAt(this.deps.now());
+      this.dirty = true;
+      this.save(true);
+      return sent;
+    } finally {
+      this.flushing = false;
     }
-    this.digest.next_at = this.nextAt(this.deps.now());
-    this.dirty = true;
-    this.save(true);
-    return sent;
   }
 
   /** Pending digest items per vehicle (ops / tests). */
@@ -296,54 +316,86 @@ export class OwnershipRuntime {
     return Object.fromEntries(Object.entries(this.digest.items).map(([k, v]) => [k, v.length]));
   }
 
-  /** Run the REST pulls that are due (one pass over the cars). */
+  /**
+   * Run the REST pulls that are due (one pass over the cars). Each pull kind has its own try/catch,
+   * so one failure never stops the others. ANY error backs that kind off for PULL_RETRY_MS (the
+   * attempt time is persisted in CarState.pullFails), so a 404 or 500 is not retried every tick
+   * (each Fleet answer below 500 is billed). 429 / auth errors additionally pause every Fleet API
+   * pull (Retry-After, or 1 h); the public NHTSA recall lookup is not affected by that pause.
+   */
   async pullDue(): Promise<OwnershipEvent[]> {
     const r = this.cfg.rest;
     if (!r?.enabled || !this.rest) return [];
+    const rest = this.rest;
     const now = this.deps.now();
     const ts = new Date(now).toISOString();
     const events: OwnershipEvent[] = [];
     const hours = { service: r.service_h ?? 24, warranty: r.warranty_h ?? 168, recalls: r.recalls_h ?? 168, recent_alerts: r.recent_alerts_h ?? 0 };
+    type Kind = keyof typeof hours | "release_notes";
     for (const [vin, t] of this.trackers) {
       const pulls = (t.state.pulls ??= {});
-      const due = (k: keyof typeof hours) => hours[k] > 0 && now - (pulls[k] ?? 0) >= hours[k] * 3600_000;
-      try {
-        if (due("service")) {
-          const s = parseServiceData(await this.rest.serviceData(vin));
+      const fails = (t.state.pullFails ??= {});
+      const coolingDown = (k: Kind) => now - (fails[k] ?? -Infinity) < PULL_RETRY_MS;
+      const fleetPaused = () => now < this.restBackoffUntil;
+      const due = (k: keyof typeof hours) => hours[k] > 0 && now - (pulls[k] ?? 0) >= hours[k] * 3600_000 && !coolingDown(k);
+      const attempt = async (k: Kind, fleet: boolean, run: () => Promise<void>): Promise<void> => {
+        if (fleet && fleetPaused()) return;
+        try {
+          await run();
+          delete fails[k];
+        } catch (err) {
+          fails[k] = now;
+          const e = err instanceof EnergyApiError ? err : new EnergyApiError("fleet_api_unreachable");
+          this.ctx.audit({ action: "observe", outcome: "error", reason: e.code, type: `ownership_rest_${k}`, actor: vin, actorKeep: 6, status: e.status });
+          if (fleet && e.code === "rate_limited") this.restBackoffUntil = Math.max(this.restBackoffUntil, now + (e.retryAfterSec ?? 60) * 1000);
+          else if (fleet && ["unauthorized", "login_required", "missing_scope", "no_token"].includes(e.code)) this.restBackoffUntil = Math.max(this.restBackoffUntil, now + PULL_RETRY_MS);
+        }
+      };
+      if (due("service")) {
+        await attempt("service", true, async () => {
+          const s = parseServiceData(await rest.serviceData(vin));
           pulls.service = now;
           events.push(...t.serviceStatus(s.status, s.etc, ts));
-        }
-        if (due("warranty")) {
-          const w = parseWarranty(await this.rest.warranty(vin));
+        });
+      }
+      if (due("warranty")) {
+        await attempt("warranty", true, async () => {
+          const w = parseWarranty(await rest.warranty(vin));
           pulls.warranty = now;
           if (w.length) events.push(...t.warranty(w, ts));
-        }
-        if (due("recalls")) {
+        });
+      }
+      if (due("recalls")) {
+        await attempt("recalls", false, async () => {
           const dec = decodeTeslaVin(vin);
           const model = t.vehicle.model ?? dec.model;
           const year = t.vehicle.model_year ?? dec.modelYear;
+          if (!model || !year) {
+            pulls.recalls = now;
+            this.ctx.audit({ action: "observe", outcome: "skipped", reason: "recalls_model_unknown", actor: vin, actorKeep: 6 });
+            return;
+          }
+          const items = parseNhtsaRecalls(await rest.recalls(model, year));
           pulls.recalls = now;
-          if (model && year) events.push(...t.recalls(parseNhtsaRecalls(await this.rest.recalls(model, year)), ts));
-          else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "recalls_model_unknown", actor: vin });
-        }
-        if (due("recent_alerts")) {
-          const a = parseRecentAlerts(await this.rest.recentAlerts(vin));
+          events.push(...t.recalls(items, ts));
+        });
+      }
+      if (due("recent_alerts")) {
+        await attempt("recent_alerts", true, async () => {
+          const a = parseRecentAlerts(await rest.recentAlerts(vin));
           pulls.recent_alerts = now;
           events.push(...t.alerts(a, ts, "rest"));
-        }
-        const notesFor = this.pendingNotes.get(t.vehicle.vehicle_id);
-        if (notesFor) {
-          this.pendingNotes.delete(t.vehicle.vehicle_id);
-          events.push(...t.releaseNotes(notesFor, parseReleaseNotes(await this.rest.releaseNotes(vin)), ts));
-        }
-        t.prune(now);
-      } catch (err) {
-        const e = err instanceof EnergyApiError ? err : new EnergyApiError("fleet_api_unreachable");
-        this.ctx.audit({ action: "observe", outcome: "error", reason: e.code, type: "ownership_rest", actor: vin, status: e.status });
-        if (e.code === "rate_limited") this.restBackoffUntil = now + (e.retryAfterSec ?? 60) * 1000;
-        else if (["unauthorized", "login_required", "missing_scope", "no_token"].includes(e.code)) this.restBackoffUntil = now + 3600_000;
-        if (this.restBackoffUntil > now) break;
+        });
       }
+      const notesFor = this.pendingNotes.get(t.vehicle.vehicle_id);
+      if (notesFor && !coolingDown("release_notes")) {
+        await attempt("release_notes", true, async () => {
+          const notes = parseReleaseNotes(await rest.releaseNotes(vin));
+          this.pendingNotes.delete(t.vehicle.vehicle_id);
+          events.push(...t.releaseNotes(notesFor, notes, ts));
+        });
+      }
+      t.prune(now);
     }
     this.dirty = true;
     await this.emit(events);
@@ -358,9 +410,24 @@ export class OwnershipRuntime {
     } catch {
       return;
     }
-    if (raw?.version !== 1 || !raw.cars || typeof raw.cars !== "object") return;
-    this.cars = raw.cars;
-    if (raw.digest && typeof raw.digest === "object" && raw.digest.items) this.digest = raw.digest;
+    if (!raw || typeof raw !== "object" || raw.version !== 1 || !raw.cars || typeof raw.cars !== "object" || Array.isArray(raw.cars)) return;
+    // Shape-check everything read back: a malformed car or digest entry is dropped (one warning), never thrown on.
+    let dropped = 0;
+    const cars: Record<string, CarState> = {};
+    for (const [id, c] of Object.entries(raw.cars as Record<string, unknown>)) {
+      const clean = sanitizeCarState(c);
+      if (!clean || !/^[A-Za-z0-9_.-]{1,64}$/.test(id)) {
+        dropped++;
+        continue;
+      }
+      dropped += clean.dropped;
+      cars[id] = clean.state;
+    }
+    this.cars = cars;
+    const d = sanitizeDigest(raw.digest);
+    this.digest = d.digest;
+    dropped += d.dropped;
+    if (dropped) this.ctx.audit({ action: "observe", outcome: "error", reason: "ownership_state_malformed_dropped", count: dropped });
     this.ctx.audit({ action: "observe", outcome: "ok", reason: "ownership_state_restored", count: Object.keys(this.cars).length });
   }
 

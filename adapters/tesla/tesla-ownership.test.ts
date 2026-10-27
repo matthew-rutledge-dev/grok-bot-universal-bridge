@@ -22,6 +22,14 @@ import {
   TeslaAdapter,
   validateTeslaConfig,
   isTokenRef,
+  baseUrlProblem,
+  EnergyApiError,
+  FLEET_API_HOSTS,
+  FleetEnergyClient,
+  MAX_BODY_BYTES,
+  NHTSA_HOSTS,
+  OwnershipRestClient,
+  PULL_RETRY_MS,
   type CarState,
   type DigestState,
   type FetchLike,
@@ -330,7 +338,7 @@ function ownCfg(dir: string, patch: Partial<NonNullable<TeslaConfig["ownership"]
     ownership: {
       enabled: true,
       vehicles: [{ vin: CAR_A, vehicle_id: "car-a", label: "Model 3 Example" }, { vin: CAR_B, vehicle_id: "car-b" }],
-      ...(fetchRest ? { rest: { enabled: true, api_base: "https://fleet-api.example.com", token_ref: `file:${join(dir, "tok")}` } } : {}),
+      ...(fetchRest ? { rest: { enabled: true, api_base: "https://fleet-api.prd.na.vn.cloud.tesla.com", token_ref: `file:${join(dir, "tok")}` } } : {}),
       ...patch,
     },
     routes: [
@@ -452,7 +460,7 @@ test("ownership REST pull: service_data / warranty / NHTSA recalls / release not
     assert.equal(nhtsa.length, 2);
     assert.ok(nhtsa.every((c) => !c.auth && !c.url.includes(CAR_A) && !c.url.includes(CAR_B)), "no token, no VIN to NHTSA");
     assert.ok(nhtsa.some((c) => c.url.includes("model=MODEL+3&modelYear=2020")));
-    assert.ok(calls.filter((c) => c.url.startsWith("https://fleet-api.example.com")).every((c) => c.auth));
+    assert.ok(calls.filter((c) => c.url.startsWith("https://fleet-api.prd.na.vn.cloud.tesla.com")).every((c) => c.auth));
     assert.equal(calls.some((c) => /vehicle_data|wake_up|\/command\//.test(c.url)), false);
     // Nothing is due again within the interval.
     const n = calls.length;
@@ -488,4 +496,227 @@ test("rest.token_ref: env:NAME or file:<absolute path> (POSIX, Windows drive, UN
     assert.doesNotMatch(v({ ...ok, ownership: { ...ok.ownership!, rest: { ...ok.ownership!.rest!, token_ref: ref } } }), /token_ref/, ref);
   }
   assert.match(v({ ...ok, ownership: { ...ok.ownership!, rest: { ...ok.ownership!.rest!, token_ref: "file:tok" } } }), /rest\.token_ref must be env:NAME or file:\/path/);
+});
+
+// ---------- review fixes: pull backoff, host allowlist, redirects, body cap, state shape, parsers ----------
+
+test("REST pulls: ANY error backs that kind off ~1 h (persisted); a warranty 404 is not retried next tick; recalls and release notes still run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "own-backoff-"));
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(join(dir, "tok"), "dummy-access\n");
+  let clock = T0;
+  const calls: string[] = [];
+  const fetchImpl: FetchLike = async (url) => {
+    calls.push(url);
+    if (url.includes("/dx/warranty/details")) return { status: 404, headers: { get: () => null }, text: async () => '{"error":"not_found"}' };
+    let body: unknown = {};
+    if (url.includes("/service_data")) body = { response: { service_status: "not_in_service" } };
+    else if (url.includes("recallsByVehicle")) body = { results: [{ NHTSACampaignNumber: "26V000000" }] };
+    else if (url.includes("/release_notes")) body = { response: { release_notes: [{ title: "Example feature" }] } };
+    return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify(body) };
+  };
+  const td = teardown();
+  try {
+    const m = td.add(await mockRoutine({ key: "routine-key" }), (x) => x.close());
+    const cfg = ownCfg(dir, { vehicles: [{ vin: CAR_A, vehicle_id: "car-a" }] }, true);
+    const a = td.add(new TeslaAdapter(cfg, { now: () => clock, pollOnStart: false, fetchImpl }), (x) => x.stop());
+    const b = td.add(await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") }), (x) => x.close());
+    const rt = a.ownershipRuntime()!;
+    const n = (s: string) => calls.filter((u) => u.includes(s)).length;
+    const first = await rt.pullDue();
+    assert.equal(n("/dx/warranty/details"), 1);
+    assert.deepEqual(first.map((e) => e.event_type), ["recall"], "the warranty 404 did not stop the recall pull");
+    assert.ok(b.audit.lines.some((l) => l.reason === "fleet_api_error" && l.type === "ownership_rest_warranty" && l.status === 404));
+    // A version change queues release notes; next tick (1 min later): no warranty retry, notes still fetched.
+    await rt.record({ vin: CAR_A, createdAt: iso(clock), data: { Version: "2026.32.1" } }, false);
+    await rt.record({ vin: CAR_A, createdAt: iso(clock + 1000), data: { Version: "2026.38.2" } }, false);
+    clock += 60_000;
+    await rt.tick();
+    assert.equal(n("/dx/warranty/details"), 1, "a 404 is not retried on the next tick");
+    assert.equal(n("/release_notes"), 1, "release notes still run");
+    // Many ticks within the hour: still one warranty call (not ~1 per minute).
+    for (let i = 0; i < 50; i++) {
+      clock += 60_000;
+      await rt.tick();
+    }
+    assert.equal(n("/dx/warranty/details"), 1);
+    // The failed attempt time is persisted and survives a restart.
+    await a.stop();
+    const st = JSON.parse(readFileSync(join(dir, "tesla-ownership-state.json"), "utf8"));
+    assert.equal(st.cars["car-a"].pullFails.warranty, T0);
+    const a2 = td.add(new TeslaAdapter(cfg, { now: () => clock, pollOnStart: false, fetchImpl }), (x) => x.stop());
+    td.add(await startBridge({ routineUrl: m.url, adapters: [a2], holdFile: join(dir, "hold.json") }), (x) => x.close());
+    await a2.ownershipRuntime()!.pullDue();
+    assert.equal(n("/dx/warranty/details"), 1, "still backing off after a restart");
+    // After the hour: retried once.
+    clock = T0 + PULL_RETRY_MS + 1;
+    await a2.ownershipRuntime()!.pullDue();
+    assert.equal(n("/dx/warranty/details"), 2);
+  } finally {
+    await td.run();
+  }
+});
+
+/** A base URL carrying credentials (built with the URL API so no credential-looking literal sits in the repo). */
+const withUser = (raw: string) => {
+  const u = new URL(raw);
+  u.username = "someone";
+  return u.href;
+};
+
+test("REST hosts: api_base only the Fleet API regional hosts, nhtsa_base only api.nhtsa.gov (config and clients, energy too)", () => {
+  for (const h of FLEET_API_HOSTS) {
+    assert.equal(baseUrlProblem(`https://${h}`, FLEET_API_HOSTS, "x"), undefined, h);
+    assert.equal(baseUrlProblem(`https://${h}/`, FLEET_API_HOSTS, "x"), undefined, h);
+  }
+  for (const bad of ["https://fleet-api.example.com", "https://fleet-api.prd.na.vn.cloud.tesla.com.example.com", "http://fleet-api.prd.na.vn.cloud.tesla.com",
+    withUser("https://fleet-api.prd.na.vn.cloud.tesla.com"), "https://fleet-api.prd.na.vn.cloud.tesla.com:8443", "https://fleet-api.prd.na.vn.cloud.tesla.com/api", "not a url"]) {
+    assert.ok(baseUrlProblem(bad, FLEET_API_HOSTS, "x"), bad);
+  }
+  assert.equal(baseUrlProblem("https://api.nhtsa.gov", NHTSA_HOSTS, "x"), undefined);
+  assert.ok(baseUrlProblem("https://nhtsa.example.com", NHTSA_HOSTS, "x"));
+  const tok = () => "t";
+  assert.throws(() => new OwnershipRestClient({ apiBase: "https://fleet-api.example.com", getToken: tok }), /api_base must be one of/);
+  assert.throws(() => new OwnershipRestClient({ apiBase: "https://fleet-api.prd.eu.vn.cloud.tesla.com", nhtsaBase: "https://nhtsa.example.com", getToken: tok }), /nhtsa_base must be one of/);
+  assert.throws(() => new FleetEnergyClient({ apiBase: "https://fleet-api.example.com", getToken: tok }), /api_base must be one of/);
+  // The test-only override is the only way to another host.
+  assert.doesNotThrow(() => new OwnershipRestClient({ apiBase: "http://127.0.0.1:1", nhtsaBase: "http://127.0.0.1:1", getToken: tok, testHosts: { hosts: ["127.0.0.1"], allowHttp: true } }));
+  const ok = ownCfg(tmpdir(), {}, true);
+  const v = (c: TeslaConfig) => validateTeslaConfig(c).join("\n");
+  assert.match(v({ ...ok, ownership: { ...ok.ownership!, rest: { ...ok.ownership!.rest!, api_base: "https://fleet-api.example.com" } } }), /rest\.api_base must be one of/);
+  assert.match(v({ ...ok, ownership: { ...ok.ownership!, rest: { ...ok.ownership!.rest!, nhtsa_base: "https://nhtsa.example.com" } } }), /rest\.nhtsa_base must be one of/);
+  assert.match(v({ ...example, energy_poll: { ...example.energy_poll!, api_base: "https://fleet-api.example.com" } }), /energy_poll\.api_base must be one of/);
+});
+
+test("REST guard: redirects are refused (never followed) and bodies over the cap are aborted mid-stream (ownership + energy clients)", async () => {
+  const { createServer } = await import("node:http");
+  let followed = 0;
+  const BIG = 64 * 1024 * 1024;
+  const big: Array<{ written: number; finished: boolean; closed: boolean }> = [];
+  const server = createServer((req, res) => {
+    const u = req.url ?? "";
+    if (u.includes("/followed")) {
+      followed++;
+      res.end("{}");
+    } else if (u.includes("/service_data") || u.includes("live_status")) {
+      res.writeHead(302, { location: "/followed" }).end();
+    } else if (u.includes("recent_alerts")) {
+      res.writeHead(200, { "content-length": String(5 * 1024 * 1024) }).write("{");
+    } else {
+      // 64 MiB in 64 KiB chunks, no content-length: the client must stop reading past 1 MiB.
+      const st = { written: 0, finished: false, closed: false };
+      big.push(st);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.on("close", () => (st.closed = true));
+      const chunk = Buffer.alloc(64 * 1024, 0x20);
+      const pump = () => {
+        while (st.written < BIG && !st.closed) {
+          st.written += chunk.length;
+          if (!res.write(chunk)) return void res.once("drain", pump);
+        }
+        if (!st.closed) {
+          st.finished = true;
+          res.end();
+        }
+      };
+      pump();
+    }
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const testHosts = { hosts: ["127.0.0.1"], allowHttp: true };
+  try {
+    const own = new OwnershipRestClient({ apiBase: base, nhtsaBase: base, getToken: () => "t", testHosts });
+    await assert.rejects(own.serviceData(CAR_A), (e: EnergyApiError) => e.code === "redirect_refused");
+    const energy = new FleetEnergyClient({ apiBase: base, getToken: () => "t", testHosts });
+    await assert.rejects(energy.liveStatus("1111"), (e: EnergyApiError) => e.code === "redirect_refused");
+    assert.equal(followed, 0, "a redirect target is never requested");
+    await assert.rejects(own.warranty(CAR_A), (e: EnergyApiError) => e.code === "response_too_large");
+    await assert.rejects(energy.backupReserve("1111"), (e: EnergyApiError) => e.code === "response_too_large");
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(big.length, 2);
+    assert.ok(big.every((b) => b.closed && !b.finished && b.written < BIG), "each oversize response was aborted before the server finished");
+    // A declared Content-Length over the cap is refused before reading the body.
+    await assert.rejects(own.recentAlerts(CAR_A), (e: EnergyApiError) => e.code === "response_too_large");
+    // Mocked fetch: a 3xx answer is refused too, and a text() body over the cap is rejected.
+    const r3 = new OwnershipRestClient({ apiBase: "https://fleet-api.prd.na.vn.cloud.tesla.com", getToken: () => "t", fetchImpl: async () => ({ status: 301, headers: { get: () => null }, text: async () => "" }) });
+    await assert.rejects(r3.warranty(CAR_A), (e: EnergyApiError) => e.code === "redirect_refused");
+    const huge = new OwnershipRestClient({ apiBase: "https://fleet-api.prd.na.vn.cloud.tesla.com", getToken: () => "t", fetchImpl: async () => ({ status: 200, headers: { get: () => null }, text: async () => "x".repeat(MAX_BODY_BYTES + 1) }) });
+    await assert.rejects(huge.warranty(CAR_A), (e: EnergyApiError) => e.code === "response_too_large");
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("state file: malformed car and digest entries are dropped with one warning; ticks and flushDigest keep working", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "own-badstate-"));
+  const { writeFileSync } = await import("node:fs");
+  const good = { vehicle_id: "car-b", vin_last6: "000002", model: "Model Y", ts: iso(T0), source: "telemetry", event_type: "odometer_milestone", tier: "digest", priority: "normal", dedupe_key: "odometer_milestone:21000", data: { milestone_mi: 21000 } };
+  writeFileSync(join(dir, "tesla-ownership-state.json"), JSON.stringify({
+    version: 1,
+    cars: { "car-a": "str", "car-b": { odometer: "not a number", odoMilestone: 21000, pulls: { service: "x" }, emitted: { "odometer_milestone:21000": T0 } }, "bad id!": {} },
+    digest: { next_at: T0 + 3600_000, items: { "car-a": "nope", "car-b": [good, null, 5, { vehicle_id: "car-b" }] } },
+  }));
+  let clock = T0;
+  const td = teardown();
+  try {
+    const m = td.add(await mockRoutine({ key: "routine-key" }), (x) => x.close());
+    const a = td.add(new TeslaAdapter(ownCfg(dir), { now: () => clock, pollOnStart: false }), (x) => x.stop());
+    const b = td.add(await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") }), (x) => x.close());
+    const rt = a.ownershipRuntime()!;
+    const warn = b.audit.lines.filter((l) => l.reason === "ownership_state_malformed_dropped");
+    assert.equal(warn.length, 1, "one warning");
+    assert.ok((warn[0].count as number) >= 6);
+    assert.deepEqual(rt.pending(), { "car-b": 1 });
+    // Car A (dropped) works from a fresh state; car B kept its valid fields (milestone dedupe).
+    await rt.record({ vin: CAR_A, createdAt: iso(clock), data: { Odometer: 999 } }, false);
+    await rt.record({ vin: CAR_A, createdAt: iso(clock + 1000), data: { Odometer: 1000.5 } }, false);
+    await rt.record({ vin: CAR_B, createdAt: iso(clock + 2000), data: { Odometer: 21000.5 } }, false);
+    assert.deepEqual(rt.pending(), { "car-b": 1, "car-a": 1 });
+    clock = T0 + 3600_000 + 1;
+    await rt.tick();
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(m.hits.length, 2, "one digest per car");
+    assert.deepEqual(rt.pending(), { "car-b": 0, "car-a": 0 });
+    assert.equal(await rt.flushDigest(), 0);
+  } finally {
+    await td.run();
+  }
+});
+
+test("flushDigest is under an overlap guard: two at once send each car's digest once", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "own-overlap-"));
+  let clock = T0;
+  const td = teardown();
+  try {
+    const m = td.add(await mockRoutine({ key: "routine-key" }), (x) => x.close());
+    const a = td.add(new TeslaAdapter(ownCfg(dir), { now: () => clock, pollOnStart: false }), (x) => x.stop());
+    td.add(await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") }), (x) => x.close());
+    const rt = a.ownershipRuntime()!;
+    await rt.record({ vin: CAR_A, createdAt: iso(clock), data: { Odometer: 999 } }, false);
+    await rt.record({ vin: CAR_A, createdAt: iso(clock + 1000), data: { Odometer: 1000.5 } }, false);
+    const [x, y] = await Promise.all([rt.flushDigest(), rt.flushDigest()]);
+    assert.deepEqual([x, y].sort(), [0, 1]);
+    clock = nextDigestAt(T0, 0, 13) + 1;
+    await Promise.all([rt.tick(), rt.tick()]);
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(m.hits.length, 1);
+  } finally {
+    await td.run();
+  }
+});
+
+test("parseNhtsaRecalls skips null and non-object entries", () => {
+  assert.deepEqual(parseNhtsaRecalls({ results: [null, 5, "x", [], { NHTSACampaignNumber: "26V000000" }, undefined] }).map((r) => r.campaign), ["26V000000"]);
+  assert.deepEqual(parseNhtsaRecalls(null), []);
+  assert.deepEqual(parseNhtsaRecalls({ results: null }), []);
+});
+
+test("rest.token_ref refuses any whitespace or control character", () => {
+  for (const bad of ["file:\t/run/tok", "file:/run/tok\n", "file:/run/\ntok", " env:TOKEN", "env:TOKEN ", "env:TOK\u0000EN", "file:/run/t ok", "file:C:\\Program Files\\tok", "file:/run/tok\u2028", "file:/run/tok\u0085", "env:TOKEN\r"]) {
+    assert.equal(isTokenRef(bad), false, JSON.stringify(bad));
+  }
+  const ok = ownCfg(tmpdir(), {}, true);
+  assert.match(validateTeslaConfig({ ...ok, ownership: { ...ok.ownership!, rest: { ...ok.ownership!.rest!, token_ref: "file:\t/run/tok" } } }).join("\n"), /rest\.token_ref must be env:NAME or file:\/path/);
 });

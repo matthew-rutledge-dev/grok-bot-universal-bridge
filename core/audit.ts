@@ -37,6 +37,8 @@ export interface AuditEntry {
   eventId?: string;
   lane?: string;
   actor?: string;
+  /** Characters of the actor kept when masking (default 4). The Tesla adapter keeps 6 of a VIN, matching vin_last6 in its prompts. */
+  actorKeep?: 4 | 6;
   /** Short event type (e.g. charge_complete). */
   type?: string;
   status?: number;
@@ -65,7 +67,7 @@ export function auditLine(entry: AuditEntry, now = new Date()): Record<string, u
   }
   for (const k of MASK) {
     const v = src[k];
-    if (typeof v === "string" && v) out[k] = maskId(v);
+    if (typeof v === "string" && v) out[k] = maskId(v, k === "actor" && entry.actorKeep === 6 ? 6 : 4);
   }
   return out;
 }

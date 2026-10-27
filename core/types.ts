@@ -18,6 +18,8 @@ export interface InboundEvent {
   lane: string;
   /** Who caused it (user id, client id, vehicle id). Checked against the route's allowActors. */
   actor: string;
+  /** Characters of the actor kept in audit lines (default 4; the Tesla adapter uses 6 for VINs). */
+  actorKeep?: 4 | 6;
   /** Optional groups the actor belongs to (roles). Checked against route.allowGroups. */
   actorGroups?: string[];
   /** Fields the route table matches on, e.g. { guild, channel }. Exact match only. */

@@ -227,7 +227,7 @@ export class Bridge {
   async submit(adapter: SourceAdapter, event: InboundEvent): Promise<SubmitResult> {
     const ev: InboundEvent = { ...event, adapter: adapter.name };
     const id = `${adapter.name}:${ev.eventId}`;
-    const base = { adapter: adapter.name, action: "inbound" as const, eventId: id, lane: ev.lane, actor: ev.actor };
+    const base = { adapter: adapter.name, action: "inbound" as const, eventId: id, lane: ev.lane, actor: ev.actor, ...(ev.actorKeep ? { actorKeep: ev.actorKeep } : {}) };
     const deny = (reason: DenyReason, extra?: Partial<AuditEntry>): SubmitResult => {
       this.opts.audit.write({ ...base, outcome: "deny", reason, ...extra });
       return { accepted: false, reason };

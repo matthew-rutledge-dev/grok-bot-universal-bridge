@@ -162,6 +162,8 @@ export interface CarState {
   warrantyHash?: string;
   /** Last REST pull per kind (ms). */
   pulls?: Record<string, number>;
+  /** Last FAILED REST pull attempt per kind (ms); that kind backs off for an hour after it. */
+  pullFails?: Record<string, number>;
   /** Dedupe keys already emitted (key -> ms), pruned after 400 days. */
   emitted?: Record<string, number>;
 }
@@ -613,6 +615,7 @@ export function parseNhtsaRecalls(body: unknown): RecallItem[] {
   if (!Array.isArray(results)) return [];
   const out: RecallItem[] = [];
   for (const r of results) {
+    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
     const o = r as Record<string, unknown>;
     const campaign = typeof o.NHTSACampaignNumber === "string" ? o.NHTSACampaignNumber.trim() : "";
     if (!/^[A-Z0-9]{5,16}$/i.test(campaign)) continue;
@@ -705,6 +708,70 @@ export interface DigestState {
 }
 
 export const DIGEST_MAX_ITEMS = 200;
+
+type FieldKind = "string" | "number" | "boolean" | "strings" | "numbers" | "strmap" | "boolmap" | "chargeAlert";
+/** Expected type of every persisted CarState field (used to shape-check the state file on load). */
+const CAR_FIELDS: Record<keyof CarState, FieldKind> = {
+  version: "string", swTarget: "string", swPhase: "string", swInstallPct: "number", swSeen: "boolean",
+  odoMilestone: "number", odometer: "number", serviceMode: "boolean", serviceStatus: "string",
+  tpmsBand: "strmap", tpmsSoft: "boolmap", tpmsHard: "boolmap",
+  charge: "string", chargeEnable: "boolean", chargeLimit: "number", battery: "number", ratedRange: "number",
+  energyRemaining: "number", nominalFullPack: "number", bms: "string", hvil: "string", sentry: "string",
+  aebOff: "boolean", carType: "string", trim: "string", hvMonth: "string",
+  alertsActive: "strings", alertsEnded: "strings", lastChargeAlert: "chargeAlert",
+  recalls: "strings", recallsBaselined: "boolean", warrantyHash: "string",
+  pulls: "numbers", pullFails: "numbers", emitted: "numbers",
+};
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const fin = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+function fieldOk(kind: FieldKind, v: unknown): boolean {
+  switch (kind) {
+    case "string": return typeof v === "string" && v.length <= 400;
+    case "number": return fin(v);
+    case "boolean": return typeof v === "boolean";
+    case "strings": return Array.isArray(v) && v.length <= 2000 && v.every((x) => typeof x === "string" && x.length <= 400);
+    case "numbers": return isObj(v) && Object.values(v).every(fin);
+    case "strmap": return isObj(v) && Object.values(v).every((x) => typeof x === "string");
+    case "boolmap": return isObj(v) && Object.values(v).every((x) => typeof x === "boolean");
+    case "chargeAlert": return isObj(v) && typeof v.name === "string" && fin(v.at);
+  }
+}
+
+/** A persisted car entry, shape-checked: unknown or mistyped fields are dropped (counted); a non-object is rejected. */
+export function sanitizeCarState(raw: unknown): { state: CarState; dropped: number } | undefined {
+  if (!isObj(raw)) return undefined;
+  const state: Record<string, unknown> = {};
+  let dropped = 0;
+  for (const [k, v] of Object.entries(raw)) {
+    const kind = (CAR_FIELDS as Record<string, FieldKind | undefined>)[k];
+    if (kind && fieldOk(kind, v)) state[k] = v;
+    else dropped++;
+  }
+  return { state: state as CarState, dropped };
+}
+
+/** A persisted digest, shape-checked: each list must be an array of event envelopes; anything else is dropped (counted). */
+export function sanitizeDigest(raw: unknown): { digest: DigestState; dropped: number } {
+  const digest: DigestState = { items: {} };
+  let dropped = 0;
+  if (!isObj(raw)) return { digest, dropped: raw === undefined ? 0 : 1 };
+  if (fin(raw.next_at)) digest.next_at = raw.next_at as number;
+  if (raw.items !== undefined && !isObj(raw.items)) dropped++;
+  for (const [id, list] of Object.entries(isObj(raw.items) ? raw.items : {})) {
+    if (!Array.isArray(list)) {
+      dropped++;
+      continue;
+    }
+    const ok = list.filter(
+      (e): e is OwnershipEvent =>
+        isObj(e) && typeof e.vehicle_id === "string" && typeof e.event_type === "string" && typeof e.dedupe_key === "string"
+        && typeof e.ts === "string" && typeof e.vin_last6 === "string" && (e.tier === "immediate" || e.tier === "digest") && isObj(e.data),
+    );
+    dropped += list.length - ok.length;
+    digest.items[id] = ok.slice(-DIGEST_MAX_ITEMS);
+  }
+  return { digest, dropped };
+}
 
 export function addToDigest(d: DigestState, e: OwnershipEvent): void {
   const list = (d.items[e.vehicle_id] ??= []);

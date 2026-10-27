@@ -209,7 +209,7 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
 
     assert.deepEqual(await a.ingestTelemetry({ vin: "OTHERVIN000000009", createdAt: "x", data: { DetailedChargeState: "Complete" } }), []);
     assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false);
-    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…0009"));
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…000009"), "audit keeps the last 6 of a VIN, like vin_last6");
     const cb = await b.call("POST", "/tesla/callback", {});
     assert.equal(cb.status, 404, "no tesla callback route: replies use the origin channel");
   } finally {

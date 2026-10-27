@@ -17,6 +17,8 @@ const ALLOWED_HOSTS = [
   /(^|\.)example\.(com|org|net)$/, /\.(test|invalid)$/, /^127\.0\.0\.1$/, /^localhost$/, /^\[::1\]$/,
   /^github\.com$/, /^docs\.github\.com$/, /^nodejs\.org$/, /^discord\.com$/, /^developer\.tesla\.com$/,
   /^api\.nhtsa\.gov$/,
+  // Public Fleet API regional base hosts (documented on developer.tesla.com; the bridge allowlists exactly these).
+  /^fleet-api\.prd\.(na|eu)\.vn\.cloud\.tesla\.com$/, /^fleet-api\.prd\.cn\.vn\.cloud\.tesla\.cn$/,
 ];
 const placeholderNum = (n) => /^(\d)\1+$/.test(n) || /^[1-9]0+\d{0,2}$/.test(n);
 const checks = [

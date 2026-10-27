@@ -56,7 +56,7 @@ Ground rules:
 ## 5. Bridge config (host-only `config/tesla.json`)
 
 - [ ] Start from `adapters/tesla/config.example.json`. Set `telemetry.mode: "mqtt"`, `telemetry.mqtt.broker` (a literal loopback or LAN URL such as `mqtt://<broker-host>:1883`, or an `env:` / `file:` ref), `client_id`, `topic_base`, `username_ref` / `password_ref` (refs to the `bridge` broker user), `vin_allowlist`, `rules` and `routes` (route `agent` = the registry alias that should wake).
-- [ ] `energy_poll`: `site_allowlist`, `api_base` (your region's Fleet API base URL) and `token_ref` from step 4.
+- [ ] `energy_poll`: `site_allowlist`, `api_base` (your region's Fleet API base URL: `https://fleet-api.prd.na.vn.cloud.tesla.com`, `…eu…` or `https://fleet-api.prd.cn.vn.cloud.tesla.cn`; other hosts are refused) and `token_ref` from step 4.
 - [ ] If the broker is a compose service, put the bridge on the same compose network and use the service name (`mqtt://mosquitto:1883`). Single-label names are accepted as LAN.
 - [ ] In `config/bridge.json`, set `adapters.tesla.enabled: true` (telemetry first: leave `energy_poll.enabled: false` until step 6 passes).
 - [ ] Ownership events (optional): `ownership.enabled: true`, `ownership.vehicles` (one entry per car, VINs also in `vin_allowlist`), a route with `match: { "kind": "ownership" }` whose `agent` is the alias that should get them, and `ownership.rest` (`api_base`, `token_ref`) for recalls / warranty / service status.
