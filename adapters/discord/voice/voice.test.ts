@@ -204,3 +204,79 @@ test("voice is off unless enabled; channel ids are validated", async () => {
   }
   assert.match(validateDiscordConfig({ ...example, voice: { enabled: true, channels: ["general"] } }).join(), /voice.channels must be voice channel ids/);
 });
+
+// ---- review nits ----
+import { MAX_LAYERS } from "./mix.js";
+import { MAX_PIPER_BYTES } from "./engines.js";
+import { guardVoice } from "./guard.js";
+import { FakeVoicePort } from "../../../test/helpers.js";
+
+test("nit 4: a stream holds at most 16 layers (400 too_many_layers); replacing an id is fine", async () => {
+  assert.equal(MAX_LAYERS, 16);
+  const m = new PcmMixer();
+  for (let i = 0; i < 16; i++) m.add({ id: `l${i}`, pcm: Buffer.alloc(FRAME_BYTES), loop: true, gain: 1 });
+  assert.throws(() => m.add({ id: "l16", pcm: Buffer.alloc(FRAME_BYTES), loop: true, gain: 1 }), /too_many_layers/);
+  m.add({ id: "l3", pcm: Buffer.alloc(FRAME_BYTES), loop: false, gain: 1 });
+  const s = await setup({ ...example.voice, enabled: true });
+  try {
+    await s.b.call("POST", "/discord/voice/stream", { op: "open", channelId: VCH }, auth);
+    const w = wav(48000, 2, Array(8).fill(1)).toString("base64");
+    for (let i = 0; i < 16; i++) assert.equal((await s.b.call("POST", "/discord/voice/stream", { op: "add", id: `l${i}`, audioBase64: w }, auth)).status, 200);
+    const over = await s.b.call("POST", "/discord/voice/stream", { op: "add", id: "l16", audioBase64: w }, auth);
+    assert.deepEqual([over.status, over.body.error], [400, "too_many_layers"]);
+  } finally {
+    await s.close();
+  }
+});
+
+test("nit 5: busy lock: concurrent play/open answer 409 voice_busy and never leak a stream", async () => {
+  const s = await setup({ ...example.voice, enabled: true });
+  try {
+    let release!: () => void;
+    s.port.voice.gate = new Promise<void>((r) => (release = r));
+    const slowPlay = s.b.call("POST", "/discord/voice/play", { channelId: VCH }, auth);
+    await new Promise((r) => setTimeout(r, 30));
+    const open = await s.b.call("POST", "/discord/voice/stream", { op: "open", channelId: VCH }, auth);
+    const play2 = await s.b.call("POST", "/discord/voice/play", { channelId: VCH }, auth);
+    const close = await s.b.call("POST", "/discord/voice/stream", { op: "close" }, auth);
+    assert.deepEqual([open.status, open.body.error, play2.status, play2.body.error, close.status], [409, "voice_busy", 409, "voice_busy", 409]);
+    release();
+    assert.equal((await slowPlay).status, 200);
+    s.port.voice.gate = new Promise<void>((r) => (release = r));
+    const slowOpen = s.b.call("POST", "/discord/voice/stream", { op: "open", channelId: VCH }, auth);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal((await s.b.call("POST", "/discord/voice/stream", { op: "open", channelId: VCH }, auth)).body.error, "voice_busy");
+    release();
+    assert.equal((await slowOpen).status, 200);
+    assert.equal(s.port.voice.streams.length, 1, "exactly one stream opened");
+  } finally {
+    await s.close();
+  }
+  // Gateway-side backstop: no play while a stream is open, no two joins at once.
+  const raw = new FakeVoicePort();
+  const v = guardVoice(raw);
+  const h = await v.openStream(VCH, () => Buffer.alloc(FRAME_BYTES));
+  await assert.rejects(v.play(VCH, Buffer.alloc(4)), /voice_busy/);
+  await assert.rejects(v.openStream(VCH, () => Buffer.alloc(FRAME_BYTES)), /voice_busy/);
+  h.close();
+  h.close();
+  await v.play(VCH, Buffer.alloc(4));
+  let release!: () => void;
+  raw.gate = new Promise<void>((r) => (release = r));
+  const p1 = v.play(VCH, Buffer.alloc(4));
+  await assert.rejects(v.openStream(VCH, () => Buffer.alloc(FRAME_BYTES)), /voice_busy/);
+  release();
+  await p1;
+  assert.equal(raw.played.length, 2);
+});
+
+test("nit 9: the Piper receive buffer is capped", async () => {
+  assert.equal(MAX_PIPER_BYTES, 16 * 1024 * 1024);
+  const piper = await mockPiper();
+  try {
+    await assert.rejects(synthesizePiper("hello", "127.0.0.1", piper.port, 5000, 1024), /piper_too_large/);
+    assert.equal((await synthesizePiper("hello", "127.0.0.1", piper.port)).pcm.length, 4800);
+  } finally {
+    await piper.close();
+  }
+});

@@ -1,5 +1,6 @@
 import { Readable } from "node:stream";
 import type { DiscordPort, IncomingDiscordMessage, OutgoingFile, VoicePort } from "./port.js";
+import { guardVoice } from "./voice/guard.js";
 import { FRAME_BYTES } from "./voice/mix.js";
 
 /**
@@ -43,53 +44,56 @@ export async function createGatewayPort(): Promise<DiscordPort> {
     return ch;
   }
 
-  const voice: VoicePort = {
-    async play(channelId, pcm) {
-      const ch = await voiceChannel(channelId);
-      const v = await import("@discordjs/voice");
-      const connection = v.joinVoiceChannel({ channelId: ch.id, guildId: ch.guild.id, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true });
-      const seconds = pcm.length / (48000 * 4);
-      try {
-        await v.entersState(connection, v.VoiceConnectionStatus.Ready, 15_000);
-        const player = v.createAudioPlayer();
-        connection.subscribe(player);
-        player.play(v.createAudioResource(Readable.from(pcm), { inputType: v.StreamType.Raw }));
-        await v.entersState(player, v.AudioPlayerStatus.Playing, 10_000);
-        await v.entersState(player, v.AudioPlayerStatus.Idle, Math.max(15_000, Math.ceil(seconds * 1000) + 5_000));
-      } finally {
-        connection.destroy();
-      }
-    },
-    async openStream(channelId, nextFrame) {
-      const ch = await voiceChannel(channelId);
-      const v = await import("@discordjs/voice");
-      const connection = v.joinVoiceChannel({ channelId: ch.id, guildId: ch.guild.id, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true });
-      const stream = new Readable({ read() {} });
+  // One guild voice connection is shared: guardVoice refuses (voice_busy) a play
+  // while a stream is open or a join is in flight.
+  const voice: VoicePort = guardVoice({ play: playNow, openStream: openNow });
+
+  async function playNow(channelId: string, pcm: Buffer) {
+    const ch = await voiceChannel(channelId);
+    const v = await import("@discordjs/voice");
+    const connection = v.joinVoiceChannel({ channelId: ch.id, guildId: ch.guild.id, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true });
+    const seconds = pcm.length / (48000 * 4);
+    try {
+      await v.entersState(connection, v.VoiceConnectionStatus.Ready, 15_000);
       const player = v.createAudioPlayer();
-      try {
-        await v.entersState(connection, v.VoiceConnectionStatus.Ready, 15_000);
-        connection.subscribe(player);
-        stream.push(Buffer.alloc(FRAME_BYTES));
-        player.play(v.createAudioResource(stream, { inputType: v.StreamType.Raw }));
-        await v.entersState(player, v.AudioPlayerStatus.Playing, 10_000);
-      } catch (err) {
+      connection.subscribe(player);
+      player.play(v.createAudioResource(Readable.from(pcm), { inputType: v.StreamType.Raw }));
+      await v.entersState(player, v.AudioPlayerStatus.Playing, 10_000);
+      await v.entersState(player, v.AudioPlayerStatus.Idle, Math.max(15_000, Math.ceil(seconds * 1000) + 5_000));
+    } finally {
+      connection.destroy();
+    }
+  }
+
+  async function openNow(channelId: string, nextFrame: () => Buffer) {
+    const ch = await voiceChannel(channelId);
+    const v = await import("@discordjs/voice");
+    const connection = v.joinVoiceChannel({ channelId: ch.id, guildId: ch.guild.id, adapterCreator: ch.guild.voiceAdapterCreator, selfDeaf: true });
+    const stream = new Readable({ read() {} });
+    const player = v.createAudioPlayer();
+    try {
+      await v.entersState(connection, v.VoiceConnectionStatus.Ready, 15_000);
+      connection.subscribe(player);
+      stream.push(Buffer.alloc(FRAME_BYTES));
+      player.play(v.createAudioResource(stream, { inputType: v.StreamType.Raw }));
+      await v.entersState(player, v.AudioPlayerStatus.Playing, 10_000);
+    } catch (err) {
+      connection.destroy();
+      stream.destroy();
+      throw err;
+    }
+    const timer = setInterval(() => {
+      if (!stream.push(nextFrame())) stream.resume();
+    }, 20);
+    timer.unref?.();
+    return {
+      close() {
+        clearInterval(timer);
+        stream.push(null);
         connection.destroy();
-        stream.destroy();
-        throw err;
-      }
-      const timer = setInterval(() => {
-        if (!stream.push(nextFrame())) stream.resume();
-      }, 20);
-      timer.unref?.();
-      return {
-        close() {
-          clearInterval(timer);
-          stream.push(null);
-          connection.destroy();
-        },
-      };
-    },
-  };
+      },
+    };
+  }
 
   return {
     voice,

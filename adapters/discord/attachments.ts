@@ -1,3 +1,6 @@
+import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
+
 /**
  * Attachment rules, ported from the existing Discord bridge.
  *
@@ -120,6 +123,14 @@ export function normalizeMime(raw: string | undefined, filename: string): string
   return base || "application/octet-stream";
 }
 
+/** Refused by extension whatever MIME type the caller claims. */
+export const BLOCKED_EXTENSIONS = [".exe", ".msi", ".dmg", ".iso", ".appimage", ".bat", ".cmd", ".scr", ".com"] as const;
+
+export function assertExtensionAllowed(filename: string): void {
+  const lower = filename.trim().toLowerCase().replace(/[.\s]+$/, "");
+  if (BLOCKED_EXTENSIONS.some((ext) => lower.endsWith(ext))) throw new AttachmentError("unsupported_media_type", "blocked extension");
+}
+
 export function assertMimeAllowed(contentType: string): void {
   const base = contentType.split(";")[0].trim().toLowerCase();
   if (!ALLOWED_MIME.has(base)) throw new AttachmentError("unsupported_media_type");
@@ -153,17 +164,18 @@ function filenameFromUrl(urlStr: string): string {
   return "attachment.bin";
 }
 
-export function decodeBase64Attachment(input: JsonAttachmentInput): ResolvedAttachment {
+export function decodeBase64Attachment(input: JsonAttachmentInput, maxBytes = MAX_ATTACHMENT_BYTES): ResolvedAttachment {
   if (typeof input.data !== "string" || !input.data.trim()) throw new AttachmentError("invalid_attachment", "data required");
   if (typeof input.filename !== "string" || !input.filename.trim()) throw new AttachmentError("invalid_attachment", "filename required for data");
   const filename = safeFilename(input.filename, "file.bin");
+  assertExtensionAllowed(filename);
   const raw = input.data.trim().replace(/^data:[^;]+;base64,/i, "");
   if (!/^[A-Za-z0-9+/=\s_-]+$/.test(raw)) throw new AttachmentError("invalid_attachment", "invalid base64");
   // Reject before decoding when the encoded size already exceeds the cap.
-  if (Math.floor((raw.length * 3) / 4) > MAX_ATTACHMENT_BYTES + 3) throw new AttachmentError("attachment_too_large");
+  if (Math.floor((raw.length * 3) / 4) > maxBytes + 3) throw new AttachmentError("attachment_too_large");
   const buffer = Buffer.from(raw, "base64");
   if (buffer.length === 0) throw new AttachmentError("invalid_attachment", "empty data");
-  if (buffer.length > MAX_ATTACHMENT_BYTES) throw new AttachmentError("attachment_too_large");
+  if (buffer.length > maxBytes) throw new AttachmentError("attachment_too_large");
   const contentType = normalizeMime(typeof input.contentType === "string" ? input.contentType : undefined, filename);
   assertMimeAllowed(contentType);
   return { filename, contentType, buffer };
@@ -177,6 +189,29 @@ export interface FetchOptions {
    */
   allowHttpHosts?: readonly string[];
   timeoutMs?: number;
+  /** Byte cap for this file (default 8 MiB; resolveJsonAttachments passes what is left of the 25 MiB total). */
+  maxBytes?: number;
+  /** DNS lookup (tests). Default: node:dns/promises lookup, all addresses. */
+  lookup?: (host: string) => Promise<{ address: string }[]>;
+}
+
+export const MAX_REDIRECTS = 3;
+
+/** Private, loopback, link-local, CGNAT, unspecified, multicast/reserved, ULA and v4-mapped forms. */
+export function isPrivateAddress(ip: string): boolean {
+  const v = ip.replace(/^\[|\]$/g, "").toLowerCase();
+  if (isIP(v) === 4) {
+    const [a, b] = v.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+  }
+  if (isIP(v) === 6) {
+    if (v === "::" || v === "::1") return true;
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v);
+    if (mapped) return isPrivateAddress(mapped[1]);
+    if (/^::ffff:[0-9a-f]{1,4}:[0-9a-f]{1,4}$/.test(v)) return true; // hex-form v4-mapped: refuse
+    return /^f[cd]/.test(v) || /^fe[89ab]/.test(v) || /^ff/.test(v);
+  }
+  return false;
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -192,29 +227,55 @@ function urlAllowed(u: URL, opts: FetchOptions): boolean {
   return u.protocol === "http:" && LOOPBACK.has(u.hostname) && (opts.allowHttpHosts ?? []).includes(u.hostname);
 }
 
+/**
+ * Every hop: scheme rule (urlAllowed) and no private / loopback / link-local
+ * target (literal IP or any DNS answer), unless the host is in allowHttpHosts.
+ */
+async function assertTargetAllowed(u: URL, opts: FetchOptions): Promise<void> {
+  if (!urlAllowed(u, opts)) throw new AttachmentError("invalid_attachment_url", "https only");
+  const host = u.hostname.replace(/^\[|\]$/g, "");
+  if ((opts.allowHttpHosts ?? []).includes(u.hostname)) return;
+  if (host === "localhost" || host.endsWith(".localhost")) throw new AttachmentError("invalid_attachment_url", "private target");
+  if (isIP(host)) {
+    if (isPrivateAddress(host)) throw new AttachmentError("invalid_attachment_url", "private target");
+    return;
+  }
+  let addrs: { address: string }[];
+  try {
+    addrs = await (opts.lookup ?? ((h: string) => dnsLookup(h, { all: true })))(host);
+  } catch {
+    throw new AttachmentError("attachment_fetch_failed", "dns");
+  }
+  if (!addrs.length || addrs.some((a) => isPrivateAddress(a.address))) throw new AttachmentError("invalid_attachment_url", "private target");
+}
+
 export async function fetchUrlAttachment(input: JsonAttachmentInput, opts: FetchOptions = {}): Promise<ResolvedAttachment> {
   if (typeof input.url !== "string" || !input.url.trim()) throw new AttachmentError("invalid_attachment", "url required");
-  let parsed: URL;
+  let current: URL;
   try {
-    parsed = new URL(input.url.trim());
+    current = new URL(input.url.trim());
   } catch {
     throw new AttachmentError("invalid_attachment_url");
   }
-  if (!urlAllowed(parsed, opts)) throw new AttachmentError("invalid_attachment_url", "https only");
-  const filename = safeFilename(input.filename ?? filenameFromUrl(parsed.toString()), "attachment.bin");
+  if (!urlAllowed(current, opts)) throw new AttachmentError("invalid_attachment_url", "https only");
+  const filename = safeFilename(input.filename ?? filenameFromUrl(current.toString()), "attachment.bin");
+  assertExtensionAllowed(filename);
+  const maxBytes = Math.min(opts.maxBytes ?? MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_BYTES);
+  const signal = AbortSignal.timeout(opts.timeoutMs ?? ATTACHMENT_FETCH_TIMEOUT_MS);
   try {
-    const res = await (opts.fetchImpl ?? fetch)(parsed.toString(), {
-      method: "GET",
-      redirect: "follow",
-      signal: AbortSignal.timeout(opts.timeoutMs ?? ATTACHMENT_FETCH_TIMEOUT_MS),
-      headers: { accept: "*/*" },
-    });
-    // A redirect must not land on a plain-http host.
-    if (res.url) {
+    let res: Response | undefined;
+    for (let hop = 0; ; hop++) {
+      await assertTargetAllowed(current, opts);
+      res = await (opts.fetchImpl ?? fetch)(current.toString(), { method: "GET", redirect: "manual", signal, headers: { accept: "*/*" } });
+      if (res.status < 300 || res.status > 399 || res.status === 304) break;
+      const loc = res.headers.get("location");
+      await res.body?.cancel().catch(() => undefined);
+      if (!loc) throw new AttachmentError("attachment_fetch_failed", "redirect without location");
+      if (hop >= MAX_REDIRECTS) throw new AttachmentError("attachment_fetch_failed", "too many redirects");
       try {
-        if (!urlAllowed(new URL(res.url), opts)) throw new AttachmentError("invalid_attachment_url", "redirected off https");
-      } catch (e) {
-        if (e instanceof AttachmentError) throw e;
+        current = new URL(loc, current);
+      } catch {
+        throw new AttachmentError("invalid_attachment_url", "bad redirect");
       }
     }
     if (!res.ok) throw new AttachmentError("attachment_fetch_failed", `HTTP ${res.status}`);
@@ -224,8 +285,8 @@ export async function fetchUrlAttachment(input: JsonAttachmentInput, opts: Fetch
     );
     assertMimeAllowed(contentType);
     const len = Number(res.headers.get("content-length") ?? NaN);
-    if (Number.isFinite(len) && len > MAX_ATTACHMENT_BYTES) throw new AttachmentError("attachment_too_large");
-    const buffer = await readCapped(res, MAX_ATTACHMENT_BYTES);
+    if (Number.isFinite(len) && len > maxBytes) throw new AttachmentError("attachment_too_large");
+    const buffer = await readCapped(res, maxBytes);
     if (buffer.length === 0) throw new AttachmentError("attachment_fetch_failed", "empty body");
     return { filename, contentType, buffer };
   } catch (err) {
@@ -266,7 +327,10 @@ export async function resolveJsonAttachments(items: unknown, opts: FetchOptions 
     const hasData = typeof item.data === "string" && item.data.length > 0;
     const hasUrl = typeof item.url === "string" && item.url.length > 0;
     if (hasData === hasUrl) throw new AttachmentError("invalid_attachment", "each attachment needs exactly one of data or url");
-    const r = hasData ? decodeBase64Attachment(item) : await fetchUrlAttachment(item, opts);
+    // Per-file cap shrinks to what is left of the total, so the total is enforced while streaming too.
+    const left = Math.min(MAX_ATTACHMENT_BYTES, MAX_TOTAL_ATTACHMENT_BYTES - total);
+    if (left <= 0) throw new AttachmentError("attachment_too_large", "total exceeds 25 MiB");
+    const r = hasData ? decodeBase64Attachment(item, left) : await fetchUrlAttachment(item, { ...opts, maxBytes: left });
     total += r.buffer.length;
     if (total > MAX_TOTAL_ATTACHMENT_BYTES) throw new AttachmentError("attachment_too_large", "total exceeds 25 MiB");
     out.push(r);

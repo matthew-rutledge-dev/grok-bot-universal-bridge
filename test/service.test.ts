@@ -31,7 +31,9 @@ function hostDir(opts: { publicBaseUrl?: string; discord?: Record<string, unknow
 const build = (file: string) => buildService(file, { discordPort: new FakeDiscordPort(BOT), env: {}, log: silentLogger });
 
 test("publicBaseUrl: not needed without a live callback route; required (clear error) once one is enabled", async () => {
-  const noCallback = { callbackTokenRef: undefined };
+  const ex = JSON.parse(readFileSync("adapters/discord/config.example.json", "utf8"));
+  // No callback route at all: no token ref and no planner route (a planner route needs the callback).
+  const noCallback = { callbackTokenRef: undefined, routes: ex.routes.filter((r: { handler?: string }) => r.handler !== "local-planner") };
   const svc = await build(hostDir({ discord: noCallback }));
   assert.deepEqual([...svc.adapters.keys()], ["discord"]);
   await assert.rejects(build(hostDir({})), /http\.publicBaseUrl required: callback route enabled for discord/);

@@ -137,12 +137,16 @@ export class FakeVoicePort implements VoicePort {
   played: { channelId: string; bytes: number }[] = [];
   streams: { channelId: string; closed: boolean; frames: number }[] = [];
   notVoice = new Set<string>();
+  /** When set, play/openStream wait on it (to test concurrent requests). */
+  gate: Promise<void> | undefined;
   private pull: (() => Buffer) | undefined;
   async play(channelId: string, pcm: Buffer) {
+    if (this.gate) await this.gate;
     if (this.notVoice.has(channelId)) throw new Error("not_a_voice_channel");
     this.played.push({ channelId, bytes: pcm.length });
   }
   async openStream(channelId: string, nextFrame: () => Buffer) {
+    if (this.gate) await this.gate;
     if (this.notVoice.has(channelId)) throw new Error("not_a_voice_channel");
     const s = { channelId, closed: false, frames: 0 };
     this.streams.push(s);

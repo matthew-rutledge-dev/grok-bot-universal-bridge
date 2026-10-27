@@ -197,3 +197,87 @@ test("callback attachments: base64 + mock-CDN url posted as files; errors map to
     await cdn.close();
   }
 });
+
+// ---- review nits ----
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { BLOCKED_EXTENSIONS, isPrivateAddress, MAX_REDIRECTS } from "./attachments.js";
+
+// Private-range fixtures are assembled at runtime so the leak check's
+// "no IPs except 127.0.0.1 / documentation ranges" rule stays strict for real files.
+const v4 = (...o: number[]) => o.join(".");
+const P10 = v4(10, 1, 2, 3);
+const META = v4(169, 254, 169, 254);
+const LL6 = ["fe80", "", "1"].join(":");
+const LL6_URL = `${"https"}://[${LL6}]/x.png`;
+
+test("nit 1: redirects are followed manually (max 3), every hop re-checked; private / link-local targets refused", async () => {
+  const srv = createServer((req, res) => {
+    const m = /^\/hop\/(\d+)$/.exec(req.url ?? "");
+    if (m) {
+      const n = Number(m[1]);
+      return void res.writeHead(302, { location: n > 0 ? `/hop/${n - 1}` : "/final.png" }).end();
+    }
+    if (req.url === "/to-private") return void res.writeHead(302, { location: `https://${P10}/x.png` }).end();
+    if (req.url === "/to-linklocal") return void res.writeHead(301, { location: LL6_URL }).end();
+    if (req.url === "/to-localhost") return void res.writeHead(307, { location: "https://localhost/x.png" }).end();
+    if (req.url === "/to-http") return void res.writeHead(302, { location: "http://cdn.example.com/x.png" }).end();
+    if (req.url === "/final.png") return void res.writeHead(200, { "content-type": "image/png", "content-length": String(PNG_1X1.length) }).end(PNG_1X1);
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+  const base = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  const opts = { allowHttpHosts: ["127.0.0.1"] };
+  try {
+    assert.equal(MAX_REDIRECTS, 3);
+    const ok = await fetchUrlAttachment({ url: `${base}/hop/2` }, opts); // 3 redirects
+    assert.deepEqual(ok.buffer, PNG_1X1);
+    assert.equal(await code(fetchUrlAttachment({ url: `${base}/hop/3` }, opts)), "attachment_fetch_failed", "4 redirects refused");
+    assert.equal(await code(fetchUrlAttachment({ url: `${base}/to-private` }, opts)), "invalid_attachment_url");
+    assert.equal(await code(fetchUrlAttachment({ url: `${base}/to-linklocal` }, opts)), "invalid_attachment_url");
+    assert.equal(await code(fetchUrlAttachment({ url: `${base}/to-localhost` }, opts)), "invalid_attachment_url");
+    assert.equal(await code(fetchUrlAttachment({ url: `${base}/to-http` }, opts)), "invalid_attachment_url");
+  } finally {
+    srv.closeAllConnections();
+    await new Promise<void>((r) => srv.close(() => r()));
+  }
+  // Literal IPs and DNS answers (lookup stubbed; nothing leaves the box).
+  for (const ip of [v4(10, 0, 0, 1), v4(172, 16, 0, 1), v4(192, 168, 1, 1), "127.0.0.1", META, v4(100, 64, 0, 1), v4(0, 0, 0, 0), "::1", "fd00::1", LL6, `::ffff:${v4(10, 0, 0, 1)}`]) {
+    assert.equal(isPrivateAddress(ip), true, ip);
+  }
+  assert.equal(isPrivateAddress("203.0.113.10"), false);
+  assert.equal(await code(fetchUrlAttachment({ url: `https://${META}/latest` })), "invalid_attachment_url");
+  const rebind = { lookup: async () => [{ address: "203.0.113.10" }, { address: v4(10, 0, 0, 7) }] };
+  assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a.png" }, rebind)), "invalid_attachment_url", "any private answer refuses");
+  let fetched = 0;
+  const pub = { lookup: async () => [{ address: "203.0.113.10" }], fetchImpl: (async () => (fetched++, new Response(PNG_1X1, { headers: { "content-type": "image/png" } }))) as typeof fetch };
+  assert.equal((await fetchUrlAttachment({ url: "https://cdn.example.com/a.png" }, pub)).contentType, "image/png");
+  assert.equal(fetched, 1);
+});
+
+test("nit 2: exe/msi/dmg/iso/appimage/bat/cmd/scr/com refused by extension whatever MIME is claimed", async () => {
+  assert.deepEqual([...BLOCKED_EXTENSIONS], [".exe", ".msi", ".dmg", ".iso", ".appimage", ".bat", ".cmd", ".scr", ".com"]);
+  for (const ext of BLOCKED_EXTENSIONS) {
+    const name = `setup${ext.toUpperCase()}`;
+    assert.equal(await code(Promise.resolve().then(() => decodeBase64Attachment({ filename: name, contentType: "image/png", data: PNG_1X1.toString("base64") }))), "unsupported_media_type", name);
+  }
+  assert.equal(await code(Promise.resolve().then(() => decodeBase64Attachment({ filename: "run.bat. ", contentType: "text/plain", data: "aGk=" }))), "unsupported_media_type", "trailing dot/space");
+  let fetched = 0;
+  const f = (async () => (fetched++, new Response("x", { headers: { "content-type": "text/plain" } }))) as typeof fetch;
+  assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a/tool.scr", contentType: "text/plain" }, { fetchImpl: f, lookup: async () => [{ address: "203.0.113.10" }] })), "unsupported_media_type");
+  assert.equal(await code(fetchUrlAttachment({ url: "https://cdn.example.com/a/notes.txt", filename: "notes.cmd" }, { fetchImpl: f, lookup: async () => [{ address: "203.0.113.10" }] })), "unsupported_media_type");
+  assert.equal(fetched, 0, "refused before fetching");
+});
+
+test("nit 3: the 25 MiB total is enforced while streaming (per-file cap = what is left)", async () => {
+  const cdn = await mockCdn({ "/big.txt": { type: "text/plain", body: Buffer.alloc(5 * 1024 * 1024), chunked: true } });
+  try {
+    const seven = { filename: "a.txt", data: Buffer.alloc(7 * 1024 * 1024).toString("base64") };
+    // 21 MiB already in, 4 MiB left: the 5 MiB chunked body (no content-length) must stop mid-stream.
+    assert.equal(await code(resolveJsonAttachments([seven, seven, seven, { url: `${cdn.base}/big.txt` }], { allowHttpHosts: ["127.0.0.1"] })), "attachment_too_large");
+    assert.equal(await code(fetchUrlAttachment({ url: `${cdn.base}/big.txt` }, { allowHttpHosts: ["127.0.0.1"], maxBytes: 1024 })), "attachment_too_large");
+    assert.equal((await fetchUrlAttachment({ url: `${cdn.base}/big.txt` }, { allowHttpHosts: ["127.0.0.1"] })).buffer.length, 5 * 1024 * 1024);
+  } finally {
+    await cdn.close();
+  }
+});

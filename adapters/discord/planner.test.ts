@@ -174,3 +174,35 @@ test("deleted working message: the callback falls back to a new reply", async ()
     await s.close();
   }
 });
+
+// ---- review nits ----
+import { PLANNER_STRIPPED_PARAMS } from "./planner.js";
+
+test("nit 6: planner and voice refs must be env:/file: references; literals refused at startup", () => {
+  const lit = (over: Partial<DiscordAdapterConfig>) => validateDiscordConfig({ ...example, ...over }).join("\n");
+  assert.match(lit({ planner: { urlRef: "http://127.0.0.1:18100/plan", tokenRef: "env:X" } }), /discord\.planner\.urlRef must be env:NAME or file:\/absolute\/path \(literal values refused\)/);
+  assert.match(lit({ planner: { urlRef: "env:X", tokenRef: "s3cr3t" } }), /planner\.tokenRef must be env:NAME/);
+  assert.match(lit({ voice: { enabled: true, piperHostRef: "127.0.0.1" } }), /voice\.piperHostRef must be env:NAME/);
+  assert.match(lit({ voice: { enabled: true, piperPortRef: "10200" } }), /voice\.piperPortRef must be env:NAME/);
+  assert.match(lit({ voice: { enabled: true, grokApiKeyRef: "example-key" } }), /voice\.grokApiKeyRef must be env:NAME/);
+  assert.match(lit({ planner: { urlRef: "env:X", tokenRef: "env:Y", token: "abc" } as never }), /discord\.planner\.token: literal values refused; use tokenRef/);
+  assert.match(lit({ callbackTokenRef: "plain" }), /callbackTokenRef must be env:NAME/);
+  assert.deepEqual(validateDiscordConfig(example), []);
+});
+
+test("nit 7: an enabled local-planner route without a callback token ref or callback URL is a startup error", () => {
+  const { callbackTokenRef: _c, ...noToken } = example;
+  assert.match(validateDiscordConfig(noToken).join(), /callbackTokenRef required when a local-planner route is enabled/);
+  const off = { ...noToken, routes: example.routes.map((r) => (r.handler ? { ...r, enabled: false } : r)) };
+  assert.ok(!validateDiscordConfig(off).join().includes("callbackTokenRef required"), "a disabled planner route is fine");
+  const ctx = { callbackUrl: "", dataFile: () => "", authedRoute: () => undefined, secret: () => undefined } as never;
+  assert.throws(() => new DiscordAdapter(example, new FakeDiscordPort(BOT)).init(ctx), /local-planner route needs a callback URL/);
+  new DiscordAdapter({ ...example, planner: { ...example.planner!, callbackUrl: "https://bridge.example.com/discord/callback" } }, new FakeDiscordPort(BOT)).init(ctx);
+});
+
+test("nit 8: token, access_token and key are stripped from the planner query string", () => {
+  assert.deepEqual([...PLANNER_STRIPPED_PARAMS], ["token", "access_token", "key"]);
+  const u = new URL(withPlannerQuery("https://planner.example.com/plan?token=a&access_token=b&key=c&mode=fast", "42", "https://bridge.example.com/discord/callback"));
+  for (const k of PLANNER_STRIPPED_PARAMS) assert.equal(u.searchParams.has(k), false, k);
+  assert.equal(u.searchParams.get("mode"), "fast");
+});

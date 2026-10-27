@@ -5,12 +5,16 @@ import type { PcmClip } from "./mix.js";
 /** Ported from the existing Discord bridge (piper.ts, grok-voice.ts). Host, port and key come from refs. */
 export const GROK_VOICE_URL = "wss://api.x.ai/v1/realtime?model=grok-voice-latest";
 
+/** Piper receive cap: header + audio for a 240-character line is far below this. */
+export const MAX_PIPER_BYTES = 16 * 1024 * 1024;
+
 /** Ask a Wyoming-protocol Piper service (host/port from refs) for one spoken line. */
 export function synthesizePiper(
   text: string,
   host: string,
   port: number,
   timeoutMs = 15_000,
+  maxBytes = MAX_PIPER_BYTES,
 ): Promise<PcmClip> {
   const spoken = text.trim().slice(0, 240);
   if (!spoken) return Promise.reject(new Error("piper_text_required"));
@@ -85,7 +89,13 @@ export function synthesizePiper(
         }
       }
     };
+    let received = 0;
     socket.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > maxBytes) {
+        finish(new Error("piper_too_large"));
+        return;
+      }
       buf = Buffer.concat([buf, chunk]);
       pump();
     });

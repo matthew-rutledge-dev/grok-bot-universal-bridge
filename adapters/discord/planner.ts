@@ -69,6 +69,8 @@ export function plannerImageFields(refs: ReadonlyArray<{ url: string }>): Pick<P
   };
 }
 
+export const PLANNER_STRIPPED_PARAMS = ["token", "access_token", "key"] as const;
+
 export function withPlannerQuery(plannerUrl: string, messageId: string, callbackUrl: string, statusMessageId?: string): string {
   const u = new URL(plannerUrl);
   if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("planner_bad_url");
@@ -76,7 +78,8 @@ export function withPlannerQuery(plannerUrl: string, messageId: string, callback
   u.searchParams.set("callbackUrl", callbackUrl);
   if (statusMessageId?.trim()) u.searchParams.set("statusMessageId", statusMessageId.trim());
   else u.searchParams.delete("statusMessageId");
-  u.searchParams.delete("token");
+  // Never forward credentials on the query string.
+  for (const k of PLANNER_STRIPPED_PARAMS) u.searchParams.delete(k);
   return u.toString();
 }
 

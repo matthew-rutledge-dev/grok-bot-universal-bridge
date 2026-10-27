@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { validateRoutes } from "../../core/allowlist.js";
+import { isSecretRef } from "../../core/secrets.js";
 import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
 import type { HeldItem } from "../../core/hold.js";
 import type { HttpResponse } from "../../core/http.js";
@@ -108,6 +109,22 @@ export function validateDiscordConfig(raw: unknown): string[] {
   if (!c || typeof c !== "object") return ["discord: config is not an object"];
   const p = validateRoutes(c.routes, "discord");
   if (!c.tokenRef) p.push("discord: tokenRef required (env:NAME or file:/path)");
+  // Every *Ref must be a reference, never a literal (same rule as wake.*).
+  const refs: [string, unknown][] = [
+    ["tokenRef", c.tokenRef],
+    ["callbackTokenRef", c.callbackTokenRef],
+    ["planner.urlRef", c.planner?.urlRef],
+    ["planner.tokenRef", c.planner?.tokenRef],
+    ["voice.piperHostRef", c.voice?.piperHostRef],
+    ["voice.piperPortRef", c.voice?.piperPortRef],
+    ["voice.grokApiKeyRef", c.voice?.grokApiKeyRef],
+  ];
+  for (const [k, v] of refs) if (v !== undefined && v !== "" && !isSecretRef(v)) p.push(`discord.${k} must be env:NAME or file:/absolute/path (literal values refused)`);
+  for (const [section, obj] of [["planner", c.planner], ["voice", c.voice]] as const) {
+    for (const k of Object.keys(obj ?? {})) {
+      if (/^(url|token|key|apiKey|grokApiKey|piperHost|piperPort|host|port)$/i.test(k)) p.push(`discord.${section}.${k}: literal values refused; use ${k}Ref`);
+    }
+  }
   for (const [i, r] of (c.routes ?? []).entries()) {
     const keys = Object.keys(r.match ?? {});
     const ok = (keys.length === 2 && keys.includes("guild") && keys.includes("channel")) || (keys.length === 1 && keys[0] === "dm");
@@ -116,6 +133,9 @@ export function validateDiscordConfig(raw: unknown): string[] {
   }
   if ((c.routes ?? []).some((r) => r.handler === PLANNER_HANDLER) && (!c.planner?.urlRef || !c.planner?.tokenRef)) {
     p.push("discord.planner.urlRef and tokenRef required when a route uses the local-planner handler");
+  }
+  if ((c.routes ?? []).some((r) => r.enabled && r.handler === PLANNER_HANDLER) && !c.callbackTokenRef) {
+    p.push("discord.callbackTokenRef required when a local-planner route is enabled (the planner replies through the callback)");
   }
   if (c.planner?.callbackUrl !== undefined && !/^https?:\/\/[^\s]+$/.test(String(c.planner.callbackUrl))) {
     p.push("discord.planner.callbackUrl must be an http(s) URL");
@@ -187,6 +207,9 @@ export class DiscordAdapter implements SourceAdapter {
 
   init(ctx: AdapterContext): void {
     this.ctx = ctx;
+    if (this.routes.some((r) => r.enabled && r.handler === PLANNER_HANDLER) && !(this.cfg.planner?.callbackUrl || ctx.callbackUrl)) {
+      throw new Error("discord: a local-planner route needs a callback URL (set http.publicBaseUrl or discord.planner.callbackUrl)");
+    }
     if (this.cfg.voice) {
       const voice = new VoiceService(this.cfg.voice, { port: this.port.voice, secret: (r) => ctx.secret(r), grokUrl: this.opts.grokVoiceUrl });
       this.voice = voice;

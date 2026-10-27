@@ -5,6 +5,8 @@ export const FRAME_SAMPLES = 960;
 export const FRAME_BYTES = FRAME_SAMPLES * 4;
 const MAX_SECONDS = 180;
 const MAX_BYTES = 48000 * 2 * 2 * MAX_SECONDS;
+/** At most 16 layers in one stream (each up to 3 min of PCM). Replacing an existing id is fine. */
+export const MAX_LAYERS = 16;
 
 export type MixLayer = {
   id: string;
@@ -21,6 +23,7 @@ export class PcmMixer {
     if (!layer.id) throw new Error("layer_id_required");
     if (layer.pcm.length < 4 || layer.pcm.length % 4 !== 0) throw new Error("pcm_format");
     if (layer.pcm.length > MAX_BYTES) throw new Error("audio_too_long");
+    if (!this.layers.has(layer.id) && this.layers.size >= MAX_LAYERS) throw new Error("too_many_layers");
     const gain = clampGain(layer.gain);
     this.layers.set(layer.id, {
       id: layer.id,

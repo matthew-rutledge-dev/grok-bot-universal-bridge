@@ -33,7 +33,7 @@ export interface VoiceDeps {
 }
 
 const CHANNEL = /^[0-9]{17,20}$/;
-const KNOWN_ADD = new Set(["voice_engine", "wav_format", "audio_too_long", "pcm_format", "grok_voice_not_configured", "piper_not_configured", "piper_format", "piper_empty"]);
+const KNOWN_ADD = new Set(["too_many_layers", "voice_engine", "wav_format", "audio_too_long", "pcm_format", "grok_voice_not_configured", "piper_not_configured", "piper_format", "piper_empty"]);
 const NOT_CONFIGURED = new Set(["grok_voice_not_configured", "piper_not_configured"]);
 
 export function validateVoiceConfig(v: unknown): string[] {
@@ -52,6 +52,22 @@ const cleanId = (v: unknown) => (typeof v === "string" ? v.trim().slice(0, 64) :
 
 export class VoiceService {
   private stream: { channelId: string; mixer: PcmMixer; handle: VoiceStreamHandle } | null = null;
+  /**
+   * One voice operation at a time (play, or a stream open/close). Without it a
+   * play racing an open could leak a stream or destroy the shared guild
+   * connection the stream uses. While busy: 409 voice_busy.
+   */
+  private busy: "play" | "open" | null = null;
+
+  private async exclusive(kind: "play" | "open", fn: () => Promise<HttpResponse>): Promise<HttpResponse> {
+    if (this.busy) return err(409, "voice_busy");
+    this.busy = kind;
+    try {
+      return await fn();
+    } finally {
+      this.busy = null;
+    }
+  }
 
   constructor(
     private readonly cfg: VoiceConfig,
@@ -97,6 +113,11 @@ export class VoiceService {
       return this.done(err(400, "voice_engine"), t0);
     }
     if (this.stream) return this.done(err(409, "voice_stream_open"), t0);
+    return this.exclusive("play", () => this.playNow(channelId, text, engine, body.bed === true, t0));
+  }
+
+  private async playNow(channelId: string, text: string, engine: "local" | "grok", bed: boolean, t0: number): Promise<HttpResponse> {
+    const body = { bed };
     try {
       let pcm = text ? await this.speak(text, engine) : buildTonePcm(2);
       if (text && body.bed === true) pcm = mixLocalBed(pcm);
@@ -105,6 +126,7 @@ export class VoiceService {
     } catch (e) {
       const msg = (e as Error)?.message ?? "";
       if (msg === "not_a_voice_channel") return this.done(err(400, msg), t0);
+      if (msg === "voice_busy") return this.done(err(409, msg), t0);
       if (NOT_CONFIGURED.has(msg)) return this.done(err(503, msg), t0);
       return this.done(err(502, "voice_play_failed"), t0);
     }
@@ -116,22 +138,28 @@ export class VoiceService {
     const op = typeof body.op === "string" ? body.op : "";
     if (!this.cfg.enabled) return this.done(err(503, "voice_disabled"), t0);
     if (op === "status") return { status: 200, body: { ok: true, ...this.status() } };
-    if (op === "close") return this.done({ status: 200, body: { ok: true, closed: this.close() } }, t0);
+    if (op === "close") {
+      if (this.busy) return err(409, "voice_busy");
+      return this.done({ status: 200, body: { ok: true, closed: this.close() } }, t0);
+    }
     if (op === "open") {
       const channelId = cleanId(body.channelId);
       const denied = this.gate(channelId);
       if (denied) return this.done(denied, t0);
       if (this.stream?.channelId === channelId) return { status: 200, body: { ok: true, ...this.status() } };
-      this.close();
-      const mixer = new PcmMixer();
-      try {
-        const handle = await this.deps.port!.openStream(channelId, () => mixer.nextFrame());
-        this.stream = { channelId, mixer, handle };
-        return this.done({ status: 200, body: { ok: true, ...this.status() } }, t0);
-      } catch (e) {
-        const msg = (e as Error)?.message ?? "";
-        return this.done(msg === "not_a_voice_channel" ? err(400, msg) : err(502, "voice_stream_failed"), t0);
-      }
+      return this.exclusive("open", async () => {
+        this.close();
+        const mixer = new PcmMixer();
+        try {
+          const handle = await this.deps.port!.openStream(channelId, () => mixer.nextFrame());
+          this.stream = { channelId, mixer, handle };
+          return this.done({ status: 200, body: { ok: true, ...this.status() } }, t0);
+        } catch (e) {
+          const msg = (e as Error)?.message ?? "";
+          if (msg === "voice_busy") return err(409, msg);
+          return this.done(msg === "not_a_voice_channel" ? err(400, msg) : err(502, "voice_stream_failed"), t0);
+        }
+      });
     }
     const mixer = this.stream?.mixer;
     if (!mixer) return this.done(err(409, "voice_stream_closed"), t0);
