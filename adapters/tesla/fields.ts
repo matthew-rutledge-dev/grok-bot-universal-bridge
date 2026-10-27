@@ -19,7 +19,12 @@ export const KNOWN_FIELDS = [
 ] as const;
 export type KnownField = (typeof KNOWN_FIELDS)[number];
 
-/** Names from older drafts that do not exist (or are deprecated) in the proto, with the replacement. */
+/**
+ * Names from older drafts that must not be used, with the replacement. ChargeCableConnected,
+ * TrunkOpen and SentryAlert do not exist in the proto. ChargeState exists but is deprecated,
+ * SoftwareUpdateAvailable exists but is undocumented, and Soc exists but means usable charge,
+ * not the app's battery %.
+ */
 export const REPLACED_FIELDS: Record<string, string> = {
   ChargeState: "DetailedChargeState (ChargeState is deprecated)",
   ChargeCableConnected: "DetailedChargeState leaving/returning to Disconnected (backup: ChargingCableType)",
@@ -170,6 +175,11 @@ export interface TriggerHit<T extends string = VehicleTrigger> {
   priority?: "high";
 }
 
+/**
+ * Gear values treated as parked. "" (Gear never streamed), Unknown, Invalid and SNA count as
+ * parked, so door/trunk triggers need Gear in the telemetry fields (the validator requires it
+ * when those rules wake) or they could fire while driving.
+ */
 const PARKED = new Set(["P", "", "Unknown", "Invalid", "SNA"]);
 
 /**
@@ -200,8 +210,10 @@ export function deriveVehicleTriggers(
     // Backup only while DetailedChargeState is not streamed for this car.
     const was = enumName("ChargingCableType", p.ChargingCableType);
     const now = enumName("ChargingCableType", delta.ChargingCableType);
-    if (was === "Invalid" && now !== "Invalid") out.push({ on: "plugged_in" });
-    if (was !== "Invalid" && now === "Invalid") out.push({ on: "unplugged" });
+    // Invalid (and SNA, "signal not available") mean no cable.
+    const none = (v: string) => v === "Invalid" || v === "SNA";
+    if (none(was) && !none(now)) out.push({ on: "plugged_in" });
+    if (!none(was) && none(now)) out.push({ on: "unplugged" });
   }
 
   if (changed("DoorState") && parked) {

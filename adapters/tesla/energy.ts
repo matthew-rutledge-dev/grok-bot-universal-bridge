@@ -51,6 +51,9 @@ export type FetchLike = (url: string, init: { method: string; headers: Record<st
   text(): Promise<string>;
 }>;
 
+/** A Retry-After longer than this is capped (a bad header must not silence polling for days). */
+export const MAX_RETRY_AFTER_S = 3600;
+
 const TLS_CODES = /^(CERT_|UNABLE_TO_|DEPTH_ZERO|SELF_SIGNED|ERR_TLS|ERR_SSL|HOSTNAME_MISMATCH|ERR_CERT)/;
 
 /** Network/TLS failure -> code. Never the message (it can echo a URL). */
@@ -70,7 +73,7 @@ export function mapHttpError(status: number, body: string, retryAfter: string | 
       const at = Date.parse(retryAfter);
       if (!Number.isNaN(at)) sec = Math.max(1, Math.ceil((at - Date.now()) / 1000));
     }
-    return new EnergyApiError("rate_limited", status, Number.isNaN(sec) ? 60 : sec);
+    return new EnergyApiError("rate_limited", status, Number.isNaN(sec) ? 60 : Math.min(MAX_RETRY_AFTER_S, sec));
   }
   if (status === 401) return new EnergyApiError(/login_required/i.test(body) ? "login_required" : "unauthorized", status);
   if (status === 403 && /scope/i.test(body)) return new EnergyApiError("missing_scope", status);

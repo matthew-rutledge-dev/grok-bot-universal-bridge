@@ -71,22 +71,36 @@ function* recordsIn(text: string): Generator<unknown> {
 /** Loopback HTTP listener for fleet-telemetry decoded JSON (POST /records). */
 export class DecodedJsonReceiver implements TelemetryReceiver {
   private server?: HttpServer;
-  constructor(private readonly o: { listen: string; token?: () => string | undefined }) {
+  /**
+   * token: when set, a bearer is REQUIRED; if the ref resolves empty at request time the
+   * listener answers 503 (fail closed), never "no auth".
+   * requestTimeoutMs: whole-request timeout (default 10 s) so a slow client can't hold a socket.
+   */
+  constructor(private readonly o: { listen: string; token?: () => string | undefined; requestTimeoutMs?: number }) {
     const { host } = splitListen(o.listen);
     if (!isLoopbackHost(host)) throw new Error("tesla.telemetry.decoded_listen must be a loopback address");
   }
 
   async start(sink: ReceiverSink): Promise<void> {
     const { host, port } = splitListen(this.o.listen);
-    this.server = createHttpServer((req, res) => {
+    const timeout = Math.max(50, this.o.requestTimeoutMs ?? 10_000);
+    this.server = createHttpServer(
+      { requestTimeout: timeout, headersTimeout: timeout, connectionsCheckingInterval: Math.min(1000, Math.max(25, Math.floor(timeout / 4))) },
+      (req, res) => {
       if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== "/records") {
         res.writeHead(404).end();
         return;
       }
-      const want = this.o.token?.();
-      if (want && !safeEqual(req.headers.authorization ?? "", `Bearer ${want}`)) {
-        res.writeHead(401).end();
-        return;
+      if (this.o.token) {
+        const want = this.o.token();
+        if (!want) {
+          res.writeHead(503).end();
+          return;
+        }
+        if (!safeEqual(req.headers.authorization ?? "", `Bearer ${want}`)) {
+          res.writeHead(401).end();
+          return;
+        }
       }
       readBody(req, MAX_BODY)
         .then((text) => {
@@ -102,8 +116,12 @@ export class DecodedJsonReceiver implements TelemetryReceiver {
           }
           res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ accepted: n }));
         })
-        .catch(() => res.writeHead(413).end());
-    });
+        .catch(() => {
+          if (!res.headersSent) res.writeHead(413).end();
+        });
+      },
+    );
+    this.server.on("clientError", (_e, sock) => sock.destroy());
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
       this.server!.listen(port, host, () => resolve());
@@ -163,8 +181,16 @@ export class MtlsTelemetryReceiver implements TelemetryReceiver {
       minVersion: "TLSv1.2",
     });
     this.server.on("request", (_req, res) => res.writeHead(426).end());
+    this.server.on("tlsClientError", () => sink.drop("no_client_cert"));
     this.wss = new WebSocketServer({ server: this.server, maxPayload: MAX_BODY });
+    // Server-level errors (e.g. a failed upgrade) must never crash the process.
+    this.wss.on("error", () => sink.drop("bad_record"));
     this.wss.on("connection", (ws, req) => {
+      // Frame errors (over maxPayload, invalid UTF-8 text, bad opcode) emit 'error' on the socket.
+      ws.on("error", () => {
+        sink.drop("bad_record", vinFromSocket(req.socket as TLSSocket));
+        ws.terminate();
+      });
       const certVin = vinFromSocket(req.socket as TLSSocket);
       if (!certVin) {
         sink.drop("no_client_cert");

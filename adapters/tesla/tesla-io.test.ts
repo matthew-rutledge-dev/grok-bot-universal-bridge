@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
+import { connect as netConnect } from "node:net";
 import forge from "node-forge";
 import WebSocket from "ws";
 import {
@@ -63,6 +64,8 @@ test("error mapping", () => {
   assert.equal(rl.code, "rate_limited");
   assert.equal(rl.retryAfterSec, 120);
   assert.equal(mapHttpError(429, "", null).retryAfterSec, 60);
+  assert.equal(mapHttpError(429, "", "999999").retryAfterSec, 3600, "Retry-After capped at an hour");
+  assert.equal(mapHttpError(429, "", new Date(Date.now() + 7 * 86_400_000).toUTCString()).retryAfterSec, 3600);
   assert.equal(mapHttpError(500, "", null).code, "fleet_api_error");
 });
 
@@ -94,7 +97,7 @@ async function energyRig(answer: Parameters<typeof fakeApi>[0], patch: Partial<N
     energy_poll: { ...example.energy_poll!, enabled: true, api_base: API, token_ref: `file:${tokenFile}`, ...patch },
   };
   const m = await mockRoutine({ key: "routine-key" });
-  const a = new TeslaAdapter(cfg, { fetchImpl: api.f, now: () => clock });
+  const a = new TeslaAdapter(cfg, { fetchImpl: api.f, now: () => clock, pollOnStart: false });
   const b = await startBridge({ routineUrl: m.url, adapters: [a] });
   return {
     a, b, m, api, tokenFile,
@@ -205,7 +208,7 @@ test("energy client: 401 then rotated token on disk -> retried with the new toke
   const api = fakeApi((url, n) => (n === 1 ? { status: 401 } : live({})));
   const a = new TeslaAdapter(
     { ...example, energy_poll: { ...example.energy_poll!, enabled: true, api_base: API, token_ref: "env:TESLA_TOKEN" } },
-    { fetchImpl: api.f },
+    { fetchImpl: api.f, pollOnStart: false },
   );
   const env = { get TESLA_TOKEN() { return token; } } as unknown as Record<string, string>;
   a.init({ log: { info() {}, warn() {}, error() {} }, audit() {}, submit: async () => ({ accepted: false, reason: "no_route" }), secret: (ref: string) => (ref === "env:TESLA_TOKEN" ? env.TESLA_TOKEN : undefined) } as never);
@@ -260,6 +263,33 @@ test("energy: missing scope / login_required / unreachable / tls are audited by 
   }
 });
 
+test("energy: polls immediately at start; a failing submit inside a timer tick is audited, not unhandled", async () => {
+  const api = fakeApi(() => live({ island_status: "off_grid_unintentional" }));
+  const audit: Array<{ reason?: string }> = [];
+  const a = new TeslaAdapter({ ...example, energy_poll: { ...example.energy_poll!, enabled: true, api_base: API, token_ref: "env:T" } }, { fetchImpl: api.f });
+  a.init({
+    log: { info() {}, warn() {}, error() {} },
+    audit: (e: { reason?: string }) => audit.push(e),
+    submit: async () => {
+      throw new Error("boom");
+    },
+    secret: () => "access",
+  } as never);
+  let unhandled = 0;
+  const onUnhandled = () => unhandled++;
+  process.on("unhandledRejection", onUnhandled);
+  await a.start();
+  try {
+    for (let i = 0; i < 50 && !audit.some((e) => e.reason === "poll_failed"); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(api.calls.some((c) => c.url.endsWith("/live_status")), "first poll did not wait a full interval");
+    assert.ok(audit.some((e) => e.reason === "poll_failed"));
+    assert.equal(unhandled, 0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    await a.stop();
+  }
+});
+
 // ---------- decoded receiver ----------
 
 test("decoded receiver: loopback only; POST NDJSON from fleet-telemetry -> triggers", async () => {
@@ -284,6 +314,47 @@ test("decoded receiver: loopback only; POST NDJSON from fleet-telemetry -> trigg
   } finally {
     await b.close();
     await m.close();
+  }
+});
+
+test("decoded receiver: a configured token ref that doesn't resolve fails at start and answers 503 later", async () => {
+  const cfg = { ...example, telemetry: { ...example.telemetry!, enabled: true, decoded_listen: "127.0.0.1:0", decoded_token_ref: "env:RELAY_TOKEN" } };
+  let token: string | undefined;
+  const ctx = { log: { info() {}, warn() {}, error() {} }, audit() {}, submit: async () => ({ accepted: true }), secret: () => token } as never;
+  const a1 = new TeslaAdapter(cfg);
+  a1.init(ctx);
+  await assert.rejects(a1.start(), /decoded_token_ref is set but does not resolve/);
+  token = "relay-secret";
+  const a2 = new TeslaAdapter(cfg);
+  a2.init(ctx);
+  await a2.start();
+  try {
+    const url = `http://127.0.0.1:${a2.telemetryPort()}/records`;
+    token = undefined; // the ref later resolves empty: fail closed, never "no auth"
+    assert.equal((await fetch(url, { method: "POST", body: "{}" })).status, 503);
+    assert.equal((await fetch(url, { method: "POST", headers: { authorization: "Bearer " }, body: "{}" })).status, 503);
+    token = "relay-secret";
+    assert.equal((await fetch(url, { method: "POST", body: "{}" })).status, 401);
+  } finally {
+    await a2.stop();
+  }
+});
+
+test("decoded receiver: request timeout closes a slow client", async () => {
+  const r = new DecodedJsonReceiver({ listen: "127.0.0.1:0", requestTimeoutMs: 200 });
+  await r.start({ record() {}, drop() {} });
+  try {
+    const closed = await new Promise<number>((resolve) => {
+      const t0 = Date.now();
+      const s = netConnect(r.port(), "127.0.0.1", () => s.write("POST /records HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n{"));
+      s.on("data", () => undefined);
+      s.on("error", () => undefined);
+      s.on("close", () => resolve(Date.now() - t0));
+      setTimeout(() => resolve(-1), 5000);
+    });
+    assert.ok(closed > 0 && closed < 3000, `closed after ${closed} ms`);
+  } finally {
+    await r.stop();
   }
 });
 
@@ -405,6 +476,29 @@ test("mtls receiver: client cert required and verified; VIN from cert CN; payloa
     assert.ok(reasons.includes("vin_cert_mismatch"));
     assert.ok(reasons.includes("undecodable_frame"));
     assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false);
+
+    // Frame errors must not crash the process: oversize frame and invalid UTF-8 text frame.
+    let unhandled = 0;
+    const onErr = () => unhandled++;
+    process.on("uncaughtException", onErr);
+    try {
+      const dropsBefore = b.audit.lines.filter((l) => l.reason === "bad_record").length;
+      for (const frame of [Buffer.alloc(1_000_001, 0x61), Buffer.from([0xc3, 0x28, 0xff])]) {
+        const w = await open(car);
+        await new Promise<void>((resolve) => {
+          w.on("close", () => resolve());
+          w.on("error", () => undefined);
+          w.send(frame, { binary: false });
+        });
+      }
+      for (let i = 0; i < 50 && b.audit.lines.filter((l) => l.reason === "bad_record").length < dropsBefore + 2; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, dropsBefore + 2);
+      assert.equal(unhandled, 0);
+      const again = await open(car);
+      again.close();
+    } finally {
+      process.off("uncaughtException", onErr);
+    }
   } finally {
     await b.close();
     await m.close();

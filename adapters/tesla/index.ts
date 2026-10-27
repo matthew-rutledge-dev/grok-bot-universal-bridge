@@ -127,6 +127,11 @@ export function validateTeslaConfig(raw: unknown): string[] {
     if (!Array.isArray(t.vin_allowlist)) p.push("tesla.telemetry.vin_allowlist must be an array");
     for (const v of t.vin_allowlist ?? []) if (typeof v !== "string" || !/^[A-HJ-NPR-Z0-9]{17}$/.test(v)) p.push("tesla.telemetry.vin_allowlist entries must be 17-character VINs");
     if (t.prefer_typed === false) p.push("tesla.telemetry.prefer_typed must be true (enums and DoorState are parsed as typed values)");
+    const doorRules = (c.rules ?? []).filter((r) => (r.on === "door_open_parked" || r.on === "trunk_open_parked") && r.wake).map((r) => r.on);
+    if (doorRules.length && t.fields && !("Gear" in t.fields)) {
+      p.push(`tesla.telemetry.fields must include Gear when ${doorRules.join("/")} wakes (without Gear the car counts as parked)`);
+    }
+    if (doorRules.length && t.fields && !("DoorState" in t.fields)) p.push(`tesla.telemetry.fields must include DoorState when ${doorRules.join("/")} wakes`);
     for (const f of Object.keys(t.fields ?? {})) {
       if (REPLACED_FIELDS[f]) p.push(`tesla.telemetry.fields.${f}: not a usable field; use ${REPLACED_FIELDS[f]}`);
       else if (!(KNOWN_FIELDS as readonly string[]).includes(f)) p.push(`tesla.telemetry.fields.${f}: not read by the trigger logic (known: ${KNOWN_FIELDS.join(", ")})`);
@@ -187,6 +192,10 @@ export interface TeslaDeps {
   energy?: EnergyStatusSource;
   fetchImpl?: FetchLike;
   now?: () => number;
+  /** Poll energy once right at start (default true). */
+  pollOnStart?: boolean;
+  /** decoded listener request timeout (default 10 s). */
+  decodedRequestTimeoutMs?: number;
 }
 
 const MAX_AUTH_BACKOFF_S = 3600;
@@ -248,7 +257,7 @@ export class TeslaAdapter implements SourceAdapter {
         this.deps.receiver ??
         ((t.mode ?? "decoded") === "mtls"
           ? new MtlsTelemetryReceiver({ listen: t.listen!, cert: this.pem(t.tls_cert!), key: this.pem(t.tls_key!), clientCa: this.pem(t.client_ca!) })
-          : new DecodedJsonReceiver({ listen: t.decoded_listen!, token: t.decoded_token_ref ? () => this.ctx.secret(t.decoded_token_ref) : undefined }));
+          : this.decodedReceiver(t));
       await this.receiver.start({
         record: (r) =>
           void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin })),
@@ -259,10 +268,30 @@ export class TeslaAdapter implements SourceAdapter {
     if (e?.enabled) {
       this.energy = this.deps.energy ?? new FleetEnergyClient({ apiBase: e.api_base!, getToken: () => this.token(), fetchImpl: this.deps.fetchImpl });
       const every = Math.max(60, e.interval_s ?? 300) * 1000;
-      this.timer = setInterval(() => void this.tick(), every);
+      this.timer = setInterval(() => this.safeTick(), every);
       this.timer.unref?.();
+      if (this.deps.pollOnStart !== false) this.safeTick();
     }
     this.ctx.log.info(`[tesla] started telemetry=${t?.enabled ? (t.mode ?? "decoded") : "off"} energy=${Boolean(e?.enabled)}`);
+  }
+
+  private decodedReceiver(t: NonNullable<TeslaConfig["telemetry"]>): DecodedJsonReceiver {
+    const ref = t.decoded_token_ref;
+    if (ref && !this.ctx.secret(ref)) {
+      throw new Error(`tesla: telemetry.decoded_token_ref is set but does not resolve (${ref.startsWith("file:") ? "file" : ref})`);
+    }
+    return new DecodedJsonReceiver({
+      listen: t.decoded_listen!,
+      token: ref ? () => this.ctx.secret(ref) : undefined,
+      requestTimeoutMs: this.deps.decodedRequestTimeoutMs,
+    });
+  }
+
+  /** Timer/start entry: never lets a rejection escape. */
+  private safeTick(): void {
+    this.tick().catch(() => {
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "poll_failed" });
+    });
   }
 
   async stop(): Promise<void> {
@@ -437,8 +466,9 @@ export class TeslaAdapter implements SourceAdapter {
         this.ctx.audit({ action: "observe", outcome: "ok", reason: "no_wake_rule", type: t, actor: id });
         continue;
       }
-      const eventId = createHash("sha256").update(`${id}|${t}|${priority}|${at}`).digest("hex").slice(0, 16);
       const masked = maskId(id);
+      // Only the masked id goes into the hash, so the event id can't be brute-forced back to a VIN.
+      const eventId = createHash("sha256").update(`${kind}|${masked}|${t}|${priority}|${at}`).digest("hex").slice(0, 16);
       const extra = t === "grid_islanded" && detail ? ` (${detail})` : "";
       const res = await this.ctx.submit({
         eventId,

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import {
   Debouncer,
   deriveVehicleTriggers,
@@ -60,6 +61,10 @@ test("telemetry config: prefer_typed, replaced field names, VIN shape, receiver 
     assert.match(v({ fields: { [f]: 10 } }), hint, f);
   }
   assert.match(v({ fields: { Odometer: 10 } }), /not read by the trigger logic/);
+  const noGear = { ...t.fields! };
+  delete noGear.Gear;
+  assert.match(v({ fields: noGear }), /must include Gear when door_open_parked\/trunk_open_parked wakes/);
+  assert.equal(validateTeslaConfig({ ...example, rules: example.rules.filter((r) => !/door|trunk/.test(r.on)), telemetry: { ...t, fields: noGear } }).length, 0, "Gear optional without door/trunk wake rules");
   assert.match(v({ vin_allowlist: ["5YJ0000000EXAMPLE1"] }), /17-character/);
   assert.match(v({ enabled: true, mode: "mtls", client_ca: undefined }), /client_ca is required in mtls mode/);
   assert.match(v({ decoded_listen: "0.0.0.0:18091" }), /loopback/);
@@ -93,6 +98,9 @@ test("ChargingCableType is the backup plug signal (invalid = no cable), only wit
   assert.equal(plugged.ChargingCableType, "Invalid");
   assert.deepEqual(step(plugged, { ChargingCableType: "CableTypeSAE" }), ["plugged_in"]);
   assert.deepEqual(step({ ChargingCableType: "CableTypeSAE" }, { ChargingCableType: { invalid: true } }), ["unplugged"]);
+  assert.deepEqual(step({ ChargingCableType: "CableTypeSAE" }, { ChargingCableType: "CableTypeSNA" }), ["unplugged"], "SNA = no cable");
+  assert.deepEqual(step({ ChargingCableType: "CableTypeSNA" }, { ChargingCableType: "CableTypeIEC" }), ["plugged_in"]);
+  assert.deepEqual(step({ ChargingCableType: "Invalid" }, { ChargingCableType: "CableTypeSNA" }), []);
   // DetailedChargeState seen for this car: it alone decides.
   assert.deepEqual(step({ DetailedChargeState: "Charging", ChargingCableType: "Invalid" }, { ChargingCableType: "CableTypeSAE" }), []);
 });
@@ -182,6 +190,11 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
     const prompt: string = m.hits[0].body.prompt;
     assert.match(prompt, /Tesla vehicle …MPLE: charge_complete \(priority normal\)/);
     assert.equal(prompt.includes(VIN), false, "full VIN never leaves the bridge");
+    // The event id hashes only the masked id: it can't be brute-forced back to the VIN.
+    const at = "2026-01-01T01:00:00Z";
+    const id = /t:charge_complete:([0-9a-f]{16})/.exec(prompt)![1];
+    assert.equal(id, createHash("sha256").update(`vehicle|…MPLE|charge_complete|normal|${at}`).digest("hex").slice(0, 16));
+    assert.notEqual(id, createHash("sha256").update(`${VIN}|charge_complete|normal|${at}`).digest("hex").slice(0, 16));
 
     assert.deepEqual(await rec("2026-01-01T01:10:00Z", { SentryMode: "SentryModeStatePanic" }), ["sentry_alert"]);
     assert.match(m.hits[1].body.prompt, /sentry_alert \(priority high\)/);
