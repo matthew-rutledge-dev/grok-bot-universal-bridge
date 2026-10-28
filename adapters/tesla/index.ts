@@ -25,6 +25,12 @@ import {
 import { deriveVehicleTriggers, KNOWN_FIELDS, mergeState, OWNERSHIP_FIELDS, REPLACED_FIELDS, STREAM_ONLY_FIELDS, type TelemetryRecord, type TelemetryValue, type TriggerHit, type VehicleTrigger } from "./fields.js";
 import { brokerUrlProblem, MqttTelemetryReceiver, topicBaseProblem } from "./mqtt.js";
 import { OwnershipRuntime, validateOwnership, type OwnershipConfig } from "./ownership-runtime.js";
+import {
+  DashcamAutosaveRuntime,
+  telemetryAuthenticated,
+  validateDashcamAutosave,
+  type DashcamAutosaveConfig,
+} from "./dashcam-autosave.js";
 import { DecodedJsonReceiver, isLoopbackHost, MtlsTelemetryReceiver, splitListen, type DropReason, type TelemetryReceiver } from "./receiver.js";
 
 export * from "./fields.js";
@@ -34,6 +40,9 @@ export * from "./mqtt.js";
 export * from "./ownership.js";
 export * from "./ownership-rest.js";
 export * from "./ownership-runtime.js";
+export * from "./dashcam-autosave.js";
+export * from "./signed-command.js";
+export * from "./proto-wire.js";
 
 /**
  * Tesla source adapter.
@@ -54,8 +63,12 @@ export * from "./ownership-runtime.js";
  *                  pushes it today; telemetry.fields here is its source of truth.
  *
  * Hard rules enforced here:
- *   - The bridge NEVER sends vehicle commands (config with commands is refused).
- *   - Never poll vehicle_data or wake a car. Vehicles are push-only via telemetry.
+ *   - The bridge NEVER sends vehicle commands by default (config with commands/actions keys is
+ *     refused). EXPERIMENTAL exception: tesla.dashcam_autosave + env TESLA_DASHCAM_AUTOSAVE=1 may
+ *     send community DashcamSaveClipAction (47) via Fleet signed_command. Off by default; live
+ *     tests need the owner's yes. Stock tesla-http-proxy rejects action 47.
+ *   - Never poll vehicle_data or wake a car. Vehicles are push-only via telemetry (except the
+ *     experimental dashcam path above, which may wake the car as a side effect of the command).
  *   - Energy uses an ACCESS token only (energy_device_data). Refresh tokens are refused.
  *   - Replies go back through the agent's origin channel; there is no /tesla/callback.
  *   - Prompts and audit carry a masked VIN / site id only.
@@ -140,6 +153,11 @@ export interface TeslaConfig {
   };
   /** Ownership events (route match { kind: "ownership" }). */
   ownership?: OwnershipConfig;
+  /**
+   * EXPERIMENTAL dashcam auto-save (route match { kind: "dashcam_autosave" }).
+   * Also requires env TESLA_DASHCAM_AUTOSAVE=1. Off by default.
+   */
+  dashcam_autosave?: DashcamAutosaveConfig;
   /**
    * Audit lines record the full VIN of an allowlisted car (default true). false: the last 6 only.
    * Foreign (non-allowlisted) VINs always keep the last 6, and non-VIN strings are written "invalid".
@@ -232,14 +250,24 @@ export function validateTeslaConfig(raw: unknown): string[] {
   }
   for (const [i, r] of (c.routes ?? []).entries()) {
     const keys = Object.keys(r.match ?? {});
-    if (keys.length !== 1 || keys[0] !== "kind" || !["vehicle", "energy", "ownership"].includes(String(r.match.kind))) {
-      p.push(`tesla.routes[${i}]: match must be { kind: "vehicle" }, { kind: "energy" } or { kind: "ownership" }`);
+    if (keys.length !== 1 || keys[0] !== "kind" || !["vehicle", "energy", "ownership", "dashcam_autosave"].includes(String(r.match.kind))) {
+      p.push(`tesla.routes[${i}]: match must be { kind: "vehicle" }, { kind: "energy" }, { kind: "ownership" } or { kind: "dashcam_autosave" }`);
     }
   }
   if (c.ownership !== undefined) {
     const hasRoute = (c.routes ?? []).some((r) => r.match?.kind === "ownership" && r.enabled !== false);
     p.push(...validateOwnership(c.ownership, t?.vin_allowlist ?? [], hasRoute));
     if (c.ownership.enabled && !t?.enabled) p.push("tesla.ownership needs tesla.telemetry enabled (events come from the cars' telemetry)");
+  }
+  if (c.dashcam_autosave !== undefined) {
+    const hasDash = (c.routes ?? []).some((r) => r.match?.kind === "dashcam_autosave" && r.enabled !== false);
+    p.push(...validateDashcamAutosave(
+      c.dashcam_autosave,
+      t?.vin_allowlist ?? [],
+      hasDash,
+      Boolean(c.ownership?.enabled),
+      telemetryAuthenticated(t),
+    ));
   }
   return p;
 }
@@ -334,6 +362,7 @@ export class TeslaAdapter implements SourceAdapter {
   private receiver?: TelemetryReceiver;
   private energy?: EnergyStatusSource;
   private ownership?: OwnershipRuntime;
+  private dashcam?: DashcamAutosaveRuntime;
   private polling = false;
   private skipUntil = 0;
   private skipReason = "";
@@ -379,6 +408,15 @@ export class TeslaAdapter implements SourceAdapter {
     if (this.cfg.ownership?.enabled) {
       this.ownership = new OwnershipRuntime(this.cfg.ownership, this.ctx, { now: this.now, fetchImpl: this.deps.fetchImpl, testHosts: this.deps.testHosts, auditVin: (vin) => this.auditVin(vin) });
       this.ownership.start();
+    }
+    if (this.cfg.dashcam_autosave) {
+      this.dashcam = new DashcamAutosaveRuntime(this.cfg.dashcam_autosave, this.ctx, {
+        now: this.now,
+        fetchImpl: this.deps.fetchImpl,
+        testHosts: this.deps.testHosts,
+        auditVin: (vin) => this.auditVin(vin),
+      });
+      this.dashcam.start();
     }
     if (t?.enabled) {
       const mode = t.mode ?? "decoded";
@@ -473,10 +511,14 @@ export class TeslaAdapter implements SourceAdapter {
     this.timer = undefined;
     await this.receiver?.stop().catch(() => undefined);
     await this.ownership?.stop();
+    await this.dashcam?.stop();
   }
 
   health(): Record<string, unknown> {
-    return { ownership: this.ownership?.health() ?? { enabled: false } };
+    return {
+      ownership: this.ownership?.health() ?? { enabled: false },
+      dashcam_autosave: this.dashcam?.health() ?? { experimental: true, armed: false },
+    };
   }
 
   /** Ownership runtime (tests / ops): digest flush, REST pull, pending counts. */
@@ -537,9 +579,11 @@ export class TeslaAdapter implements SourceAdapter {
       return [];
     }
     if (r.alerts) {
-      // Alerts records carry no field data: they only feed ownership events.
-      if (this.ownership) await this.ownership.record(r, Boolean(r.baseline || r.isResend));
-      else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "alerts_without_ownership", ...this.auditVin(r.vin) });
+      // Alerts records carry no field data: they only feed ownership (and experimental dashcam) events.
+      if (this.ownership) {
+        const ev = await this.ownership.record(r, Boolean(r.baseline || r.isResend));
+        if (this.dashcam && ev.length) await this.dashcam.onOwnershipEvents(r.vin, ev);
+      } else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "alerts_without_ownership", ...this.auditVin(r.vin) });
       return [];
     }
     if (r.baseline) {
@@ -547,7 +591,10 @@ export class TeslaAdapter implements SourceAdapter {
       const cur = this.lastVehicle.get(r.vin) ?? {};
       const fresh = Object.fromEntries(Object.entries(r.data).filter(([k]) => !(k in cur)));
       this.lastVehicle.set(r.vin, mergeState(cur, fresh).next);
-      if (this.ownership) await this.ownership.record({ ...r, data: fresh }, true);
+      if (this.ownership) {
+        const ev = await this.ownership.record({ ...r, data: fresh }, true);
+        if (this.dashcam && ev.length) await this.dashcam.onOwnershipEvents(r.vin, ev);
+      }
       this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", ...this.auditVin(r.vin) });
       return [];
     }
@@ -563,11 +610,17 @@ export class TeslaAdapter implements SourceAdapter {
     this.lastVehicle.set(r.vin, next);
     if (r.isResend) {
       // A resend carries un-acked values: keep the state current, but never fire on it.
-      if (this.ownership) await this.ownership.record(r, true);
+      if (this.ownership) {
+        const ev = await this.ownership.record(r, true);
+        if (this.dashcam && ev.length) await this.dashcam.onOwnershipEvents(r.vin, ev);
+      }
       this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", ...this.auditVin(r.vin) });
       return [];
     }
-    if (this.ownership) await this.ownership.record(r, false);
+    if (this.ownership) {
+      const ev = await this.ownership.record(r, false);
+      if (this.dashcam && ev.length) await this.dashcam.onOwnershipEvents(r.vin, ev);
+    }
     const hits = deriveVehicleTriggers(prev, delta, { lowBatteryPercent: this.cfg.telemetry?.low_battery_percent });
     return this.fire("vehicle", r.vin, hits, r.createdAt || new Date(this.now()).toISOString());
   }

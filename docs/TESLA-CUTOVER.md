@@ -88,3 +88,18 @@ Ground rules:
 - [ ] fleet-telemetry and the broker can keep running, or be stopped. To stop the car streaming, remove the telemetry config (`DELETE /api/1/vehicles/<VIN>/fleet_telemetry_config`, a car change that needs the owner's yes) or let its `exp` lapse.
 - [ ] Unset `TESLA_FLEET_ACCESS_TOKEN_EXPORT_FILE` in the plugin and delete the exported file if energy polling is abandoned.
 - [ ] Audit and hold files stay in the data volume for review. `tesla-energy-state.json` can be deleted safely; the only effect is that the next first poll reports what's already in effect.
+
+## 8. EXPERIMENTAL dashcam auto-save (off by default)
+
+Saves a dashcam clip on the car when a crash/collision or AEB telemetry alert is classified as `collision_or_safety` (same alert-name heuristics as ownership events). Sends community CarServer action 47 (`DashcamSaveClipAction`) through Fleet API `signed_command` (stock `tesla-http-proxy` rejects it). **Unverified until a live test. Needs the owner's yes before any live command.**
+
+- [ ] Ownership events are on (step 5) and alerts reach the bridge.
+- [ ] A NIST-P256 private key paired with the car is on the host (mode 600), referenced only as `file:/…` — never in git.
+- [ ] Telemetry is authenticated (decoded_token_ref, MQTT username_ref+password_ref, or mTLS PEMs) — dashcam refuses to arm without one.
+- [ ] `config/tesla.json` has `dashcam_autosave` (see `adapters/tesla/config.example.json`): `enabled: true`, `api_base`, `token_ref`, `key_ref`, cooldown / global cap, and a route `match: { "kind": "dashcam_autosave" }` whose `agent` is the registry alias that should be notified (example: `example-agent`). Optional `max_alert_age_s` (default 300) refuses stale alerts; `notify_max_per_hour` caps dashcam notifies.
+- [ ] Registry has that alias (see `config/registry.example.json` placeholder `example-agent`).
+- [ ] Set host env `TESLA_DASHCAM_AUTOSAVE=1`. Any other value (unset, `true`, `yes`) keeps the feature inert even if config says enabled.
+- [ ] `node dist/src/main.js --check` → ok.
+- [ ] Recreate the bridge. Audit should show `dashcam_autosave_experimental_armed` once. No car command has been sent yet.
+- [ ] Live test only with the owner's explicit yes: induce a safe test path or wait for a real safety alert; confirm one `dashcam_autosave_attempt` / `…_saved` or `…_failed` audit line and an immediate notify to the alias. Confirm the car's SavedClips gained a clip. Mark the field-47 encoding verified or file a fix.
+- [ ] To disable: unset `TESLA_DASHCAM_AUTOSAVE` (or set anything but `1`) and/or `dashcam_autosave.enabled: false`, recreate. State file `dashcam-autosave-state.json` can stay; it only holds dedupe timestamps keyed by `vehicle_id`.
