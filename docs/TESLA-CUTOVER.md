@@ -17,7 +17,7 @@ Ground rules:
 
 ## 1. MQTT broker
 
-- [ ] Run a broker (for example Mosquitto) bound to loopback, or to a compose network shared by fleet-telemetry and the bridge. Don't publish its port to the internet.
+- [ ] Run a broker (for example Mosquitto) on a compose network shared by fleet-telemetry and the bridge (simplest), or on the host. A host broker bound only to `127.0.0.1` can't be reached from the bridge's compose network: also listen on the Docker bridge gateway address (`listener <mqtt-port> <bridge-gateway-ip>`; find it with `docker network inspect <bridge-compose-project>_default --format '{{(index .IPAM.Config 0).Gateway}}'`), and never on public interfaces. Don't publish its port to the internet.
 - [ ] Two broker users. `fleet-telemetry` may **publish** to `telemetry/#`, and `bridge` may only **subscribe** to `telemetry/+/v/+`. With Mosquitto, an ACL file like:
 
   ```
@@ -28,6 +28,7 @@ Ground rules:
   ```
 
 - [ ] Message size limit: `message_size_limit 65536` in `mosquitto.conf`. The bridge drops payloads over 64 KB, but only after its MQTT client has buffered the whole packet, so the broker should refuse them first.
+- [ ] Host firewall: if the broker runs on the host (or publishes its port on the host) and the host runs a firewall such as ufw, allow the bridge's compose network to reach it, or the MQTT connection fails silently (connect timeouts and backoff in the audit, no events). Find the subnet with `docker network inspect <bridge-compose-project>_default --format '{{(index .IPAM.Config 0).Subnet}}'`, then for example `sudo ufw allow from <compose-subnet> to any port <mqtt-port> proto tcp`. Recheck after the compose network is recreated, since its subnet can change. Not needed when the broker shares the bridge's compose network. If the broker runs in Docker with a published port, ufw rules don't govern it (Docker's own iptables rules bypass them): bind the published port to a specific host address (e.g. `127.0.0.1:<mqtt-port>:<mqtt-port>`) or filter it in the `DOCKER-USER` chain.
 - [ ] Anonymous access off. Passwords live in host-only files (mode 600).
 - [ ] Optional TLS (`mqtts://`): give the bridge the broker CA through `telemetry.mqtt.ca_file` (`file:` ref).
 

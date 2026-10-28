@@ -220,3 +220,36 @@ test("migrated config end to end: guild wake, each DM route, default agent via p
     await planner.close();
   }
 });
+
+test("migrate-old-config: --gateway-url-ref / --gateway-token-ref override the registry-addition refs; defaults unchanged; literals refused", () => {
+  const { dir, p } = files();
+  const script = new URL("./migrate-old-config.mjs", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+  const base = ["--security", p("security.json"), "--channel-map", p("channel-map.json"), "--env", p(".env"), "--planner-handler", PH];
+  const run = (extra: string[]) => spawnSync(process.execPath, [script, ...base, ...extra], { encoding: "utf8" });
+  const refsOf = (stdout: string) => JSON.parse(stdout);
+  const def = run([]);
+  assert.equal(def.status, 0, def.stderr);
+  const defAdds = Object.values(refsOf(def.stdout).registryAdditions) as any[];
+  assert.ok(defAdds.length > 0);
+  for (const a of defAdds) assert.equal(a.deliver.keyRef, "env:GROK_BOT_GATEWAY_TOKEN");
+  assert.ok(defAdds.some((a) => a.deliver.urlRef === "env:GROK_BOT_SENDPROMPT_URL"));
+  const over = run(["--gateway-url-ref", "env:EXAMPLE_GATEWAY_URL", "--gateway-token-ref", "file:/run/secrets/example-gateway-token"]);
+  assert.equal(over.status, 0, over.stderr);
+  const b = refsOf(over.stdout);
+  const adds = Object.values(b.registryAdditions) as any[];
+  for (const a of adds) {
+    assert.equal(a.deliver.keyRef, "file:/run/secrets/example-gateway-token");
+    assert.notEqual(a.deliver.urlRef, "env:GROK_BOT_SENDPROMPT_URL");
+  }
+  assert.ok(adds.some((a) => a.deliver.urlRef === "env:EXAMPLE_GATEWAY_URL"));
+  assert.ok(b.env.referenced.includes("EXAMPLE_GATEWAY_URL"));
+  assert.ok(!b.env.referenced.includes("GROK_BOT_GATEWAY_TOKEN"));
+  for (const bad of [["--gateway-url-ref", "https://example.invalid/x"], ["--gateway-token-ref", "sentinel-literal"], ["--gateway-url-ref"], ["--gateway-token-ref", "file:relative/x"], ["--gateway-token-ref", "file: /x"], ["--gateway-url-ref", "env:BAD NAME"]]) {
+    const r = run(bad);
+    assert.equal(r.status, 2, bad.join(" "));
+    assert.ok(!r.stderr.includes("sentinel-literal") && !r.stderr.includes("example.invalid"));
+    assert.ok(!/\n\s+at /.test(r.stderr), "no stack trace");
+  }
+  for (const bad of ["literal", "file:relative/x", "file: /x"]) assert.throws(() => convert({ security: {}, channelMap: {}, gatewayTokenRef: bad }), /env:NAME or file/);
+  void dir;
+});
