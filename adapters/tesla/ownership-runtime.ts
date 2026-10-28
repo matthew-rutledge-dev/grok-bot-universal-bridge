@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, posix, win32 } from "node:path";
 import type { AdapterContext } from "../../core/bridge.js";
+import { vinAuditActor, type VinAudit } from "./audit-vin.js";
 import { baseUrlProblem, EnergyApiError, FLEET_API_HOSTS, NHTSA_HOSTS, type FetchLike, type TestHostOverride } from "./energy.js";
 import type { TelemetryRecord, TelemetryValue } from "./fields.js";
 import {
@@ -112,6 +113,8 @@ export interface OwnershipDeps {
   fetchImpl?: FetchLike;
   /** TESTS ONLY: extra hosts for the REST client. */
   testHosts?: TestHostOverride;
+  /** Audit actor fields for a VIN (the adapter's audit_full_vin policy). Default: full VIN when VIN-shaped. */
+  auditVin?: (vin: string) => VinAudit;
 }
 
 /**
@@ -151,6 +154,10 @@ export class OwnershipRuntime {
     private readonly ctx: AdapterContext,
     private readonly deps: OwnershipDeps,
   ) {}
+
+  private av(vin: string): VinAudit {
+    return this.deps.auditVin?.(vin) ?? vinAuditActor(vin, true, true);
+  }
 
   private vehicleFor(vin: string): OwnershipVehicle & { vehicle_id: string } {
     const v = (this.cfg.vehicles ?? []).find((x) => x.vin === vin) ?? { vin };
@@ -220,7 +227,7 @@ export class OwnershipRuntime {
       return await this.recordUnsafe(r, quiet);
     } catch {
       // Ownership must never break the wake triggers that share the record.
-      this.ctx.audit({ action: "observe", outcome: "error", reason: "ownership_ingest_failed", actor: r.vin, actorKeep: "full" });
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "ownership_ingest_failed", ...this.av(r.vin) });
       return [];
     }
   }
@@ -272,7 +279,7 @@ export class OwnershipRuntime {
       eventId,
       lane: `ownership:${vehicleId}`,
       actor: vin,
-      actorKeep: "full",
+      actorKeep: this.av(vin).actorKeep,
       match: { kind: "ownership" },
       addressed: true,
       prompt: [
@@ -283,7 +290,7 @@ export class OwnershipRuntime {
       ].join("\n"),
       metadata: { kind: "ownership", digest, event_types: [...new Set(events.map((e) => e.event_type))].join(","), priority: events.some((e) => e.priority === "high") ? "high" : "normal" },
     });
-    this.ctx.audit({ action: "observe", outcome: res.accepted ? "ok" : "skipped", reason: res.accepted ? (digest ? "ownership_digest" : "ownership_immediate") : `ownership_${res.reason}`, type: digest ? "digest" : e0.event_type, actor: vin, actorKeep: "full", count: events.length });
+    this.ctx.audit({ action: "observe", outcome: res.accepted ? "ok" : "skipped", reason: res.accepted ? (digest ? "ownership_digest" : "ownership_immediate") : `ownership_${res.reason}`, type: digest ? "digest" : e0.event_type, ...this.av(vin), count: events.length });
     return res.accepted;
   }
 
@@ -346,7 +353,7 @@ export class OwnershipRuntime {
         } catch (err) {
           fails[k] = now;
           const e = err instanceof EnergyApiError ? err : new EnergyApiError("fleet_api_unreachable");
-          this.ctx.audit({ action: "observe", outcome: "error", reason: e.code, type: `ownership_rest_${k}`, actor: vin, actorKeep: "full", status: e.status });
+          this.ctx.audit({ action: "observe", outcome: "error", reason: e.code, type: `ownership_rest_${k}`, ...this.av(vin), status: e.status });
           if (fleet && e.code === "rate_limited") this.restBackoffUntil = Math.max(this.restBackoffUntil, now + (e.retryAfterSec ?? 60) * 1000);
           else if (fleet && ["unauthorized", "login_required", "missing_scope", "no_token"].includes(e.code)) this.restBackoffUntil = Math.max(this.restBackoffUntil, now + PULL_RETRY_MS);
         }
@@ -372,7 +379,7 @@ export class OwnershipRuntime {
           const year = t.vehicle.model_year ?? dec.modelYear;
           if (!model || !year) {
             pulls.recalls = now;
-            this.ctx.audit({ action: "observe", outcome: "skipped", reason: "recalls_model_unknown", actor: vin, actorKeep: "full" });
+            this.ctx.audit({ action: "observe", outcome: "skipped", reason: "recalls_model_unknown", ...this.av(vin) });
             return;
           }
           const items = parseNhtsaRecalls(await rest.recalls(model, year));

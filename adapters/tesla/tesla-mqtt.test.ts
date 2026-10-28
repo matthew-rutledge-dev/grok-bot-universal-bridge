@@ -202,7 +202,9 @@ test("mqtt e2e: publish -> record -> trigger -> wake submit to the routine; Gear
     // Another VIN on the same broker is not allowlisted.
     await p.datum("DetailedChargeState", "DetailedChargeStateComplete", false, "5YJ1111111EXAMPLE");
     await until(() => b.audit.lines.some((l) => l.reason === "vin_not_allowlisted"));
-    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "5YJ1111111EXAMPLE"), "audit has the full VIN");
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…XAMPLE"), "a foreign VIN keeps the last 6");
+    assert.equal(JSON.stringify(b.audit.lines).includes("5YJ1111111EXAMPLE"), false, "never the foreign VIN in full");
+    assert.ok(b.audit.lines.some((l) => l.actor === VIN), "the allowlisted car is audited with its full VIN");
     assert.equal(JSON.stringify(m.hits).includes(VIN), false, "prompts carry the masked id only");
   } finally {
     await p.close();
@@ -388,7 +390,8 @@ test("mqtt: VINs not allowlisted are dropped before parsing or batching; the aud
     await until(() => m.hits.length === 1);
     assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, 0, "unknown VIN payloads are not parsed");
     assert.equal(denies().length, 1, "22 messages, one audit line");
-    assert.equal(denies()[0].actor, OTHER, "full VIN in the audit");
+    assert.equal(denies()[0].actor, "…AMPLE9", "a foreign VIN keeps the last 6");
+    assert.equal(JSON.stringify(b.audit.lines).includes(OTHER), false, "never the foreign VIN in full");
     // Ten minutes on, the next line carries the count suppressed in between.
     clock += 10 * 60_000;
     await p.datum("SentryMode", "SentryModeStateArmed", false, OTHER);
@@ -487,7 +490,8 @@ test("mqtt: with ownership on, alerts/<name>/current is subscribed and feeds own
     await p.raw(`${BASE}/${OTHER}/alerts/UI_a001_Example/current`, JSON.stringify(alert));
     await p.raw(`${BASE}/${OTHER}/alerts/RCM2_a001_Example_Crash/current`, JSON.stringify({ ...alert, Name: "RCM2_a001_Example_Crash" }));
     await until(() => b.audit.lines.some((l) => l.reason === "vin_not_allowlisted"));
-    assert.equal(b.audit.lines.filter((l) => l.reason === "vin_not_allowlisted")[0].actor, OTHER);
+    assert.equal(b.audit.lines.filter((l) => l.reason === "vin_not_allowlisted")[0].actor, "…AMPLE9");
+    assert.equal(JSON.stringify(b.audit.lines).includes(OTHER), false, "never the foreign VIN in full");
     assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, 0);
     await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/history`, JSON.stringify([alert]));
     await p.raw(`${BASE}/${VIN}/errors/some_error`, JSON.stringify({ Name: "some_error", Body: "x" }));

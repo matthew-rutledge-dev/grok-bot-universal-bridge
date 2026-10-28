@@ -18,7 +18,7 @@ export interface InboundEvent {
   lane: string;
   /** Who caused it (user id, client id, vehicle id). Checked against the route's allowActors. */
   actor: string;
-  /** Characters of the actor kept in audit lines (default 4), or "full" for no masking (the Tesla adapter, for VINs). */
+  /** Characters of the actor kept in audit lines (default 4), or "full" for an unmasked VIN-shaped actor (anything else is written "invalid"; the Tesla adapter, for VINs). */
   actorKeep?: 4 | 6 | "full";
   /** Optional groups the actor belongs to (roles). Checked against route.allowGroups. */
   actorGroups?: string[];

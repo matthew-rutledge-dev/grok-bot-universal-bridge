@@ -1,4 +1,5 @@
 {
+  "audit_full_vin": true,
   "telemetry": {
     "enabled": false,
     "mode": "mqtt",
