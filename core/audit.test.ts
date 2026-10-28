@@ -26,6 +26,16 @@ test("audit masks ids and drops anything outside the allow list", () => {
   assert.match(String(line.ts), /^\d{4}-\d\d-\d\dT/);
 });
 
+test("actorKeep: default 4, 6 keeps six, \"full\" writes the actor unmasked (control chars stripped); other ids stay masked", () => {
+  const base = { adapter: "tesla", action: "observe" as const, outcome: "ok" as const, eventId: "tesla:555555555555555555", lane: "vehicle:…MPLE" };
+  assert.equal(auditLine({ ...base, actor: "5YJ0000000EXAMPLE" }).actor, "…MPLE");
+  assert.equal(auditLine({ ...base, actor: "5YJ0000000EXAMPLE", actorKeep: 6 }).actor, "…XAMPLE");
+  const full = auditLine({ ...base, actor: "5YJ0000000EXAMPLE", actorKeep: "full" });
+  assert.equal(full.actor, "5YJ0000000EXAMPLE");
+  assert.equal(full.eventId, "…5555");
+  assert.equal(auditLine({ ...base, actor: "5YJ0000000\nEXAMPLE", actorKeep: "full" }).actor, "5YJ0000000 EXAMPLE");
+});
+
 test("JSONL audit appends one line per entry", () => {
   const p = join(tmp(), "a", "audit.jsonl");
   const a = new JsonlAudit(p);

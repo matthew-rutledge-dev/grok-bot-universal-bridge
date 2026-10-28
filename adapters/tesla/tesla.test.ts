@@ -192,7 +192,7 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
     assert.equal(m.hits.length, 1);
     const prompt: string = m.hits[0].body.prompt;
     assert.match(prompt, /Tesla vehicle …MPLE: charge_complete \(priority normal\)/);
-    assert.equal(prompt.includes(VIN), false, "full VIN never leaves the bridge");
+    assert.equal(prompt.includes(VIN), false, "the prompt never has the full VIN");
     // The event id hashes only the masked id: it can't be brute-forced back to the VIN.
     const at = "2026-01-01T01:00:00Z";
     const id = /t:charge_complete:([0-9a-f]{16})/.exec(prompt)![1];
@@ -208,8 +208,9 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
     assert.ok(b.audit.lines.some((l) => l.reason === "stale_record"));
 
     assert.deepEqual(await a.ingestTelemetry({ vin: "OTHERVIN000000009", createdAt: "x", data: { DetailedChargeState: "Complete" } }), []);
-    assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false);
-    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…000009"), "audit keeps the last 6 of a VIN, like vin_last6");
+    assert.ok(b.audit.lines.filter((l) => l.reason === "resend" || l.reason === "stale_record").every((l) => l.actor === VIN), "audit lines carry the full VIN");
+    assert.equal(m.hits.some((h) => JSON.stringify(h.body).includes(VIN)), false, "prompts still carry the masked id only");
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "OTHERVIN000000009"), "a denied VIN is audited in full too");
     const cb = await b.call("POST", "/tesla/callback", {});
     assert.equal(cb.status, 404, "no tesla callback route: replies use the origin channel");
   } finally {

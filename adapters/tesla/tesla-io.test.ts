@@ -446,7 +446,8 @@ test("mtls receiver: client cert required and verified; VIN from cert CN; payloa
     const reasons = b.audit.lines.map((l) => l.reason);
     assert.ok(reasons.includes("vin_cert_mismatch"));
     assert.ok(reasons.includes("undecodable_frame"));
-    assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false);
+    assert.ok(b.audit.lines.filter((l) => l.reason === "vin_cert_mismatch").every((l) => l.actor === VIN), "audit lines carry the full VIN");
+    assert.equal(JSON.stringify(m.hits).includes(VIN), false, "prompts carry the masked id only");
 
     // Frame errors must not crash the process: oversize frame and invalid UTF-8 text frame.
     let unhandled = 0;
@@ -464,7 +465,7 @@ test("mtls receiver: client cert required and verified; VIN from cert CN; payloa
       }
       for (let i = 0; i < 50 && b.audit.lines.filter((l) => l.reason === "bad_record").length < dropsBefore + 2; i++) await new Promise((r) => setTimeout(r, 20));
       assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, dropsBefore + 2);
-      assert.ok(b.audit.lines.filter((l) => l.reason === "bad_record").slice(-2).every((l) => l.actor === "…XAMPLE"), "frame errors carry the captured cert VIN (masked to the last 6)");
+      assert.ok(b.audit.lines.filter((l) => l.reason === "bad_record").slice(-2).every((l) => l.actor === VIN), "frame errors carry the captured cert VIN in full");
       assert.equal(unhandled, 0);
       const again = await open(car);
       again.close();
