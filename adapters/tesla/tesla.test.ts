@@ -59,7 +59,8 @@ test("telemetry config: prefer_typed, replaced field names, VIN shape, receiver 
   ] as const) {
     assert.match(v({ fields: { [f]: 10 } }), hint, f);
   }
-  assert.match(v({ fields: { Odometer: 10 } }), /not read by the trigger logic/);
+  assert.match(v({ fields: { VehicleSpeed: 10 } }), /not read by the trigger logic or ownership events/);
+  assert.equal(v({ fields: { ...t.fields!, Odometer: 600 } }), "", "ownership fields are accepted");
   assert.equal(v({ fields: { ...t.fields!, Soc: 300 } }), "", "Soc is accepted as stream-only (low_battery still reads BatteryLevel)");
   assert.match(v({ fields: { ...t.fields!, Gear: 0 } }), /whole seconds >= 1/);
   assert.match(v({ resend_interval_s: 5 }), /resend_interval_s must be an integer >= 60/);
@@ -191,7 +192,7 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
     assert.equal(m.hits.length, 1);
     const prompt: string = m.hits[0].body.prompt;
     assert.match(prompt, /Tesla vehicle …MPLE: charge_complete \(priority normal\)/);
-    assert.equal(prompt.includes(VIN), false, "full VIN never leaves the bridge");
+    assert.equal(prompt.includes(VIN), false, "the prompt never has the full VIN");
     // The event id hashes only the masked id: it can't be brute-forced back to the VIN.
     const at = "2026-01-01T01:00:00Z";
     const id = /t:charge_complete:([0-9a-f]{16})/.exec(prompt)![1];
@@ -207,8 +208,14 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
     assert.ok(b.audit.lines.some((l) => l.reason === "stale_record"));
 
     assert.deepEqual(await a.ingestTelemetry({ vin: "OTHERVIN000000009", createdAt: "x", data: { DetailedChargeState: "Complete" } }), []);
-    assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false);
-    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…0009"));
+    assert.ok(b.audit.lines.filter((l) => l.reason === "resend" || l.reason === "stale_record").every((l) => l.actor === VIN), "audit lines carry the full VIN");
+    assert.equal(m.hits.some((h) => JSON.stringify(h.body).includes(VIN)), false, "prompts still carry the masked id only");
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "invalid"), "a string that isn't VIN-shaped (has O) is written as invalid, never raw");
+    assert.equal(JSON.stringify(b.audit.lines).includes("OTHERVIN"), false);
+    // A foreign but VIN-shaped VIN keeps the last 6 only.
+    assert.deepEqual(await a.ingestTelemetry({ vin: "5YJ0000EXAMPLE009", createdAt: "x", data: { DetailedChargeState: "Complete" } }), []);
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…PLE009"), "foreign VINs are masked to the last 6");
+    assert.equal(JSON.stringify(b.audit.lines).includes("5YJ0000EXAMPLE009"), false);
     const cb = await b.call("POST", "/tesla/callback", {});
     assert.equal(cb.status, 404, "no tesla callback route: replies use the origin channel");
   } finally {
@@ -250,5 +257,30 @@ test("resend records update the stored state without firing", async () => {
   } finally {
     await b.close();
     await m.close();
+  }
+});
+
+test("audit_full_vin: default true (allowlisted VIN in full); false keeps the last 6; foreign VINs keep 6 and non-VIN strings are 'invalid' either way", async () => {
+  assert.deepEqual(validateTeslaConfig({ ...example, audit_full_vin: false }), []);
+  assert.match(validateTeslaConfig({ ...example, audit_full_vin: "yes" }).join("\n"), /audit_full_vin must be true or false/);
+  for (const full of [undefined, true, false]) {
+    const m = await mockRoutine({ key: "routine-key" });
+    const a = new TeslaAdapter({ ...example, ...(full === undefined ? {} : { audit_full_vin: full }) });
+    const b = await startBridge({ routineUrl: m.url, adapters: [a] });
+    try {
+      await a.ingestTelemetry({ vin: VIN, createdAt: "2026-01-01T00:00:00Z", data: { DetailedChargeState: "DetailedChargeStateComplete" } });
+      await a.ingestTelemetry({ vin: VIN, createdAt: "2026-01-01T00:30:00Z", data: { DetailedChargeState: "DetailedChargeStateCharging" }, isResend: true });
+      await a.ingestTelemetry({ vin: "5YJ0000EXAMPLE009", createdAt: "x", data: {} });
+      await a.ingestTelemetry({ vin: "x".repeat(80), createdAt: "x", data: {} });
+      const own = b.audit.lines.filter((l) => l.reason === "resend").map((l) => l.actor);
+      assert.deepEqual(own, [full === false ? "…XAMPLE" : VIN], `audit_full_vin=${full}`);
+      const denied = b.audit.lines.filter((l) => l.reason === "vin_not_allowlisted").map((l) => l.actor);
+      assert.deepEqual(denied, ["…PLE009", "invalid"]);
+      assert.equal(JSON.stringify(b.audit.lines).includes("xxxxxx"), false, "a non-VIN string is never logged raw");
+      assert.equal(JSON.stringify(m.hits).includes(VIN), false, "prompts never carry the full VIN");
+    } finally {
+      await b.close();
+      await m.close();
+    }
   }
 });

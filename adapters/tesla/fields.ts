@@ -39,6 +39,44 @@ export const REPLACED_FIELDS: Record<string, string> = {
  */
 export const STREAM_ONLY_FIELDS: readonly string[] = ["Soc"];
 
+/**
+ * Fields the ownership events read (adapters/tesla/ownership.ts). All are in vehicle_data.proto;
+ * all but NominalFullPackEnergyKwh are on Tesla's Available Data page (that one is proto-only,
+ * firmware 2026.32+). Location is only kept coarse (city level) and only attached to safety and
+ * service events.
+ */
+export const OWNERSHIP_FIELDS = [
+  "Version",
+  "SoftwareUpdateVersion",
+  "SoftwareUpdateInstallationPercentComplete",
+  "Odometer",
+  "ServiceMode",
+  "TpmsPressureFl",
+  "TpmsPressureFr",
+  "TpmsPressureRl",
+  "TpmsPressureRr",
+  "TpmsSoftWarnings",
+  "TpmsHardWarnings",
+  "DetailedChargeState",
+  "ChargeEnableRequest",
+  "ChargeLimitSoc",
+  "BatteryLevel",
+  "RatedRange",
+  "EnergyRemaining",
+  "NominalFullPackEnergyKwh",
+  "BMSState",
+  "Hvil",
+  "SentryMode",
+  "AutomaticEmergencyBrakingOff",
+  "CarType",
+  "Trim",
+  "Location",
+] as const;
+export type OwnershipField = (typeof OWNERSHIP_FIELDS)[number];
+
+/** Every field a receiver keeps (trigger fields + ownership fields). */
+export const ACCEPTED_FIELDS: ReadonlySet<string> = new Set<string>([...KNOWN_FIELDS, ...OWNERSHIP_FIELDS]);
+
 /** Doors struct (proto message Doors). */
 export const DOOR_KEYS = ["DriverFront", "DriverRear", "PassengerFront", "PassengerRear"] as const;
 export const TRUNK_KEYS = ["TrunkFront", "TrunkRear"] as const;
@@ -48,7 +86,44 @@ export type Doors = Partial<Record<(typeof DOOR_KEYS)[number] | (typeof TRUNK_KE
 export interface Invalid {
   invalid: true;
 }
-export type TelemetryValue = string | number | boolean | null | Doors | Invalid;
+/** TireLocation struct (TpmsSoftWarnings / TpmsHardWarnings), normalised to fl/fr/rl/rr. */
+export type TireSet = Partial<Record<"fl" | "fr" | "rl" | "rr", boolean>>;
+/** Location, already rounded to city level on ingest (the precise value is never stored). */
+export interface CoarseLocation {
+  lat: number;
+  lon: number;
+}
+export type TelemetryValue = string | number | boolean | null | Doors | Invalid | TireSet | CoarseLocation;
+
+/** Decimal places kept for Location (1 = about 11 km, roughly city level). */
+export const COARSE_DECIMALS = 1;
+
+/** {latitude, longitude} (MQTT) or {latitude, longitude} protojson -> coarse location, or undefined. */
+export function coarseLocation(v: unknown): CoarseLocation | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  const lat = num(o.latitude ?? o.lat);
+  const lon = num(o.longitude ?? o.lon);
+  if (lat === undefined || lon === undefined || Math.abs(lat) > 90 || Math.abs(lon) > 180) return undefined;
+  const f = 10 ** COARSE_DECIMALS;
+  return { lat: Math.round(lat * f) / f, lon: Math.round(lon * f) / f };
+}
+
+const TIRE_KEYS: Record<string, keyof TireSet> = {
+  front_left: "fl", frontLeft: "fl", front_right: "fr", frontRight: "fr",
+  rear_left: "rl", rearLeft: "rl", rear_right: "rr", rearRight: "rr",
+};
+
+/** TireLocation struct (snake_case from MQTT, camelCase from protojson) -> TireSet. Semi axles are ignored. */
+export function tireSet(v: unknown): TireSet | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v) || isInvalid(v)) return undefined;
+  const out: TireSet = {};
+  for (const [k, b] of Object.entries(v as Record<string, unknown>)) {
+    const t = TIRE_KEYS[k];
+    if (t) out[t] = b === true || b === "true";
+  }
+  return out;
+}
 
 export const isInvalid = (v: unknown): v is Invalid =>
   typeof v === "object" && v !== null && (v as { invalid?: unknown }).invalid === true;
@@ -95,6 +170,8 @@ export function fromProtoValue(v: unknown): TelemetryValue | undefined {
   const o = v as Record<string, unknown>;
   if (o.invalid === true) return { invalid: true };
   if ("doorValue" in o) return doors(o.doorValue) ?? {};
+  if ("tireLocationValue" in o) return tireSet(o.tireLocationValue) ?? {};
+  if ("locationValue" in o) return coarseLocation(o.locationValue);
   // Exactly one oneof member is meaningful; with EmitUnpopulated the others are absent (oneof).
   for (const [k, x] of Object.entries(o)) {
     if (k === "invalid") continue;
@@ -112,6 +189,38 @@ export interface TelemetryRecord {
   /** A replayed value (e.g. an MQTT retained message): folded into state as a baseline, never fires. */
   baseline?: boolean;
   data: Record<string, TelemetryValue>;
+  /** VehicleAlerts (vehicle_alert.proto), when the record is an alerts record. */
+  alerts?: VehicleAlertRecord[];
+  /**
+   * A VehicleErrors record (vehicle_error.proto): errors from the car's telemetry client (bad
+   * config, unknown field), not vehicle fault codes. Counted in audit only.
+   */
+  telemetryErrors?: number;
+}
+
+/** One VehicleAlert: active while endedAt is unset. Audiences: Customer, Service, ServiceFix. */
+export interface VehicleAlertRecord {
+  name: string;
+  audiences: string[];
+  startedAt?: string;
+  endedAt?: string;
+}
+
+const ALERT_NAME = /^[A-Za-z0-9_.-]{1,128}$/;
+
+/**
+ * One alert, from protojson ({ name, audiences, startedAt, endedAt }) or fleet-telemetry's MQTT
+ * payload ({ Name, Audiences, StartedAt, EndedAt }). Undefined when it has no usable name.
+ */
+export function parseAlert(raw: unknown, nameHint?: string): VehicleAlertRecord | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const name = typeof o.name === "string" ? o.name : typeof o.Name === "string" ? o.Name : nameHint;
+  if (typeof name !== "string" || !ALERT_NAME.test(name)) return undefined;
+  const aud = (o.audiences ?? o.Audiences) as unknown;
+  const audiences = Array.isArray(aud) ? aud.filter((a): a is string => typeof a === "string").map((a) => a.replace(/^AUDIENCE_/i, "")) : [];
+  const ts = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? new Date(Date.parse(v)).toISOString() : undefined);
+  return { name, audiences, startedAt: ts(o.startedAt ?? o.StartedAt), endedAt: ts(o.endedAt ?? o.EndedAt) };
 }
 
 /**
@@ -126,6 +235,11 @@ export function parsePayload(raw: unknown): TelemetryRecord | undefined {
   const createdAt = typeof o.createdAt === "string" ? o.createdAt : typeof o.created_at === "string" ? o.created_at : "";
   const isResend = o.isResend === true || o.is_resend === true;
   const data: Record<string, TelemetryValue> = {};
+  if (Array.isArray(o.alerts)) {
+    const alerts = o.alerts.map((a) => parseAlert(a)).filter((a): a is VehicleAlertRecord => a !== undefined);
+    return { vin, createdAt, isResend, data, alerts };
+  }
+  if (Array.isArray(o.errors)) return { vin, createdAt, isResend, data, telemetryErrors: o.errors.length };
   if (Array.isArray(o.data)) {
     for (const d of o.data) {
       const key = (d as { key?: unknown })?.key;
@@ -136,7 +250,12 @@ export function parsePayload(raw: unknown): TelemetryRecord | undefined {
   } else if (o.data && typeof o.data === "object") {
     for (const [k, v] of Object.entries(o.data as Record<string, unknown>)) {
       if (v === undefined) continue;
-      data[k] = k === "DoorState" ? (doors(v) ?? (isInvalid(v) ? { invalid: true } : {})) : (v as TelemetryValue);
+      if (k === "DoorState") data[k] = doors(v) ?? (isInvalid(v) ? { invalid: true } : {});
+      else if (k === "TpmsSoftWarnings" || k === "TpmsHardWarnings") data[k] = tireSet(v) ?? (isInvalid(v) ? { invalid: true } : {});
+      else if (k === "Location") {
+        const c = coarseLocation(v);
+        if (c) data[k] = c;
+      } else data[k] = v as TelemetryValue;
     }
   } else {
     return undefined;

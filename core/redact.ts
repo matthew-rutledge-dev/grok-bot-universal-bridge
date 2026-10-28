@@ -14,13 +14,13 @@ export function redactUrl(raw: string | undefined): string | undefined {
 }
 
 /**
- * Mask an identifier for audit lines: keep the last 4 characters.
- * "5YJ0000000EXAMPLE" -> "…MPLE". Short values become "…".
+ * Mask an identifier for audit lines: keep the last 4 characters (or `keep`, 4 or 6).
+ * "5YJ0000000EXAMPLE" -> "…MPLE" (keep 6: "…XAMPLE"). Short values become "…".
  */
-export function maskId(raw: string | undefined | null): string {
+export function maskId(raw: string | undefined | null, keep: 4 | 6 = 4): string {
   const v = (raw ?? "").trim();
-  if (v.length <= 4) return "…";
-  return `…${v.slice(-4)}`;
+  if (v.length <= keep) return "…";
+  return `…${v.slice(-keep)}`;
 }
 
 /** Error class / code only. Never the message: it can echo a URL or a key. */

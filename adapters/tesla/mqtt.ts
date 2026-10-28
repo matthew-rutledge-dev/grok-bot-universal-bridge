@@ -1,6 +1,6 @@
 import { isIP } from "node:net";
 import { connect, type IClientOptions, type MqttClient } from "mqtt";
-import { doors, KNOWN_FIELDS, type TelemetryRecord, type TelemetryValue } from "./fields.js";
+import { ACCEPTED_FIELDS, coarseLocation, doors, parseAlert, tireSet, type TelemetryRecord, type TelemetryValue } from "./fields.js";
 import type { ReceiverSink, TelemetryReceiver } from "./receiver.js";
 
 /**
@@ -18,7 +18,13 @@ import type { ReceiverSink, TelemetryReceiver } from "./receiver.js";
  * bridge's receive time and resends can't be told apart. The datums of one vehicle Payload are
  * published back to back with SetOrderMatters(false), so messages for one VIN are coalesced for
  * `batch_ms` into one record before the trigger logic runs (Gear and DoorState from the same
- * Payload are evaluated together). Alerts, errors and connectivity topics are not subscribed.
+ * Payload are evaluated together). With `alerts: true` the receiver also subscribes to
+ *
+ *   topic    <topic_base>/<VIN>/alerts/<AlertName>/current
+ *   payload  {"Name": ..., "StartedAt": RFC 3339, "EndedAt": RFC 3339 (absent while active), "Audiences": ["Customer", ...]}
+ *
+ * and hands each one over as an alerts record. The alerts/<name>/history, errors and
+ * connectivity topics are not subscribed.
  *
  * Retained messages (only if fleet-telemetry runs with retained:true) are replayed by the broker
  * on every subscribe; they are folded in as a baseline and never fire.
@@ -48,6 +54,8 @@ export interface MqttReceiverOptions {
    * dropped (`vin_not_allowlisted`) before its payload is parsed or batched.
    */
   vinAllowed?: (vin: string) => boolean;
+  /** Also subscribe to <topic_base>/+/alerts/+/current (vehicle alerts). */
+  alerts?: boolean;
 }
 
 export type MqttEvent =
@@ -72,11 +80,20 @@ export function topicBaseProblem(base: unknown): string | undefined {
 }
 
 export const subscriptionFor = (base: string) => `${base}/+/v/+`;
+export const alertSubscriptionFor = (base: string) => `${base}/+/alerts/+/current`;
 
-/** "<base>/<VIN>/v/<Field>" -> { vin, field }, or undefined. */
-export function parseMqttTopic(base: string, topic: string): { vin: string; field: string } | undefined {
+/**
+ * "<base>/<VIN>/v/<Field>" -> { vin, field }; "<base>/<VIN>/alerts/<Name>/current" ->
+ * { vin, field: "", alert: Name }; anything else -> undefined.
+ */
+export function parseMqttTopic(base: string, topic: string): { vin: string; field: string; alert?: string } | undefined {
   if (!topic.startsWith(`${base}/`)) return undefined;
   const rest = topic.slice(base.length + 1).split("/");
+  if (rest.length === 4 && rest[1] === "alerts" && rest[3] === "current") {
+    const [vin, , alert] = rest;
+    if (!VIN_RE.test(vin) || !/^[A-Za-z0-9_.-]{1,128}$/.test(alert)) return undefined;
+    return { vin, field: "", alert };
+  }
   if (rest.length !== 3 || rest[1] !== "v") return undefined;
   const [vin, , field] = rest;
   if (!VIN_RE.test(vin) || !/^[A-Za-z0-9_]+$/.test(field)) return undefined;
@@ -91,6 +108,9 @@ export function parseMqttTopic(base: string, topic: string): { vin: string; fiel
 export function parseMqttValue(field: string, v: unknown): TelemetryValue | undefined {
   if (v === null) return { invalid: true };
   if (field === "DoorState") return typeof v === "object" && !Array.isArray(v) ? doors(v) : undefined;
+  if (field === "TpmsSoftWarnings" || field === "TpmsHardWarnings") return tireSet(v);
+  // Rounded to city level right here: the precise value is never stored.
+  if (field === "Location") return coarseLocation(v);
   if (typeof v === "string" || typeof v === "boolean") return v;
   if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
   return undefined;
@@ -154,7 +174,7 @@ export class MqttTelemetryReceiver implements TelemetryReceiver {
   private retryTimer?: ReturnType<typeof setTimeout>;
   private readonly batches = new Map<string, Batch>();
   private readonly now: () => number;
-  private readonly known = new Set<string>(KNOWN_FIELDS);
+  private readonly known: ReadonlySet<string> = ACCEPTED_FIELDS;
   private connectedOnce = false;
 
   constructor(private readonly o: MqttReceiverOptions) {
@@ -189,8 +209,9 @@ export class MqttTelemetryReceiver implements TelemetryReceiver {
       // connection but refuses the subscribe must still back off, not retry at reconnect_min_ms.
       this.connectedOnce = true;
       this.event({ outcome: "ok", reason: "connected" });
-      c.subscribe(subscriptionFor(this.o.topicBase), { qos: this.o.qos }, (err, granted) => {
-        if (err || !granted?.length || (granted[0].qos as number) === 128) {
+      const topics = [subscriptionFor(this.o.topicBase), ...(this.o.alerts ? [alertSubscriptionFor(this.o.topicBase)] : [])];
+      c.subscribe(topics, { qos: this.o.qos }, (err, granted) => {
+        if (err || !granted || granted.length < topics.length || granted.some((g) => (g.qos as number) === 128)) {
           this.event({ outcome: "error", reason: "subscribe_refused" });
           // Connected but subscribed to nothing would be silent forever: drop the connection and
           // let the close handler's backoff reconnect and subscribe again.
@@ -274,7 +295,19 @@ export class MqttTelemetryReceiver implements TelemetryReceiver {
       this.sink?.drop("bad_record", t.vin);
       return;
     }
-    if (!this.known.has(t.field)) return; // fields the trigger logic doesn't read are ignored
+    if (t.alert !== undefined) {
+      if (!this.o.alerts) return; // not subscribed: ignore
+      const a = parseAlert(raw, t.alert);
+      if (!a || a.name !== t.alert) {
+        this.sink?.drop("bad_record", t.vin);
+        return;
+      }
+      // Alerts are not batched: keep order with this VIN's field messages by flushing them first.
+      this.flush(t.vin);
+      this.sink?.record({ vin: t.vin, createdAt: new Date(this.now()).toISOString(), data: {}, alerts: [a], ...(retained ? { baseline: true } : {}) });
+      return;
+    }
+    if (!this.known.has(t.field)) return; // fields no trigger or ownership event reads are ignored
     const v = parseMqttValue(t.field, raw);
     if (v === undefined) {
       this.sink?.drop("bad_record", t.vin);

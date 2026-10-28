@@ -16,7 +16,9 @@ export type EnergyErrorCode =
   | "missing_scope"
   | "rate_limited"
   | "no_token"
-  | "fleet_api_error";
+  | "fleet_api_error"
+  | "redirect_refused"
+  | "response_too_large";
 
 export class EnergyApiError extends Error {
   constructor(
@@ -45,11 +47,110 @@ export interface EnergyStatusSource {
   backupReserve?(siteId: string): Promise<number | undefined>;
 }
 
-export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; signal?: AbortSignal }) => Promise<{
+export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; signal?: AbortSignal; redirect?: "error" }) => Promise<{
   status: number;
   headers: { get(name: string): string | null };
   text(): Promise<string>;
+  /** WHATWG stream when the implementation has one (global fetch does); read with a size cap. */
+  body?: unknown;
 }>;
+
+/** Documented Fleet API regional base hosts (developer.tesla.com, "Regions and Countries"). */
+export const FLEET_API_HOSTS = [
+  "fleet-api.prd.na.vn.cloud.tesla.com",
+  "fleet-api.prd.eu.vn.cloud.tesla.com",
+  "fleet-api.prd.cn.vn.cloud.tesla.cn",
+] as const;
+export const NHTSA_HOSTS = ["api.nhtsa.gov"] as const;
+/** Largest response body read from any REST call; bigger answers are aborted mid-stream. */
+export const MAX_BODY_BYTES = 1024 * 1024;
+
+/** TESTS ONLY: extra hosts (and plain http) a client may call, e.g. a local mock server. Never set from config. */
+export interface TestHostOverride {
+  hosts: string[];
+  allowHttp?: boolean;
+}
+
+/**
+ * Problem with a base URL, or undefined when it is https://<allowlisted host> with no credentials,
+ * no port other than 443, no path beyond "/", no query or fragment.
+ */
+export function baseUrlProblem(raw: string | undefined, hosts: readonly string[], label: string, test?: TestHostOverride): string | undefined {
+  let u: URL;
+  try {
+    u = new URL(String(raw ?? ""));
+  } catch {
+    return `${label} must be an https URL`;
+  }
+  const testHost = test?.hosts.includes(u.hostname) ?? false;
+  if (u.protocol !== "https:" && !(testHost && test?.allowHttp && u.protocol === "http:")) return `${label} must be an https URL`;
+  if (u.username || u.password || u.search || u.hash || (u.pathname !== "/" && u.pathname !== "")) return `${label} must be a bare base URL (no credentials, path, query or fragment)`;
+  if (u.port && u.port !== "443" && !testHost) return `${label} must use the default https port`;
+  if (!hosts.includes(u.hostname.toLowerCase()) && !testHost) return `${label} must be one of: ${hosts.map((h) => `https://${h}`).join(", ")}`;
+  return undefined;
+}
+
+/**
+ * One GET with redirects refused and the body capped at `maxBytes` while it streams (the request
+ * is aborted past the cap). Returns status, capped body text and Retry-After. Network errors are
+ * mapped to codes; never the message (it can echo a URL).
+ */
+export async function guardedGet(
+  fetchImpl: FetchLike,
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+  maxBytes = MAX_BODY_BYTES,
+): Promise<{ status: number; body: string; retryAfter: string | null }> {
+  const ctrl = new AbortController();
+  const signal = AbortSignal.any([ctrl.signal, AbortSignal.timeout(timeoutMs)]);
+  let res: Awaited<ReturnType<FetchLike>>;
+  try {
+    res = await fetchImpl(url, { method: "GET", headers, signal, redirect: "error" });
+  } catch (e) {
+    throw mapFetchError(e);
+  }
+  if (res.status >= 300 && res.status < 400) {
+    ctrl.abort();
+    throw new EnergyApiError("redirect_refused", res.status);
+  }
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    ctrl.abort();
+    throw new EnergyApiError("response_too_large", res.status);
+  }
+  let body = "";
+  const stream = res.body as { getReader?: () => { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> } } | null | undefined;
+  try {
+    if (stream && typeof stream.getReader === "function") {
+      const reader = stream.getReader();
+      const chunks: Uint8Array[] = [];
+      let n = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        n += value.byteLength;
+        if (n > maxBytes) {
+          ctrl.abort();
+          await reader.cancel().catch(() => undefined);
+          throw new EnergyApiError("response_too_large", res.status);
+        }
+        chunks.push(value);
+      }
+      body = Buffer.concat(chunks).toString("utf8");
+    } else {
+      body = await res.text();
+      if (Buffer.byteLength(body, "utf8") > maxBytes) throw new EnergyApiError("response_too_large", res.status);
+    }
+  } catch (e) {
+    if (e instanceof EnergyApiError) throw e;
+    // A body that fails mid-read is treated like no body for error statuses, and as unreachable on success.
+    if (res.status < 200 || res.status >= 300) body = "";
+    else throw mapFetchError(e);
+  }
+  return { status: res.status, body, retryAfter: res.headers.get("retry-after") };
+}
 
 /** A Retry-After longer than this is capped (a bad header must not silence polling for days). */
 export const MAX_RETRY_AFTER_S = 3600;
@@ -59,7 +160,8 @@ const TLS_CODES = /^(CERT_|UNABLE_TO_|DEPTH_ZERO|SELF_SIGNED|ERR_TLS|ERR_SSL|HOS
 /** Network/TLS failure -> code. Never the message (it can echo a URL). */
 export function mapFetchError(err: unknown): EnergyApiError {
   if (err instanceof EnergyApiError) return err;
-  const e = err as { code?: unknown; cause?: { code?: unknown } } | null;
+  const e = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
+  if (typeof e?.cause?.message === "string" && /redirect/i.test(e.cause.message)) return new EnergyApiError("redirect_refused");
   const code = String(e?.cause?.code ?? e?.code ?? "");
   return new EnergyApiError(TLS_CODES.test(code) ? "fleet_api_tls_error" : "fleet_api_unreachable");
 }
@@ -113,12 +215,17 @@ export interface FleetEnergyClientOptions {
   getToken: () => string | undefined;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** Response body cap (default MAX_BODY_BYTES). */
+  maxBodyBytes?: number;
+  /** TESTS ONLY (see TestHostOverride). */
+  testHosts?: TestHostOverride;
 }
 
 export class FleetEnergyClient implements EnergyStatusSource {
   private readonly fetchImpl: FetchLike;
   constructor(private readonly o: FleetEnergyClientOptions) {
-    if (!/^https:\/\//.test(o.apiBase)) throw new Error("tesla.energy_poll.api_base must be an https URL");
+    const p = baseUrlProblem(o.apiBase, FLEET_API_HOSTS, "tesla.energy_poll.api_base", o.testHosts);
+    if (p) throw new Error(p);
     this.fetchImpl = o.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
   }
 
@@ -127,18 +234,10 @@ export class FleetEnergyClient implements EnergyStatusSource {
     const token = this.o.getToken();
     if (!token) throw new EnergyApiError("no_token");
     const url = `${this.o.apiBase.replace(/\/+$/, "")}/api/1/energy_sites/${siteId}/${what}`;
-    let res;
-    try {
-      res = await this.fetchImpl(url, {
-        method: "GET",
-        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-        signal: AbortSignal.timeout(this.o.timeoutMs ?? 15_000),
-      });
-    } catch (e) {
-      throw mapFetchError(e);
-    }
-    const body = await res.text().catch(() => "");
-    if (res.status < 200 || res.status >= 300) throw mapHttpError(res.status, body, res.headers.get("retry-after"));
+    const { status, body, retryAfter } = await guardedGet(
+      this.fetchImpl, url, { authorization: `Bearer ${token}`, accept: "application/json" }, this.o.timeoutMs ?? 15_000, this.o.maxBodyBytes,
+    );
+    if (status < 200 || status >= 300) throw mapHttpError(status, body, retryAfter);
     if (!body.trim()) return {};
     try {
       return JSON.parse(body);

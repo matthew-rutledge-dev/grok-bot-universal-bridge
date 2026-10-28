@@ -36,12 +36,14 @@ Ground rules:
 
 - [ ] Image `tesla/fleet-telemetry:<tag>` (pin a tag) with the server config from [`adapters/tesla/README.md` → MQTT](../adapters/tesla/README.md#mqtt): `records: { "V": ["mqtt"] }`, `transmit_decoded_records: true`, `mqtt.broker` = `host:port` of the broker, `mqtt.topic_base` = `telemetry`, `qos: 1`, `retained: false`, and its own `client_id` (different from the bridge's).
   - If you do turn on `retained: true`: values the broker replays after a bridge reconnect only fill in fields the bridge hasn't seen yet. For fields it has, the replay is ignored, so a change that happened while the bridge was disconnected fires late, on the next live message for that field (the car's next change or resend), not at reconnect.
+- [ ] Ownership events: also `records: { "alerts": ["mqtt"] }` so vehicle alerts reach the broker (`<topic_base>/<VIN>/alerts/<name>/current`).
 - [ ] The server cert and key are mounted read-only, and the public port is forwarded to it.
 - [ ] Started, and its log shows the MQTT connect health check passing (it fails to start if the broker is unreachable).
 
 ## 3. Push the telemetry config to the car (signed, needs the owner's yes)
 
 - [ ] Build the request from `telemetry.fields` in the bridge config: `fields` → `{ "<Field>": { "interval_seconds": N, "resend_interval_seconds": <resend_interval_s> } }`, plus `prefer_typed: true`, `hostname: <telemetry-fqdn>`, `port`, `ca` (the fleet-telemetry server's CA chain) and an `exp`.
+- [ ] Ownership events: add the fields from [`adapters/tesla/README.md` → Telemetry fields for ownership](../adapters/tesla/README.md#telemetry-fields-for-ownership) and `alert_types` (the values are only community-documented; see that README section).
 - [ ] Send it once through the virtual-key proxy (`POST /api/1/vehicles/fleet_telemetry_config`). Neither the plugin nor the bridge does this today. Do it by hand, or later with the plugin's confirm-gated tool.
 - [ ] Check it took: `GET /api/1/vehicles/<VIN>/fleet_telemetry_config` shows `synced: true` once the car is online.
 
@@ -55,9 +57,10 @@ Ground rules:
 ## 5. Bridge config (host-only `config/tesla.json`)
 
 - [ ] Start from `adapters/tesla/config.example.json`. Set `telemetry.mode: "mqtt"`, `telemetry.mqtt.broker` (a literal loopback or LAN URL such as `mqtt://<broker-host>:1883`, or an `env:` / `file:` ref), `client_id`, `topic_base`, `username_ref` / `password_ref` (refs to the `bridge` broker user), `vin_allowlist`, `rules` and `routes` (route `agent` = the registry alias that should wake).
-- [ ] `energy_poll`: `site_allowlist`, `api_base` (your region's Fleet API base URL) and `token_ref` from step 4.
+- [ ] `energy_poll`: `site_allowlist`, `api_base` (your region's Fleet API base URL: `https://fleet-api.prd.na.vn.cloud.tesla.com`, `…eu…` or `https://fleet-api.prd.cn.vn.cloud.tesla.cn`; other hosts are refused) and `token_ref` from step 4.
 - [ ] If the broker is a compose service, put the bridge on the same compose network and use the service name (`mqtt://mosquitto:1883`). Single-label names are accepted as LAN.
 - [ ] In `config/bridge.json`, set `adapters.tesla.enabled: true` (telemetry first: leave `energy_poll.enabled: false` until step 6 passes).
+- [ ] Ownership events (optional): `ownership.enabled: true`, `ownership.vehicles` (one entry per car, VINs also in `vin_allowlist`), a route with `match: { "kind": "ownership" }` whose `agent` is the alias that should get them, and `ownership.rest` (`api_base`, `token_ref`) for recalls / warranty / service status.
 - [ ] `node dist/src/main.js --check` → `ok`, with `tesla` in the adapter list.
 - [ ] `docker compose up -d --force-recreate universal-bridge`.
 
@@ -72,7 +75,7 @@ Ground rules:
   ```
 
   Expect `connected`, `subscribed`, and field counts for your masked VIN (wake the car with the app first, or wait for a resend). Add `--energy` once energy polling is on, for one read-only `live_status` per site.
-- [ ] Audit (`data/audit.jsonl`): `connection` lines `mqtt_connected` and `mqtt_subscribed`, no `bad_record`, no `vin_not_allowlisted` for your car (that line is rate-limited to once per VIN per 10 min, so one line can stand for many messages; see its `count`). Repeated `mqtt_subscribe_refused` means the broker ACL doesn't let the `bridge` user read `telemetry/+/v/+`; the bridge keeps retrying with backoff.
+- [ ] Audit (`data/audit.jsonl`): `connection` lines `mqtt_connected` and `mqtt_subscribed`, no `bad_record`, no `vin_not_allowlisted` for your car (that line is rate-limited to once per VIN per 10 min, so one line can stand for many messages; see its `count`). Tesla audit lines carry your car's full VIN as `actor` (`audit_full_vin`, default `true`; set `false` for the last 6); foreign VINs show their last 6 and non-VIN strings show `invalid`. Prompts keep the masked id and `vin_last6`. Repeated `mqtt_subscribe_refused` means the broker ACL doesn't let the `bridge` user read `telemetry/+/v/+`; the bridge keeps retrying with backoff.
 - [ ] With energy polling on, the bridge log shows one `[tesla] energy polling on: the exported access token carries every scope…` warning at start. That's expected (see the token security note in the adapter README).
 - [ ] End to end: with the car parked, open a door → one `door_open_parked` wake for the routed agent within seconds. Plug in and charge → `plugged_in`; let it finish → `charge_complete` (if those rules wake).
 - [ ] Then turn on `energy_poll.enabled`, recreate, and check the audit for `observe` lines without errors. `data/tesla-energy-state.json` appears (mode 600).

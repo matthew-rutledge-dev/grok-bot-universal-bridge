@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { vinAuditActor, type VinAudit } from "./audit-vin.js";
 import { validateRoutes } from "../../core/allowlist.js";
 import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
 import { maskId } from "../../core/redact.js";
@@ -8,7 +9,9 @@ import { isSecretRef } from "../../core/secrets.js";
 import type { Route } from "../../core/types.js";
 import {
   deriveEnergyTriggers,
+  baseUrlProblem,
   EnergyApiError,
+  FLEET_API_HOSTS,
   FleetEnergyClient,
   gridOutage,
   hasEnergyData,
@@ -17,15 +20,20 @@ import {
   type EnergyStatusSource,
   type EnergyTrigger,
   type FetchLike,
+  type TestHostOverride,
 } from "./energy.js";
-import { deriveVehicleTriggers, KNOWN_FIELDS, mergeState, REPLACED_FIELDS, STREAM_ONLY_FIELDS, type TelemetryRecord, type TelemetryValue, type TriggerHit, type VehicleTrigger } from "./fields.js";
+import { deriveVehicleTriggers, KNOWN_FIELDS, mergeState, OWNERSHIP_FIELDS, REPLACED_FIELDS, STREAM_ONLY_FIELDS, type TelemetryRecord, type TelemetryValue, type TriggerHit, type VehicleTrigger } from "./fields.js";
 import { brokerUrlProblem, MqttTelemetryReceiver, topicBaseProblem } from "./mqtt.js";
+import { OwnershipRuntime, validateOwnership, type OwnershipConfig } from "./ownership-runtime.js";
 import { DecodedJsonReceiver, isLoopbackHost, MtlsTelemetryReceiver, splitListen, type DropReason, type TelemetryReceiver } from "./receiver.js";
 
 export * from "./fields.js";
 export * from "./energy.js";
 export * from "./receiver.js";
 export * from "./mqtt.js";
+export * from "./ownership.js";
+export * from "./ownership-rest.js";
+export * from "./ownership-runtime.js";
 
 /**
  * Tesla source adapter.
@@ -37,6 +45,10 @@ export * from "./mqtt.js";
  *   plugin:        OAuth and token refresh, Fleet API client, read + command tools, safety
  *                  (read-only fail-closed, confirm, dry-run, state_unknown), proxy client, and
  *                  the access-token export file energy polling reads.
+ *   ownership:     change-only, deduped ownership events (software update, odometer, alerts,
+ *                  service, TPMS, battery health, charging faults, safety, Sentry counts) with
+ *                  immediate / weekly-digest tiers and a slow REST pull (recalls, warranty,
+ *                  service status, release notes). See ownership.ts.
  *   operator:      pushes fleet_telemetry_config to each car once (a signed request through the
  *                  proxy; a future confirm-gated plugin tool). Neither the plugin nor the bridge
  *                  pushes it today; telemetry.fields here is its source of truth.
@@ -126,6 +138,14 @@ export interface TeslaConfig {
     /** site_info (backup_reserve_percent) cache, seconds. Default 600. */
     site_info_ttl_s?: number;
   };
+  /** Ownership events (route match { kind: "ownership" }). */
+  ownership?: OwnershipConfig;
+  /**
+   * Audit lines record the full VIN of an allowlisted car (default true). false: the last 6 only.
+   * Foreign (non-allowlisted) VINs always keep the last 6, and non-VIN strings are written "invalid".
+   * Prompts and envelopes are unaffected (masked id / vin_last6).
+   */
+  audit_full_vin?: boolean;
   rules: TeslaRule[];
   reply?: { via: "origin_channel" };
   routes: Route[];
@@ -139,6 +159,7 @@ export function validateTeslaConfig(raw: unknown): string[] {
   const c = raw as Partial<TeslaConfig> | null;
   if (!c || typeof c !== "object") return ["tesla: config is not an object"];
   const p = validateRoutes(c.routes, "tesla");
+  if (c.audit_full_vin !== undefined && typeof c.audit_full_vin !== "boolean") p.push("tesla.audit_full_vin must be true or false");
   const walk = (o: unknown, path: string) => {
     if (!o || typeof o !== "object") return;
     for (const [k, v] of Object.entries(o)) {
@@ -170,7 +191,9 @@ export function validateTeslaConfig(raw: unknown): string[] {
     for (const [f, sec] of Object.entries(t.fields ?? {})) if (!(Number.isInteger(sec) && sec >= 1)) p.push(`tesla.telemetry.fields.${f} must be an interval in whole seconds >= 1`);
     for (const f of Object.keys(t.fields ?? {})) {
       if (REPLACED_FIELDS[f]) p.push(`tesla.telemetry.fields.${f}: not a usable field; use ${REPLACED_FIELDS[f]}`);
-      else if (!(KNOWN_FIELDS as readonly string[]).includes(f) && !STREAM_ONLY_FIELDS.includes(f)) p.push(`tesla.telemetry.fields.${f}: not read by the trigger logic (known: ${KNOWN_FIELDS.join(", ")})`);
+      else if (!(KNOWN_FIELDS as readonly string[]).includes(f) && !STREAM_ONLY_FIELDS.includes(f) && !(OWNERSHIP_FIELDS as readonly string[]).includes(f)) {
+        p.push(`tesla.telemetry.fields.${f}: not read by the trigger logic or ownership events (known: ${[...new Set([...KNOWN_FIELDS, ...OWNERSHIP_FIELDS])].join(", ")})`);
+      }
     }
     const mode = t.mode ?? "decoded";
     if (mode !== "decoded" && mode !== "mtls" && mode !== "mqtt") p.push('tesla.telemetry.mode must be "decoded", "mqtt" or "mtls"');
@@ -200,15 +223,23 @@ export function validateTeslaConfig(raw: unknown): string[] {
     }
     if (e.interval_s !== undefined && e.interval_s < 60) p.push("tesla.energy_poll.interval_s must be >= 60");
     if (e.site_info_ttl_s !== undefined && e.site_info_ttl_s < 60) p.push("tesla.energy_poll.site_info_ttl_s must be >= 60");
-    if (e.api_base !== undefined && !/^https:\/\/[^/]+/.test(e.api_base)) p.push("tesla.energy_poll.api_base must be an https URL");
+    if (e.api_base !== undefined) {
+      const bad = baseUrlProblem(e.api_base, FLEET_API_HOSTS, "tesla.energy_poll.api_base");
+      if (bad) p.push(bad);
+    }
     if (e.enabled && !e.api_base) p.push("tesla.energy_poll.api_base is required when enabled");
     if (e.enabled && !e.token_ref) p.push("tesla.energy_poll.token_ref is required when enabled");
   }
   for (const [i, r] of (c.routes ?? []).entries()) {
     const keys = Object.keys(r.match ?? {});
-    if (keys.length !== 1 || keys[0] !== "kind" || !["vehicle", "energy"].includes(String(r.match.kind))) {
-      p.push(`tesla.routes[${i}]: match must be { kind: "vehicle" } or { kind: "energy" }`);
+    if (keys.length !== 1 || keys[0] !== "kind" || !["vehicle", "energy", "ownership"].includes(String(r.match.kind))) {
+      p.push(`tesla.routes[${i}]: match must be { kind: "vehicle" }, { kind: "energy" } or { kind: "ownership" }`);
     }
+  }
+  if (c.ownership !== undefined) {
+    const hasRoute = (c.routes ?? []).some((r) => r.match?.kind === "ownership" && r.enabled !== false);
+    p.push(...validateOwnership(c.ownership, t?.vin_allowlist ?? [], hasRoute));
+    if (c.ownership.enabled && !t?.enabled) p.push("tesla.ownership needs tesla.telemetry enabled (events come from the cars' telemetry)");
   }
   return p;
 }
@@ -277,6 +308,8 @@ export interface TeslaDeps {
   receiver?: TelemetryReceiver;
   energy?: EnergyStatusSource;
   fetchImpl?: FetchLike;
+  /** TESTS ONLY: extra hosts the REST clients may call (never from config). */
+  testHosts?: TestHostOverride;
   now?: () => number;
   /** Poll energy once right at start (default true). */
   pollOnStart?: boolean;
@@ -300,6 +333,7 @@ export class TeslaAdapter implements SourceAdapter {
   private timer: ReturnType<typeof setInterval> | undefined;
   private receiver?: TelemetryReceiver;
   private energy?: EnergyStatusSource;
+  private ownership?: OwnershipRuntime;
   private polling = false;
   private skipUntil = 0;
   private skipReason = "";
@@ -342,6 +376,10 @@ export class TeslaAdapter implements SourceAdapter {
 
   async start(): Promise<void> {
     const t = this.cfg.telemetry;
+    if (this.cfg.ownership?.enabled) {
+      this.ownership = new OwnershipRuntime(this.cfg.ownership, this.ctx, { now: this.now, fetchImpl: this.deps.fetchImpl, testHosts: this.deps.testHosts, auditVin: (vin) => this.auditVin(vin) });
+      this.ownership.start();
+    }
     if (t?.enabled) {
       const mode = t.mode ?? "decoded";
       this.receiver =
@@ -353,7 +391,7 @@ export class TeslaAdapter implements SourceAdapter {
             : this.decodedReceiver(t));
       await this.receiver.start({
         record: (r) =>
-          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin })),
+          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", ...this.auditVin(r.vin) })),
         drop: (reason, vin, count) => this.dropped(reason, vin, count),
         event: (e) => this.ctx.audit({ action: "connection", outcome: e.outcome, reason: `mqtt_${e.reason}`, ms: "ms" in e ? e.ms : undefined }),
       });
@@ -366,7 +404,7 @@ export class TeslaAdapter implements SourceAdapter {
         "[tesla] energy polling on: the exported access token carries every scope the Tesla plugin was granted, not only energy_device_data; keep token_ref host-only (mode 600)",
       );
       this.loadEnergyState();
-      this.energy = this.deps.energy ?? new FleetEnergyClient({ apiBase: e.api_base!, getToken: () => this.token(), fetchImpl: this.deps.fetchImpl });
+      this.energy = this.deps.energy ?? new FleetEnergyClient({ apiBase: e.api_base!, getToken: () => this.token(), fetchImpl: this.deps.fetchImpl, testHosts: this.deps.testHosts });
       const every = Math.max(60, e.interval_s ?? 300) * 1000;
       this.timer = setInterval(() => this.safeTick(), every);
       this.timer.unref?.();
@@ -406,6 +444,7 @@ export class TeslaAdapter implements SourceAdapter {
       reconnectMaxMs: m.reconnect_max_ms,
       now: this.deps.now,
       vinAllowed: (vin) => this.vinAllowed(vin),
+      alerts: Boolean(this.cfg.ownership?.enabled && this.cfg.ownership.alerts_stream !== false),
     });
   }
 
@@ -428,14 +467,31 @@ export class TeslaAdapter implements SourceAdapter {
     });
   }
 
+  /** Idempotent: clears the energy poll timer, stops the receiver and the ownership runtime. */
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
     await this.receiver?.stop().catch(() => undefined);
+    await this.ownership?.stop();
+  }
+
+  health(): Record<string, unknown> {
+    return { ownership: this.ownership?.health() ?? { enabled: false } };
+  }
+
+  /** Ownership runtime (tests / ops): digest flush, REST pull, pending counts. */
+  ownershipRuntime(): OwnershipRuntime | undefined {
+    return this.ownership;
   }
 
   /** Bound telemetry port (tests / ops). */
   telemetryPort(): number {
     return this.receiver?.port?.() ?? 0;
+  }
+
+  /** Audit actor fields for a VIN (see vinAuditActor and audit_full_vin). */
+  auditVin(vin: string): VinAudit {
+    return vinAuditActor(vin, this.vinAllowed(vin), this.cfg.audit_full_vin !== false);
   }
 
   vinAllowed(vin: string): boolean {
@@ -448,7 +504,7 @@ export class TeslaAdapter implements SourceAdapter {
 
   private dropped(reason: DropReason, vin?: string, count?: number): void {
     if (reason === "vin_not_allowlisted" && vin) return this.vinDenied(vin);
-    this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin, ...(count !== undefined ? { count } : {}) });
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason, ...(vin !== undefined ? this.auditVin(vin) : {}), ...(count !== undefined ? { count } : {}) });
   }
 
   /**
@@ -466,7 +522,7 @@ export class TeslaAdapter implements SourceAdapter {
     this.vinDenyAudit.delete(vin);
     while (this.vinDenyAudit.size >= VIN_DENY_AUDIT_MAX) this.vinDenyAudit.delete(this.vinDenyAudit.keys().next().value!);
     this.vinDenyAudit.set(vin, { at: now, suppressed: 0 });
-    this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: vin, ...(seen?.suppressed ? { count: seen.suppressed } : {}) });
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", ...this.auditVin(vin), ...(seen?.suppressed ? { count: seen.suppressed } : {}) });
   }
 
   /** Feed one decoded telemetry record (called by the receiver). Returns triggers submitted. */
@@ -475,18 +531,30 @@ export class TeslaAdapter implements SourceAdapter {
       this.vinDenied(r.vin);
       return [];
     }
+    if (r.telemetryErrors !== undefined) {
+      // The car's telemetry client reporting its own errors (bad config, unknown field): audit only.
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "telemetry_client_errors", ...this.auditVin(r.vin), count: r.telemetryErrors });
+      return [];
+    }
+    if (r.alerts) {
+      // Alerts records carry no field data: they only feed ownership events.
+      if (this.ownership) await this.ownership.record(r, Boolean(r.baseline || r.isResend));
+      else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "alerts_without_ownership", ...this.auditVin(r.vin) });
+      return [];
+    }
     if (r.baseline) {
       // Replayed value (MQTT retained): only fills fields not seen yet, never fires.
       const cur = this.lastVehicle.get(r.vin) ?? {};
       const fresh = Object.fromEntries(Object.entries(r.data).filter(([k]) => !(k in cur)));
       this.lastVehicle.set(r.vin, mergeState(cur, fresh).next);
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", actor: r.vin });
+      if (this.ownership) await this.ownership.record({ ...r, data: fresh }, true);
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", ...this.auditVin(r.vin) });
       return [];
     }
     const at = Date.parse(r.createdAt);
     const last = this.lastCreatedAt.get(r.vin);
     if (!Number.isNaN(at) && last !== undefined && at < last) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "stale_record", actor: r.vin });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "stale_record", ...this.auditVin(r.vin) });
       return [];
     }
     if (!Number.isNaN(at)) this.lastCreatedAt.set(r.vin, at);
@@ -495,9 +563,11 @@ export class TeslaAdapter implements SourceAdapter {
     this.lastVehicle.set(r.vin, next);
     if (r.isResend) {
       // A resend carries un-acked values: keep the state current, but never fire on it.
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", actor: r.vin });
+      if (this.ownership) await this.ownership.record(r, true);
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", ...this.auditVin(r.vin) });
       return [];
     }
+    if (this.ownership) await this.ownership.record(r, false);
     const hits = deriveVehicleTriggers(prev, delta, { lowBatteryPercent: this.cfg.telemetry?.low_battery_percent });
     return this.fire("vehicle", r.vin, hits, r.createdAt || new Date(this.now()).toISOString());
   }
@@ -666,17 +736,19 @@ export class TeslaAdapter implements SourceAdapter {
 
   private async fire(kind: "vehicle" | "energy", id: string, hits: TriggerHit<TeslaTrigger>[], at: string, detail?: string): Promise<TeslaTrigger[]> {
     const fired: TeslaTrigger[] = [];
+    // Audit lines carry the full VIN (prompts keep the masked id / vin_last6); site ids keep 4.
+    const keep: { actorKeep?: VinAudit["actorKeep"] } = kind === "vehicle" ? { actorKeep: this.auditVin(id).actorKeep } : {};
     for (const h of hits) {
       const t = h.on;
       const rule = this.cfg.rules.find((r) => r.on === t);
       if (!rule) continue;
       const priority = h.priority ?? rule.priority ?? "normal";
       if (!this.debounce.allow(`${id}:${t}:${h.priority ?? ""}`, rule.debounce_s ?? 0, this.now())) {
-        this.ctx.audit({ action: "observe", outcome: "skipped", reason: "debounced", type: t, actor: id });
+        this.ctx.audit({ action: "observe", outcome: "skipped", reason: "debounced", type: t, actor: id, ...keep });
         continue;
       }
       if (!rule.wake) {
-        this.ctx.audit({ action: "observe", outcome: "ok", reason: "no_wake_rule", type: t, actor: id });
+        this.ctx.audit({ action: "observe", outcome: "ok", reason: "no_wake_rule", type: t, actor: id, ...keep });
         continue;
       }
       const masked = maskId(id);
@@ -687,6 +759,7 @@ export class TeslaAdapter implements SourceAdapter {
         eventId,
         lane: `${kind}:${masked}`,
         actor: id,
+        ...keep,
         match: { kind },
         addressed: true,
         prompt: [

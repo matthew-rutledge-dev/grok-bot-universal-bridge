@@ -1,4 +1,5 @@
 {
+  "audit_full_vin": true,
   "telemetry": {
     "enabled": false,
     "mode": "mqtt",
@@ -19,7 +20,14 @@
     "client_ca": "file:/run/secrets/tesla-vehicle-ca.pem",
     "vin_allowlist": ["5YJ0000000EXAMPLE"],
     "prefer_typed": true,
-    "fields": { "DetailedChargeState": 60, "ChargingCableType": 60, "DoorState": 10, "SentryMode": 10, "Gear": 10, "Soc": 300, "BatteryLevel": 300, "SoftwareUpdateVersion": 3600 },
+    "fields": {
+      "DetailedChargeState": 60, "ChargingCableType": 60, "DoorState": 10, "SentryMode": 10, "Gear": 10, "Soc": 300, "BatteryLevel": 300,
+      "SoftwareUpdateVersion": 3600, "Version": 3600, "SoftwareUpdateInstallationPercentComplete": 60,
+      "Odometer": 600, "ServiceMode": 60,
+      "TpmsPressureFl": 600, "TpmsPressureFr": 600, "TpmsPressureRl": 600, "TpmsPressureRr": 600, "TpmsSoftWarnings": 60, "TpmsHardWarnings": 60,
+      "ChargeEnableRequest": 60, "ChargeLimitSoc": 600, "RatedRange": 600, "EnergyRemaining": 600, "BMSState": 60, "Hvil": 60,
+      "AutomaticEmergencyBrakingOff": 3600, "CarType": 86400, "Trim": 86400, "Location": 300
+    },
     "resend_interval_s": 21600,
     "low_battery_percent": 20
   },
@@ -27,10 +35,32 @@
     "enabled": false,
     "interval_s": 300,
     "site_allowlist": ["1111111111111111"],
-    "api_base": "https://fleet-api.example.com",
+    "api_base": "https://fleet-api.prd.na.vn.cloud.tesla.com",
     "token_ref": "file:/run/secrets/tesla-fleet/access-token",
     "reserve_margin_percent": 5,
     "site_info_ttl_s": 600
+  },
+  "ownership": {
+    "enabled": false,
+    "vehicles": [{ "vin": "5YJ0000000EXAMPLE", "vehicle_id": "example-car", "label": "Model 3 Example" }],
+    "alerts_stream": true,
+    "rules": {
+      "odometer_step_mi": 1000,
+      "tpms": { "recommended_psi": 42, "immediate_low_by_psi": 5 },
+      "alerts": { "immediate_audiences": ["Customer"] },
+      "location": true
+    },
+    "digest": { "weekday": 0, "hour_utc": 13 },
+    "rest": {
+      "enabled": false,
+      "api_base": "https://fleet-api.prd.na.vn.cloud.tesla.com",
+      "token_ref": "file:/run/secrets/tesla-fleet/access-token",
+      "service_h": 24,
+      "warranty_h": 168,
+      "recalls_h": 168,
+      "recent_alerts_h": 0,
+      "release_notes": true
+    }
   },
   "rules": [
     { "on": "charge_complete", "wake": true, "debounce_s": 600, "priority": "normal" },
@@ -44,6 +74,7 @@
   "reply": { "via": "origin_channel" },
   "routes": [
     { "id": "example-vehicle", "enabled": true, "match": { "kind": "vehicle" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" },
-    { "id": "example-energy", "enabled": true, "match": { "kind": "energy" }, "allowActors": ["1111111111111111"], "agent": "example-agent" }
+    { "id": "example-energy", "enabled": true, "match": { "kind": "energy" }, "allowActors": ["1111111111111111"], "agent": "example-agent" },
+    { "id": "example-ownership", "enabled": true, "match": { "kind": "ownership" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" }
   ]
 }

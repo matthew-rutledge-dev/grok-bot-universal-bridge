@@ -14,6 +14,7 @@ import {
   isLanHost,
   parseMqttTopic,
   parseMqttValue,
+  alertSubscriptionFor,
   subscriptionFor,
   TeslaAdapter,
   validateTeslaConfig,
@@ -114,7 +115,9 @@ test("mqtt: topic layout <base>/<VIN>/v/<Field>; VIN from the topic", () => {
   assert.equal(subscriptionFor("telemetry"), "telemetry/+/v/+");
   assert.deepEqual(parseMqttTopic("telemetry", `telemetry/${VIN}/v/DetailedChargeState`), { vin: VIN, field: "DetailedChargeState" });
   assert.deepEqual(parseMqttTopic("a/b", `a/b/${VIN}/v/Gear`), { vin: VIN, field: "Gear" });
-  assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/alerts/X/current`), undefined);
+  assert.deepEqual(parseMqttTopic("telemetry", `telemetry/${VIN}/alerts/X/current`), { vin: VIN, field: "", alert: "X" });
+  assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/alerts/X/history`), undefined);
+  assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/errors/X`), undefined);
   assert.equal(parseMqttTopic("telemetry", `telemetry/${VIN}/connectivity`), undefined);
   assert.equal(parseMqttTopic("telemetry", "telemetry/not-a-vin/v/Gear"), undefined);
   assert.equal(parseMqttTopic("telemetry", `other/${VIN}/v/Gear`), undefined);
@@ -199,7 +202,10 @@ test("mqtt e2e: publish -> record -> trigger -> wake submit to the routine; Gear
     // Another VIN on the same broker is not allowlisted.
     await p.datum("DetailedChargeState", "DetailedChargeStateComplete", false, "5YJ1111111EXAMPLE");
     await until(() => b.audit.lines.some((l) => l.reason === "vin_not_allowlisted"));
-    assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false, "audit has masked ids only");
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…XAMPLE"), "a foreign VIN keeps the last 6");
+    assert.equal(JSON.stringify(b.audit.lines).includes("5YJ1111111EXAMPLE"), false, "never the foreign VIN in full");
+    assert.ok(b.audit.lines.some((l) => l.actor === VIN), "the allowlisted car is audited with its full VIN");
+    assert.equal(JSON.stringify(m.hits).includes(VIN), false, "prompts carry the masked id only");
   } finally {
     await p.close();
     await b.close();
@@ -384,8 +390,8 @@ test("mqtt: VINs not allowlisted are dropped before parsing or batching; the aud
     await until(() => m.hits.length === 1);
     assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, 0, "unknown VIN payloads are not parsed");
     assert.equal(denies().length, 1, "22 messages, one audit line");
-    assert.equal(denies()[0].actor, "…PLE9");
-    assert.equal(JSON.stringify(b.audit.lines).includes(OTHER), false, "masked only");
+    assert.equal(denies()[0].actor, "…AMPLE9", "a foreign VIN keeps the last 6");
+    assert.equal(JSON.stringify(b.audit.lines).includes(OTHER), false, "never the foreign VIN in full");
     // Ten minutes on, the next line carries the count suppressed in between.
     clock += 10 * 60_000;
     await p.datum("SentryMode", "SentryModeStateArmed", false, OTHER);
@@ -451,5 +457,61 @@ test("mqtt: a broker that keeps refusing the subscribe gets exponential backoff,
     await b.close();
     await m.close();
     await br.down();
+  }
+});
+
+test("mqtt: with ownership on, alerts/<name>/current is subscribed and feeds ownership events; history/errors ignored", async () => {
+  // Every handle is registered as soon as it exists and closed in finally, even if a later step throws.
+  const closers: Array<() => Promise<unknown> | unknown> = [];
+  try {
+    const br = await broker();
+    closers.push(() => br.down());
+    const m = await mockRoutine({ key: "routine-key" });
+    closers.push(() => m.close());
+    const dir = mkdtempSync(join(tmpdir(), "mqtt-own-"));
+    const base = mqttCfg(br.url());
+    const cfg: TeslaConfig = {
+      ...base,
+      ownership: { enabled: true, vehicles: [{ vin: VIN, vehicle_id: "car-a" }] },
+      routes: [...base.routes.filter((r) => r.match.kind !== "ownership"), { id: "example-ownership", enabled: true, match: { kind: "ownership" }, allowActors: [VIN], agent: "example-agent" }],
+    };
+    assert.deepEqual(validateTeslaConfig(cfg), []);
+    assert.equal(alertSubscriptionFor(BASE), "telemetry/+/alerts/+/current");
+    const a = new TeslaAdapter(cfg);
+    closers.push(() => a.stop());
+    const b = await startBridge({ routineUrl: m.url, adapters: [a], holdFile: join(dir, "hold.json") });
+    closers.push(() => b.close());
+    const p = await publisher(br.url());
+    closers.push(() => p.close());
+    await until(() => b.audit.lines.some((l) => l.reason === "mqtt_subscribed"));
+    const alert = { Name: "UI_a001_Example", StartedAt: "2026-10-27T12:00:00Z", Audiences: ["Customer"] };
+    // A VIN that is not allowlisted on the alerts topic: dropped before parsing (no event, one masked deny line).
+    const OTHER = "5YJ000000EXAMPLE9";
+    await p.raw(`${BASE}/${OTHER}/alerts/UI_a001_Example/current`, JSON.stringify(alert));
+    await p.raw(`${BASE}/${OTHER}/alerts/RCM2_a001_Example_Crash/current`, JSON.stringify({ ...alert, Name: "RCM2_a001_Example_Crash" }));
+    await until(() => b.audit.lines.some((l) => l.reason === "vin_not_allowlisted"));
+    assert.equal(b.audit.lines.filter((l) => l.reason === "vin_not_allowlisted")[0].actor, "…AMPLE9");
+    assert.equal(JSON.stringify(b.audit.lines).includes(OTHER), false, "never the foreign VIN in full");
+    assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, 0);
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/history`, JSON.stringify([alert]));
+    await p.raw(`${BASE}/${VIN}/errors/some_error`, JSON.stringify({ Name: "some_error", Body: "x" }));
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/current`, JSON.stringify(alert));
+    await until(() => m.hits.length === 1);
+    assert.equal(JSON.stringify(m.hits).includes("Crash"), false, "nothing from the non-allowlisted VIN");
+    assert.equal(JSON.stringify(m.hits).includes(OTHER), false, "the denied VIN is in the audit only, never a prompt");
+    assert.match(m.hits[0].body.prompt, /ownership event for car-a .*vehicle_alert \(tier immediate, priority high\)/);
+    assert.match(m.hits[0].body.prompt, /"name":"UI_a001_Example","audiences":\["Customer"\]/);
+    // Same alert again (fleet-telemetry republishes current state): deduped. Name/topic mismatch: bad_record.
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/current`, JSON.stringify(alert));
+    await p.raw(`${BASE}/${VIN}/alerts/Other_a002/current`, JSON.stringify(alert));
+    await until(() => b.audit.lines.some((l) => l.reason === "bad_record"));
+    await sleep(100);
+    assert.equal(m.hits.length, 1);
+    // Ended: goes to the digest, not sent now.
+    await p.raw(`${BASE}/${VIN}/alerts/UI_a001_Example/current`, JSON.stringify({ ...alert, EndedAt: "2026-10-27T12:10:00Z" }));
+    await until(() => a.ownershipRuntime()!.pending()["car-a"] === 1);
+    assert.equal(m.hits.length, 1);
+  } finally {
+    for (const c of closers.reverse()) await Promise.resolve().then(c).catch(() => undefined);
   }
 });

@@ -26,7 +26,7 @@ import { mockRoutine, startBridge } from "../../test/helpers.js";
 const example = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8")) as TeslaConfig;
 const VIN = "5YJ0000000EXAMPLE";
 const SITE = "1111111111111111";
-const API = "https://fleet-api.example.com";
+const API = "https://fleet-api.prd.na.vn.cloud.tesla.com";
 
 // ---------- energy ----------
 
@@ -242,7 +242,7 @@ test("energy: missing scope / login_required / unreachable / tls are audited by 
     }
     const reasons = r.b.audit.lines.filter((l) => l.outcome === "error").map((l) => l.reason);
     for (const c of ["fleet_api_unreachable", "fleet_api_tls_error", "missing_scope", "login_required"]) assert.ok(reasons.includes(c), c);
-    assert.equal(JSON.stringify(r.b.audit.lines).includes("fleet-api.example.com"), false, "no URLs in audit");
+    assert.equal(JSON.stringify(r.b.audit.lines).includes("fleet-api.prd"), false, "no URLs in audit");
     // in-progress skip
     const orig = (r.a as unknown as { energy: { liveStatus: (s: string) => Promise<unknown> } }).energy;
     const real = orig.liveStatus.bind(orig);
@@ -446,7 +446,8 @@ test("mtls receiver: client cert required and verified; VIN from cert CN; payloa
     const reasons = b.audit.lines.map((l) => l.reason);
     assert.ok(reasons.includes("vin_cert_mismatch"));
     assert.ok(reasons.includes("undecodable_frame"));
-    assert.equal(JSON.stringify(b.audit.lines).includes(VIN), false);
+    assert.ok(b.audit.lines.filter((l) => l.reason === "vin_cert_mismatch").every((l) => l.actor === VIN), "audit lines carry the full VIN");
+    assert.equal(JSON.stringify(m.hits).includes(VIN), false, "prompts carry the masked id only");
 
     // Frame errors must not crash the process: oversize frame and invalid UTF-8 text frame.
     let unhandled = 0;
@@ -464,7 +465,7 @@ test("mtls receiver: client cert required and verified; VIN from cert CN; payloa
       }
       for (let i = 0; i < 50 && b.audit.lines.filter((l) => l.reason === "bad_record").length < dropsBefore + 2; i++) await new Promise((r) => setTimeout(r, 20));
       assert.equal(b.audit.lines.filter((l) => l.reason === "bad_record").length, dropsBefore + 2);
-      assert.ok(b.audit.lines.filter((l) => l.reason === "bad_record").slice(-2).every((l) => l.actor === "…MPLE"), "frame errors carry the captured cert VIN (masked)");
+      assert.ok(b.audit.lines.filter((l) => l.reason === "bad_record").slice(-2).every((l) => l.actor === VIN), "frame errors carry the captured cert VIN in full");
       assert.equal(unhandled, 0);
       const again = await open(car);
       again.close();
