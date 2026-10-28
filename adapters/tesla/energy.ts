@@ -104,9 +104,6 @@ export async function readCappedBody(
   ctrl: AbortController,
   maxBytes: number,
 ): Promise<string> {
-  const declared = Number((res as { headers?: { get(name: string): string | null } }).headers?.get?.("content-length"));
-  // content-length checked by callers that have headers; keep a belt here when present.
-  void declared;
   const stream = res.body as { getReader?: () => { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> } } | null | undefined;
   try {
     if (stream && typeof stream.getReader === "function") {

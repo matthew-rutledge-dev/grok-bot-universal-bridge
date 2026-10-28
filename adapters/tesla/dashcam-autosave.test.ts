@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -101,8 +101,22 @@ test("dashcam: sanitize fails closed on bad version / bad maps", () => {
 test("dashcam: TeslaConfig example validates", () => {
   const example = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8")) as TeslaConfig;
   const problems = validateTeslaConfig(example);
-  assert.deepEqual(problems.filter((p) => /dashcam|route|detective/i.test(p)), []);
-  assert.ok(!JSON.stringify(example).includes("detective"));
+  assert.deepEqual(problems.filter((p) => /dashcam|route/i.test(p)), []);
+  const text = JSON.stringify(example);
+  // Placeholder agent only (public-repo hygiene).
+  assert.ok(/\bexample-agent\b/.test(text));
+  assert.ok((example.routes ?? []).every((r) => typeof r.agent === "string" && r.agent.startsWith("example-")));
+  // When CI provides LEAK_DENYLIST_FILE, none of its terms appear in the example (terms never listed here).
+  const denyFile = process.env.LEAK_DENYLIST_FILE;
+  if (denyFile && existsSync(denyFile)) {
+    const terms = readFileSync(denyFile, "utf8")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith("#"));
+    for (const w of terms) {
+      assert.ok(!text.toLowerCase().includes(w.toLowerCase()), "example must not contain a denylist term");
+    }
+  }
 });
 
 function mockCtx(dir: string, submits: unknown[]) {
@@ -372,8 +386,21 @@ test("dashcam: cooldown and in_flight are audited without notify", async () => {
   await rt.stop();
 });
 
+test("dashcam: dedupe key with spaces in the alert name survives state sanitize", () => {
+  const e = freshAlert("Front Crash Sensor", new Date(T0).toISOString());
+  const key = alertDedupeKey(e);
+  assert.ok(!/\s/.test(key), "encoded key must not contain raw spaces");
+  const round = sanitizeDashcamState({ version: 1, lastAttempt: {}, alertKeys: { [key]: T0 }, globalAttempts: [], globalNotifies: [] });
+  assert.equal(round.ok, true);
+  if (round.ok) {
+    assert.equal(round.state.alertKeys[key], T0);
+    assert.equal(round.dropped, 0);
+  }
+});
+
 test("dashcam: alertTimeMs prefers started_at", () => {
   const e = freshAlert("X", "2026-10-27T11:59:00.000Z");
   assert.equal(alertTimeMs(e), Date.parse("2026-10-27T11:59:00.000Z"));
-  assert.ok(alertDedupeKey(e).includes("X"));
+  assert.ok(alertDedupeKey(e).startsWith("car-a|"));
+  assert.notEqual(alertDedupeKey(e), alertDedupeKey(freshAlert("Y", "2026-10-27T11:59:00.000Z")));
 });

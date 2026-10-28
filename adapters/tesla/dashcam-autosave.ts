@@ -227,7 +227,9 @@ export function alertTimeMs(e: OwnershipEvent): number | undefined {
 export function alertDedupeKey(e: OwnershipEvent): string {
   const name = typeof e.data.name === "string" ? e.data.name : "unknown";
   const started = typeof e.data.started_at === "string" ? e.data.started_at : e.ts;
-  return `${e.vehicle_id}|${name}|${started}`;
+  // base64url so spaces / odd chars in alert names survive the state-file key charset.
+  const enc = (s: string) => Buffer.from(s, "utf8").toString("base64url");
+  return `${e.vehicle_id}|${enc(name)}|${enc(started)}`;
 }
 
 export class DashcamAutosaveRuntime {
