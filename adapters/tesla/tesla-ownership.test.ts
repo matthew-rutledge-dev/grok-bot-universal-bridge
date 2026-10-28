@@ -366,7 +366,7 @@ test("ownership config: example validates; VINs must be allowlisted; ids unique;
 
 // ---------- adapter end to end (decoded POST /records -> bridge -> routine) ----------
 
-test("ownership e2e: two cars, immediate vs weekly digest per car, state file mode 600, restart doesn't repeat, no full VIN", async () => {
+test("ownership e2e: two cars, immediate vs weekly digest per car, state file mode 600, restart doesn't repeat, no full VIN in prompts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "own-e2e-"));
   let clock = T0;
   const td = teardown();
@@ -425,8 +425,10 @@ test("ownership e2e: two cars, immediate vs weekly digest per car, state file mo
     assert.ok(digests.some((d) => /digest for car-a .*1 change/.test(d) && /"event_type":"software_update"/.test(d)));
     assert.ok(digests.some((d) => /digest for car-b .*1 change/.test(d) && /"event_type":"odometer_milestone"/.test(d)));
     assert.deepEqual(a.ownershipRuntime()!.pending(), { "car-a": 0, "car-b": 0 });
-    const all = JSON.stringify(m.hits) + JSON.stringify(b.audit.lines);
-    assert.equal(all.includes(CAR_A) || all.includes(CAR_B), false, "no full VIN in prompts or audit");
+    const prompts = JSON.stringify(m.hits);
+    assert.equal(prompts.includes(CAR_A) || prompts.includes(CAR_B), false, "no full VIN in prompts (vin_last6 only)");
+    const audited = b.audit.lines.filter((l) => /^ownership_/.test(String(l.reason))).map((l) => l.actor);
+    assert.ok(audited.includes(CAR_A) && audited.includes(CAR_B), "audit lines carry the full VIN");
   } finally {
     await td.run();
   }

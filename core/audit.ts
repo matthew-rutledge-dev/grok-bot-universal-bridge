@@ -6,7 +6,8 @@ import { maskId } from "./redact.js";
  * Content-free audit log (JSON Lines, mode 600).
  *
  * One line per decision: ts, adapter, action, outcome, reason, agent alias,
- * and MASKED ids (last 4 characters). Never message text, prompts, URLs,
+ * and MASKED ids (last 4 characters; an adapter can opt an actor out with
+ * actorKeep "full", which Tesla does for VINs). Never message text, prompts, URLs,
  * keys or tokens: fields outside the allow list below are dropped.
  */
 export type AuditAction =
@@ -37,8 +38,8 @@ export interface AuditEntry {
   eventId?: string;
   lane?: string;
   actor?: string;
-  /** Characters of the actor kept when masking (default 4). The Tesla adapter keeps 6 of a VIN, matching vin_last6 in its prompts. */
-  actorKeep?: 4 | 6;
+  /** Characters of the actor kept when masking (default 4), or "full" to write it unmasked. The Tesla adapter writes the full VIN (a VIN is not a secret); its prompts still carry vin_last6. */
+  actorKeep?: 4 | 6 | "full";
   /** Short event type (e.g. charge_complete). */
   type?: string;
   status?: number;
@@ -67,7 +68,9 @@ export function auditLine(entry: AuditEntry, now = new Date()): Record<string, u
   }
   for (const k of MASK) {
     const v = src[k];
-    if (typeof v === "string" && v) out[k] = maskId(v, k === "actor" && entry.actorKeep === 6 ? 6 : 4);
+    if (typeof v !== "string" || !v) continue;
+    if (k === "actor" && entry.actorKeep === "full") out[k] = v.replace(/[\u0000-\u001f]/g, " ").slice(0, 80);
+    else out[k] = maskId(v, k === "actor" && entry.actorKeep === 6 ? 6 : 4);
   }
   return out;
 }

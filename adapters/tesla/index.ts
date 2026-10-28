@@ -420,7 +420,7 @@ export class TeslaAdapter implements SourceAdapter {
             : this.decodedReceiver(t));
       await this.receiver.start({
         record: (r) =>
-          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin, actorKeep: 6 })),
+          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin, actorKeep: "full" })),
         drop: (reason, vin, count) => this.dropped(reason, vin, count),
         event: (e) => this.ctx.audit({ action: "connection", outcome: e.outcome, reason: `mqtt_${e.reason}`, ms: "ms" in e ? e.ms : undefined }),
       });
@@ -532,7 +532,7 @@ export class TeslaAdapter implements SourceAdapter {
 
   private dropped(reason: DropReason, vin?: string, count?: number): void {
     if (reason === "vin_not_allowlisted" && vin) return this.vinDenied(vin);
-    this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin, actorKeep: 6, ...(count !== undefined ? { count } : {}) });
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin, actorKeep: "full", ...(count !== undefined ? { count } : {}) });
   }
 
   /**
@@ -550,7 +550,7 @@ export class TeslaAdapter implements SourceAdapter {
     this.vinDenyAudit.delete(vin);
     while (this.vinDenyAudit.size >= VIN_DENY_AUDIT_MAX) this.vinDenyAudit.delete(this.vinDenyAudit.keys().next().value!);
     this.vinDenyAudit.set(vin, { at: now, suppressed: 0 });
-    this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: vin, actorKeep: 6, ...(seen?.suppressed ? { count: seen.suppressed } : {}) });
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: vin, actorKeep: "full", ...(seen?.suppressed ? { count: seen.suppressed } : {}) });
   }
 
   /** Feed one decoded telemetry record (called by the receiver). Returns triggers submitted. */
@@ -561,7 +561,7 @@ export class TeslaAdapter implements SourceAdapter {
     }
     if (r.telemetryErrors !== undefined) {
       // The car's telemetry client reporting its own errors (bad config, unknown field): audit only.
-      this.ctx.audit({ action: "observe", outcome: "error", reason: "telemetry_client_errors", actor: r.vin, actorKeep: 6, count: r.telemetryErrors });
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "telemetry_client_errors", actor: r.vin, actorKeep: "full", count: r.telemetryErrors });
       return [];
     }
     if (r.alerts) {
@@ -569,7 +569,7 @@ export class TeslaAdapter implements SourceAdapter {
       if (this.ownership) {
         const ev = await this.ownership.record(r, Boolean(r.baseline || r.isResend));
         if (this.dashcam && ev.length) await this.dashcam.onOwnershipEvents(r.vin, ev);
-      } else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "alerts_without_ownership", actor: r.vin, actorKeep: 6 });
+      } else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "alerts_without_ownership", actor: r.vin, actorKeep: "full" });
       return [];
     }
     if (r.baseline) {
@@ -581,13 +581,13 @@ export class TeslaAdapter implements SourceAdapter {
         const ev = await this.ownership.record({ ...r, data: fresh }, true);
         if (this.dashcam && ev.length) await this.dashcam.onOwnershipEvents(r.vin, ev);
       }
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", actor: r.vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", actor: r.vin, actorKeep: "full" });
       return [];
     }
     const at = Date.parse(r.createdAt);
     const last = this.lastCreatedAt.get(r.vin);
     if (!Number.isNaN(at) && last !== undefined && at < last) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "stale_record", actor: r.vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "stale_record", actor: r.vin, actorKeep: "full" });
       return [];
     }
     if (!Number.isNaN(at)) this.lastCreatedAt.set(r.vin, at);
@@ -600,7 +600,7 @@ export class TeslaAdapter implements SourceAdapter {
         const ev = await this.ownership.record(r, true);
         if (this.dashcam && ev.length) await this.dashcam.onOwnershipEvents(r.vin, ev);
       }
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", actor: r.vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", actor: r.vin, actorKeep: "full" });
       return [];
     }
     if (this.ownership) {
@@ -775,8 +775,8 @@ export class TeslaAdapter implements SourceAdapter {
 
   private async fire(kind: "vehicle" | "energy", id: string, hits: TriggerHit<TeslaTrigger>[], at: string, detail?: string): Promise<TeslaTrigger[]> {
     const fired: TeslaTrigger[] = [];
-    // A VIN keeps its last 6 in audit lines (same as vin_last6 in ownership events); site ids keep 4.
-    const keep = kind === "vehicle" ? { actorKeep: 6 as const } : {};
+    // Audit lines carry the full VIN (prompts keep the masked id / vin_last6); site ids keep 4.
+    const keep = kind === "vehicle" ? { actorKeep: "full" as const } : {};
     for (const h of hits) {
       const t = h.on;
       const rule = this.cfg.rules.find((r) => r.on === t);
