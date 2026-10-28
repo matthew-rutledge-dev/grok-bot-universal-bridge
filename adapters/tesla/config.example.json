@@ -61,6 +61,16 @@
       "release_notes": true
     }
   },
+  "dashcam_autosave": {
+    "enabled": false,
+    "experimental": true,
+    "api_base": "https://fleet-api.prd.na.vn.cloud.tesla.com",
+    "token_ref": "file:/run/secrets/tesla-fleet/access-token",
+    "key_ref": "file:/run/secrets/tesla-vehicle-command-key.pem",
+    "cooldown_s": 600,
+    "global_max_per_hour": 10,
+    "notify_agent": "detective_tesla"
+  },
   "rules": [
     { "on": "charge_complete", "wake": true, "debounce_s": 600, "priority": "normal" },
     { "on": "sentry_alert", "wake": true, "debounce_s": 120, "priority": "normal" },
@@ -74,6 +84,7 @@
   "routes": [
     { "id": "example-vehicle", "enabled": true, "match": { "kind": "vehicle" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" },
     { "id": "example-energy", "enabled": true, "match": { "kind": "energy" }, "allowActors": ["1111111111111111"], "agent": "example-agent" },
-    { "id": "example-ownership", "enabled": true, "match": { "kind": "ownership" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" }
+    { "id": "example-ownership", "enabled": true, "match": { "kind": "ownership" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" },
+    { "id": "example-dashcam-autosave", "enabled": true, "match": { "kind": "dashcam_autosave" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "detective_tesla" }
   ]
 }

@@ -47,7 +47,7 @@ export interface EnergyStatusSource {
   backupReserve?(siteId: string): Promise<number | undefined>;
 }
 
-export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; signal?: AbortSignal; redirect?: "error" }) => Promise<{
+export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal; redirect?: "error" }) => Promise<{
   status: number;
   headers: { get(name: string): string | null };
   text(): Promise<string>;

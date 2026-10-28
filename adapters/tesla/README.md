@@ -9,6 +9,7 @@ The bridge's half of the Tesla split. It turns vehicle telemetry and energy-site
 ## Hard rules (enforced by the validator and the tests)
 
 * A config with `commands`/`actions` keys, a `vehicle_data` / `wake_up` / `command/` path, or any refresh-token key (`refresh_token`, `refreshTokenRef`, ...) is refused.
+* **EXPERIMENTAL exception:** `tesla.dashcam_autosave` plus env `TESLA_DASHCAM_AUTOSAVE=1` may send community `DashcamSaveClipAction` (CarServer field 47) via Fleet `signed_command`. Off by default; unverified until a live test; needs the owner's yes for live commands. See [Experimental dashcam auto-save](#experimental-dashcam-auto-save).
 * Replies go back through the agent's **origin channel**, so there's no `/tesla/callback` route.
 * Prompts and audit carry a **masked** VIN or site id only. Wake-trigger prompts show the last 4 characters; ownership events carry `vin_last6` (the owner's spec), and audit lines keep the **last 6 of a VIN** everywhere in this adapter so they line up with those events. Site ids keep 4. Event ids hash only the masked id (plus kind, trigger, priority and time), so they can't be brute-forced back to a VIN. There's no full-VIN opt-in: agents that need the VIN get it from the plugin's `list_vehicles`, and prompts end up in logs and transcripts.
 
@@ -195,4 +196,18 @@ Add these to `telemetry.fields` (and so to the pushed `fleet_telemetry_config`):
 
 ## Config
 
-See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN), `{ "kind": "energy" }` (actor = site id) or `{ "kind": "ownership" }` (actor = VIN; ownership events and digests). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited.
+See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN), `{ "kind": "energy" }` (actor = site id), `{ "kind": "ownership" }` (actor = VIN; ownership events and digests) or `{ "kind": "dashcam_autosave" }` (actor = VIN; experimental dashcam notify). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited.
+
+
+## Experimental dashcam auto-save
+
+Off by default. Master switch: host env `TESLA_DASHCAM_AUTOSAVE` must be exactly `1` **and** `dashcam_autosave.enabled: true` in the Tesla config. Any other env value leaves the feature inert.
+
+When an ownership `collision_or_safety` event fires for an **alert start** (not `aeb_setting`, not alert end), the bridge:
+
+1. Notifies the route with `match: { "kind": "dashcam_autosave" }` (example agent alias `detective_tesla`) with event `trigger`.
+2. Dedupes by alert key (`vehicle_id|name|started_at`) in `<data dir>/tesla-dashcam-autosave-state.json` (mode 600), applies a per-car cooldown (default 10 min) and a global hourly cap (default 10).
+3. If not suppressed: POSTs a Fleet API `signed_command` carrying community CarServer action **47** (`DashcamSaveClipAction`, empty body) after a vehicle-command session handshake + HMAC-SHA256 authorization (see `signed-command.ts` and `THIRD_PARTY_VEHICLE_COMMAND.md`). Stock `tesla-http-proxy` rejects this action.
+4. Notifies again with `saved`, `failed`, `deduped`, or `suppressed`. Every notify is immediate (never digest). Audit lines carry VIN last 6 only; never tokens or key material.
+
+**Unverified until a live test:** field number 47 and the empty body are community knowledge, not in the public `car_server.proto`. Do not enable against a real car without the owner's explicit yes. Config example and cutover checklist: `config.example.json`, [`docs/TESLA-CUTOVER.md`](../../docs/TESLA-CUTOVER.md) §8.

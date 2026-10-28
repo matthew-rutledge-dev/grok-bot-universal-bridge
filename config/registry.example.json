@@ -19,6 +19,16 @@
         "url": "http://127.0.0.1:1340/api/sendPrompt",
         "keyRef": "env:EXAMPLE_GATEWAY_TOKEN"
       }
+    },
+    "detective_tesla": {
+      "agentId": "33333333-3333-4333-8333-333333333333",
+      "label": "Example Detective_tesla alias (ownership / experimental dashcam notify target)",
+      "deliver": {
+        "kind": "webhook",
+        "urlRef": "env:DETECTIVE_TESLA_WEBHOOK_URL",
+        "keyRef": "env:DETECTIVE_TESLA_WEBHOOK_KEY",
+        "timeoutMs": 8000
+      }
     }
   }
 }
