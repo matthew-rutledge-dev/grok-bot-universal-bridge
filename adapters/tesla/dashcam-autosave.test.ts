@@ -20,6 +20,7 @@ import {
 import { validateTeslaConfig, type TeslaConfig, type OwnershipEvent } from "./index.js";
 import type { AdapterContext } from "../../core/bridge.js";
 import { auditLine, type AuditEntry } from "../../core/audit.js";
+import { vinAuditActor, type VinAudit } from "./audit-vin.js";
 import type { DashcamCommandResult } from "./signed-command.js";
 
 const CAR_A = "5YJ3EXAMPLE000001";
@@ -146,6 +147,7 @@ function runtime(
     env?: boolean;
     client?: { dashcamSaveClip(vin: string): Promise<DashcamCommandResult> };
     cfg?: Partial<DashcamAutosaveConfig>;
+    auditVin?: (vin: string) => VinAudit;
   } = {},
 ) {
   const { ctx, audit } = mockCtx(dir, submits);
@@ -165,6 +167,7 @@ function runtime(
     {
       now: opts.now ?? (() => T0),
       envFlag: () => opts.env ?? true,
+      ...(opts.auditVin ? { auditVin: opts.auditVin } : {}),
       client: opts.client ?? {
         async dashcamSaveClip() {
           return { status: "saved", unverified: true };
@@ -411,4 +414,17 @@ test("dashcam: alertTimeMs prefers started_at", () => {
   assert.equal(alertTimeMs(e), Date.parse("2026-10-27T11:59:00.000Z"));
   assert.ok(alertDedupeKey(e).startsWith("car-a|"));
   assert.notEqual(alertDedupeKey(e), alertDedupeKey(freshAlert("Y", "2026-10-27T11:59:00.000Z")));
+});
+
+test("dashcam: audit follows the adapter's audit_full_vin policy (false: last 6); notifies keep vin_last6 either way", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dashcam-"));
+  const submits: Array<{ prompt?: string; actorKeep?: unknown }> = [];
+  const { rt, audit } = runtime(dir, submits, { auditVin: (v) => vinAuditActor(v, true, false) });
+  rt.start();
+  await rt.onOwnershipEvents(CAR_A, [freshAlert()]);
+  const lines = audit.map((a) => auditLine(a as AuditEntry)).filter((l) => /^dashcam_/.test(String(l.reason)) && "actor" in l);
+  assert.ok(lines.length >= 3 && lines.every((l) => l.actor === `…${CAR_A.slice(-6)}`), "audit_full_vin=false: last 6");
+  assert.ok(submits.length === 2 && submits.every((s) => s.actorKeep === 6));
+  assert.ok(submits.every((s) => String(s.prompt).includes(`VIN …${CAR_A.slice(-6)}`) && !String(s.prompt).includes(CAR_A)));
+  await rt.stop();
 });

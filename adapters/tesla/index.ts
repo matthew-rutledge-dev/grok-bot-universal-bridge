@@ -414,6 +414,7 @@ export class TeslaAdapter implements SourceAdapter {
         now: this.now,
         fetchImpl: this.deps.fetchImpl,
         testHosts: this.deps.testHosts,
+        auditVin: (vin) => this.auditVin(vin),
       });
       this.dashcam.start();
     }
