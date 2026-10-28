@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { vinAuditActor, type VinAudit } from "./audit-vin.js";
 import { validateRoutes } from "../../core/allowlist.js";
 import type { AdapterContext, SourceAdapter } from "../../core/bridge.js";
 import { maskId } from "../../core/redact.js";
@@ -139,6 +140,12 @@ export interface TeslaConfig {
   };
   /** Ownership events (route match { kind: "ownership" }). */
   ownership?: OwnershipConfig;
+  /**
+   * Audit lines record the full VIN of an allowlisted car (default true). false: the last 6 only.
+   * Foreign (non-allowlisted) VINs always keep the last 6, and non-VIN strings are written "invalid".
+   * Prompts and envelopes are unaffected (masked id / vin_last6).
+   */
+  audit_full_vin?: boolean;
   rules: TeslaRule[];
   reply?: { via: "origin_channel" };
   routes: Route[];
@@ -152,6 +159,7 @@ export function validateTeslaConfig(raw: unknown): string[] {
   const c = raw as Partial<TeslaConfig> | null;
   if (!c || typeof c !== "object") return ["tesla: config is not an object"];
   const p = validateRoutes(c.routes, "tesla");
+  if (c.audit_full_vin !== undefined && typeof c.audit_full_vin !== "boolean") p.push("tesla.audit_full_vin must be true or false");
   const walk = (o: unknown, path: string) => {
     if (!o || typeof o !== "object") return;
     for (const [k, v] of Object.entries(o)) {
@@ -369,7 +377,7 @@ export class TeslaAdapter implements SourceAdapter {
   async start(): Promise<void> {
     const t = this.cfg.telemetry;
     if (this.cfg.ownership?.enabled) {
-      this.ownership = new OwnershipRuntime(this.cfg.ownership, this.ctx, { now: this.now, fetchImpl: this.deps.fetchImpl, testHosts: this.deps.testHosts });
+      this.ownership = new OwnershipRuntime(this.cfg.ownership, this.ctx, { now: this.now, fetchImpl: this.deps.fetchImpl, testHosts: this.deps.testHosts, auditVin: (vin) => this.auditVin(vin) });
       this.ownership.start();
     }
     if (t?.enabled) {
@@ -383,7 +391,7 @@ export class TeslaAdapter implements SourceAdapter {
             : this.decodedReceiver(t));
       await this.receiver.start({
         record: (r) =>
-          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", actor: r.vin, actorKeep: "full" })),
+          void this.ingestTelemetry(r).catch(() => this.ctx.audit({ action: "inbound", outcome: "error", reason: "ingest_failed", ...this.auditVin(r.vin) })),
         drop: (reason, vin, count) => this.dropped(reason, vin, count),
         event: (e) => this.ctx.audit({ action: "connection", outcome: e.outcome, reason: `mqtt_${e.reason}`, ms: "ms" in e ? e.ms : undefined }),
       });
@@ -481,6 +489,11 @@ export class TeslaAdapter implements SourceAdapter {
     return this.receiver?.port?.() ?? 0;
   }
 
+  /** Audit actor fields for a VIN (see vinAuditActor and audit_full_vin). */
+  auditVin(vin: string): VinAudit {
+    return vinAuditActor(vin, this.vinAllowed(vin), this.cfg.audit_full_vin !== false);
+  }
+
   vinAllowed(vin: string): boolean {
     return (this.cfg.telemetry?.vin_allowlist ?? []).includes(vin);
   }
@@ -491,7 +504,7 @@ export class TeslaAdapter implements SourceAdapter {
 
   private dropped(reason: DropReason, vin?: string, count?: number): void {
     if (reason === "vin_not_allowlisted" && vin) return this.vinDenied(vin);
-    this.ctx.audit({ action: "inbound", outcome: "deny", reason, actor: vin, actorKeep: "full", ...(count !== undefined ? { count } : {}) });
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason, ...(vin !== undefined ? this.auditVin(vin) : {}), ...(count !== undefined ? { count } : {}) });
   }
 
   /**
@@ -509,7 +522,7 @@ export class TeslaAdapter implements SourceAdapter {
     this.vinDenyAudit.delete(vin);
     while (this.vinDenyAudit.size >= VIN_DENY_AUDIT_MAX) this.vinDenyAudit.delete(this.vinDenyAudit.keys().next().value!);
     this.vinDenyAudit.set(vin, { at: now, suppressed: 0 });
-    this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", actor: vin, actorKeep: "full", ...(seen?.suppressed ? { count: seen.suppressed } : {}) });
+    this.ctx.audit({ action: "inbound", outcome: "deny", reason: "vin_not_allowlisted", ...this.auditVin(vin), ...(seen?.suppressed ? { count: seen.suppressed } : {}) });
   }
 
   /** Feed one decoded telemetry record (called by the receiver). Returns triggers submitted. */
@@ -520,13 +533,13 @@ export class TeslaAdapter implements SourceAdapter {
     }
     if (r.telemetryErrors !== undefined) {
       // The car's telemetry client reporting its own errors (bad config, unknown field): audit only.
-      this.ctx.audit({ action: "observe", outcome: "error", reason: "telemetry_client_errors", actor: r.vin, actorKeep: "full", count: r.telemetryErrors });
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "telemetry_client_errors", ...this.auditVin(r.vin), count: r.telemetryErrors });
       return [];
     }
     if (r.alerts) {
       // Alerts records carry no field data: they only feed ownership events.
       if (this.ownership) await this.ownership.record(r, Boolean(r.baseline || r.isResend));
-      else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "alerts_without_ownership", actor: r.vin, actorKeep: "full" });
+      else this.ctx.audit({ action: "observe", outcome: "skipped", reason: "alerts_without_ownership", ...this.auditVin(r.vin) });
       return [];
     }
     if (r.baseline) {
@@ -535,13 +548,13 @@ export class TeslaAdapter implements SourceAdapter {
       const fresh = Object.fromEntries(Object.entries(r.data).filter(([k]) => !(k in cur)));
       this.lastVehicle.set(r.vin, mergeState(cur, fresh).next);
       if (this.ownership) await this.ownership.record({ ...r, data: fresh }, true);
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", actor: r.vin, actorKeep: "full" });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "retained_baseline", ...this.auditVin(r.vin) });
       return [];
     }
     const at = Date.parse(r.createdAt);
     const last = this.lastCreatedAt.get(r.vin);
     if (!Number.isNaN(at) && last !== undefined && at < last) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "stale_record", actor: r.vin, actorKeep: "full" });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "stale_record", ...this.auditVin(r.vin) });
       return [];
     }
     if (!Number.isNaN(at)) this.lastCreatedAt.set(r.vin, at);
@@ -551,7 +564,7 @@ export class TeslaAdapter implements SourceAdapter {
     if (r.isResend) {
       // A resend carries un-acked values: keep the state current, but never fire on it.
       if (this.ownership) await this.ownership.record(r, true);
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", actor: r.vin, actorKeep: "full" });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "resend", ...this.auditVin(r.vin) });
       return [];
     }
     if (this.ownership) await this.ownership.record(r, false);
@@ -724,7 +737,7 @@ export class TeslaAdapter implements SourceAdapter {
   private async fire(kind: "vehicle" | "energy", id: string, hits: TriggerHit<TeslaTrigger>[], at: string, detail?: string): Promise<TeslaTrigger[]> {
     const fired: TeslaTrigger[] = [];
     // Audit lines carry the full VIN (prompts keep the masked id / vin_last6); site ids keep 4.
-    const keep = kind === "vehicle" ? { actorKeep: "full" as const } : {};
+    const keep: { actorKeep?: VinAudit["actorKeep"] } = kind === "vehicle" ? { actorKeep: this.auditVin(id).actorKeep } : {};
     for (const h of hits) {
       const t = h.on;
       const rule = this.cfg.rules.find((r) => r.on === t);

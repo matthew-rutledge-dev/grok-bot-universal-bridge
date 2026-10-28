@@ -210,7 +210,12 @@ test("adapter: baseline, masked VIN, Panic high, resend/stale ignored, other VIN
     assert.deepEqual(await a.ingestTelemetry({ vin: "OTHERVIN000000009", createdAt: "x", data: { DetailedChargeState: "Complete" } }), []);
     assert.ok(b.audit.lines.filter((l) => l.reason === "resend" || l.reason === "stale_record").every((l) => l.actor === VIN), "audit lines carry the full VIN");
     assert.equal(m.hits.some((h) => JSON.stringify(h.body).includes(VIN)), false, "prompts still carry the masked id only");
-    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "OTHERVIN000000009"), "a denied VIN is audited in full too");
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "invalid"), "a string that isn't VIN-shaped (has O) is written as invalid, never raw");
+    assert.equal(JSON.stringify(b.audit.lines).includes("OTHERVIN"), false);
+    // A foreign but VIN-shaped VIN keeps the last 6 only.
+    assert.deepEqual(await a.ingestTelemetry({ vin: "5YJ0000EXAMPLE009", createdAt: "x", data: { DetailedChargeState: "Complete" } }), []);
+    assert.ok(b.audit.lines.some((l) => l.reason === "vin_not_allowlisted" && l.actor === "…PLE009"), "foreign VINs are masked to the last 6");
+    assert.equal(JSON.stringify(b.audit.lines).includes("5YJ0000EXAMPLE009"), false);
     const cb = await b.call("POST", "/tesla/callback", {});
     assert.equal(cb.status, 404, "no tesla callback route: replies use the origin channel");
   } finally {
@@ -252,5 +257,30 @@ test("resend records update the stored state without firing", async () => {
   } finally {
     await b.close();
     await m.close();
+  }
+});
+
+test("audit_full_vin: default true (allowlisted VIN in full); false keeps the last 6; foreign VINs keep 6 and non-VIN strings are 'invalid' either way", async () => {
+  assert.deepEqual(validateTeslaConfig({ ...example, audit_full_vin: false }), []);
+  assert.match(validateTeslaConfig({ ...example, audit_full_vin: "yes" }).join("\n"), /audit_full_vin must be true or false/);
+  for (const full of [undefined, true, false]) {
+    const m = await mockRoutine({ key: "routine-key" });
+    const a = new TeslaAdapter({ ...example, ...(full === undefined ? {} : { audit_full_vin: full }) });
+    const b = await startBridge({ routineUrl: m.url, adapters: [a] });
+    try {
+      await a.ingestTelemetry({ vin: VIN, createdAt: "2026-01-01T00:00:00Z", data: { DetailedChargeState: "DetailedChargeStateComplete" } });
+      await a.ingestTelemetry({ vin: VIN, createdAt: "2026-01-01T00:30:00Z", data: { DetailedChargeState: "DetailedChargeStateCharging" }, isResend: true });
+      await a.ingestTelemetry({ vin: "5YJ0000EXAMPLE009", createdAt: "x", data: {} });
+      await a.ingestTelemetry({ vin: "x".repeat(80), createdAt: "x", data: {} });
+      const own = b.audit.lines.filter((l) => l.reason === "resend").map((l) => l.actor);
+      assert.deepEqual(own, [full === false ? "…XAMPLE" : VIN], `audit_full_vin=${full}`);
+      const denied = b.audit.lines.filter((l) => l.reason === "vin_not_allowlisted").map((l) => l.actor);
+      assert.deepEqual(denied, ["…PLE009", "invalid"]);
+      assert.equal(JSON.stringify(b.audit.lines).includes("xxxxxx"), false, "a non-VIN string is never logged raw");
+      assert.equal(JSON.stringify(m.hits).includes(VIN), false, "prompts never carry the full VIN");
+    } finally {
+      await b.close();
+      await m.close();
+    }
   }
 });

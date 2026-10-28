@@ -11,7 +11,7 @@ The bridge's half of the Tesla split. It turns vehicle telemetry and energy-site
 * A config with `commands`/`actions` keys, a `vehicle_data` / `wake_up` / `command/` path, or any refresh-token key (`refresh_token`, `refreshTokenRef`, ...) is refused.
 * Replies go back through the agent's **origin channel**, so there's no `/tesla/callback` route.
 * Prompts carry a **masked** VIN or site id only. Wake-trigger prompts show the last 4 characters; ownership events carry `vin_last6` (the owner's spec). There's no full-VIN opt-in for prompts: agents that need the VIN get it from the plugin's `list_vehicles`, and prompts end up in logs and transcripts. Event ids hash only the masked id (plus kind, trigger, priority and time), so they can't be brute-forced back to a VIN.
-* Audit lines record the **full VIN** as `actor` (a VIN is not a secret), for allowlisted cars and for denied unknown VINs alike, so the owner's audit can be matched to a car without guessing. Site ids keep the last 4, and every other adapter keeps the core default of 4.
+* Audit lines record the **full VIN** of an allowlisted car as `actor` (a VIN is not a secret), so the owner's audit can be matched to a car without guessing. This is `audit_full_vin` (top level of the Tesla config, default `true`); set it to `false` to go back to the last 6. A foreign (non-allowlisted) VIN is always written as its last 6, and an actor that isn't VIN-shaped (17 characters, no I/O/Q; e.g. junk from a decoded relay) is written as `invalid`, never raw. Site ids keep the last 4, and every other adapter keeps the core default of 4.
 
 ## Telemetry
 
@@ -70,7 +70,7 @@ Checked against `teslamotors/fleet-telemetry` at commit `bd076fe1494841707528449
 How the bridge maps it:
 
 * It subscribes to `<topic_base>/+/v/+` at `qos` 1 (default; 0 allowed) with a clean session.
-* **The VIN comes from the topic.** fleet-telemetry fills it from the car's verified client certificate (`rec.Vin`), the same source the other modes trust. Topics whose VIN isn't 17 valid VIN characters are `bad_record`. VINs not in `vin_allowlist` are dropped right after the topic is parsed, before the payload is parsed or batched, and audited `vin_not_allowlisted` at most once per VIN per 10 min (full VIN as `actor`; the next line's `count` is how many were suppressed in between; at most 256 VINs are remembered, oldest evicted).
+* **The VIN comes from the topic.** fleet-telemetry fills it from the car's verified client certificate (`rec.Vin`), the same source the other modes trust. Topics whose VIN isn't 17 valid VIN characters are `bad_record`. VINs not in `vin_allowlist` are dropped right after the topic is parsed, before the payload is parsed or batched, and audited `vin_not_allowlisted` at most once per VIN per 10 min (`actor` is the foreign VIN's last 6; the next line's `count` is how many were suppressed in between; at most 256 VINs are remembered, oldest evicted).
 * Field messages carry **no `created_at` and no `is_resend`**: the MQTT producer publishes the value only. So `createdAt` is the bridge's receive time, and a car's resend arrives looking like a live value. An unchanged value never fires, so periodic resends are harmless.
 * fleet-telemetry publishes the datums of one vehicle payload back to back, unordered (`SetOrderMatters(false)`). The bridge coalesces one VIN's messages for `batch_ms` (default 250) into one record, so `Gear` and `DoorState` from the same payload are judged together. A repeated field inside the window starts a new record, which keeps the order.
 * `null` is an invalid datum (the last good value stays; for `ChargingCableType` it means no cable). Fields the trigger logic doesn't read are ignored. Malformed topics, non-JSON payloads, payloads over 64 KB and wrong shapes (say, a string `DoorState`) are audited `bad_record` and never throw.
@@ -165,7 +165,7 @@ The Errors stream (`vehicle_error.proto`) is the car's telemetry client reportin
 ### What is never sent
 
 * No location trail: `Location` is rounded to one decimal (about 11 km, city level) the moment it's parsed, the precise value is never stored, and only the last coarse value is kept, in memory. It's attached only to `collision_or_safety` and service events, and `rules.location: false` turns that off.
-* No tokens or keys, no cabin or camera media (no such field is read), no full VIN in prompts (the envelope has `vin_last6`; prompts and the state file never hold the VIN; only the local audit file records it), no raw streams (changes only).
+* No tokens or keys, no cabin or camera media (no such field is read), no full VIN in prompts (the envelope has `vin_last6`; prompts and the state file never hold the VIN; only the local audit file records it, for allowlisted cars, when `audit_full_vin` is on), no raw streams (changes only).
 
 ### REST pull (`ownership.rest`, off by default)
 
@@ -196,4 +196,4 @@ Add these to `telemetry.fields` (and so to the pushed `fleet_telemetry_config`):
 
 ## Config
 
-See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN), `{ "kind": "energy" }` (actor = site id) or `{ "kind": "ownership" }` (actor = VIN; ownership events and digests). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited.
+See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN), `{ "kind": "energy" }` (actor = site id) or `{ "kind": "ownership" }` (actor = VIN; ownership events and digests). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited. `audit_full_vin` (boolean, default `true`) controls whether audit lines carry an allowlisted car's full VIN or its last 6; flip it to `false` to mask.
