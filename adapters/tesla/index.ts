@@ -789,7 +789,8 @@ export class TeslaAdapter implements SourceAdapter {
 
   private async fire(kind: "vehicle" | "energy", id: string, hits: TriggerHit<TeslaTrigger>[], at: string, detail?: string): Promise<TeslaTrigger[]> {
     const fired: TeslaTrigger[] = [];
-    // Audit lines carry the full VIN (prompts keep the masked id / vin_last6); site ids keep 4.
+    // Audit lines carry an allowlisted car's full VIN only when audit_full_vin is on (the default;
+    // last 6 when off). Prompts keep the masked id / vin_last6; site ids keep 4.
     const keep: { actorKeep?: VinAudit["actorKeep"] } = kind === "vehicle" ? { actorKeep: this.auditVin(id).actorKeep } : {};
     for (const h of hits) {
       const t = h.on;

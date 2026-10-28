@@ -243,7 +243,7 @@ test("dashcam: fresh alert → trigger + saved; dedupe audits only (no second no
   assert.equal(calls, 1);
   assert.equal(submits.length, 2); // no deduped notify
   assert.ok(audit.some((a) => (a as { reason?: string }).reason === "dashcam_autosave_deduped"));
-  // Audit lines record the full VIN; notify prompts and envelopes keep vin_last6 only.
+  // With audit_full_vin on (the default), audit lines record the full VIN; notify prompts and envelopes keep vin_last6 only.
   const lines = audit.map((a) => auditLine(a as AuditEntry)).filter((l) => /^dashcam_/.test(String(l.reason)) && "actor" in l);
   assert.ok(lines.length >= 4 && lines.every((l) => l.actor === CAR_A), "dashcam audit lines carry the full VIN");
   const prompts = submits.map((s) => String((s as { prompt?: string }).prompt));
