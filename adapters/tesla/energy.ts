@@ -47,7 +47,7 @@ export interface EnergyStatusSource {
   backupReserve?(siteId: string): Promise<number | undefined>;
 }
 
-export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; signal?: AbortSignal; redirect?: "error" }) => Promise<{
+export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal; redirect?: "error" }) => Promise<{
   status: number;
   headers: { get(name: string): string | null };
   text(): Promise<string>;
@@ -95,6 +95,48 @@ export function baseUrlProblem(raw: string | undefined, hosts: readonly string[]
  * is aborted past the cap). Returns status, capped body text and Retry-After. Network errors are
  * mapped to codes; never the message (it can echo a URL).
  */
+/**
+ * Read a fetch response body with a hard byte cap (stream when available). Aborts
+ * the request past the cap. Shared by guardedGet and signed_command POST.
+ */
+export async function readCappedBody(
+  res: { status: number; text(): Promise<string>; body?: unknown },
+  ctrl: AbortController,
+  maxBytes: number,
+): Promise<string> {
+  const declared = Number((res as { headers?: { get(name: string): string | null } }).headers?.get?.("content-length"));
+  // content-length checked by callers that have headers; keep a belt here when present.
+  void declared;
+  const stream = res.body as { getReader?: () => { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> } } | null | undefined;
+  try {
+    if (stream && typeof stream.getReader === "function") {
+      const reader = stream.getReader();
+      const chunks: Uint8Array[] = [];
+      let n = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        n += value.byteLength;
+        if (n > maxBytes) {
+          ctrl.abort();
+          await reader.cancel().catch(() => undefined);
+          throw new EnergyApiError("response_too_large", res.status);
+        }
+        chunks.push(value);
+      }
+      return Buffer.concat(chunks).toString("utf8");
+    }
+    const body = await res.text();
+    if (Buffer.byteLength(body, "utf8") > maxBytes) throw new EnergyApiError("response_too_large", res.status);
+    return body;
+  } catch (e) {
+    if (e instanceof EnergyApiError) throw e;
+    if (res.status < 200 || res.status >= 300) return "";
+    throw mapFetchError(e);
+  }
+}
+
 export async function guardedGet(
   fetchImpl: FetchLike,
   url: string,
@@ -119,37 +161,38 @@ export async function guardedGet(
     ctrl.abort();
     throw new EnergyApiError("response_too_large", res.status);
   }
-  let body = "";
-  const stream = res.body as { getReader?: () => { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> } } | null | undefined;
-  try {
-    if (stream && typeof stream.getReader === "function") {
-      const reader = stream.getReader();
-      const chunks: Uint8Array[] = [];
-      let n = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!value) continue;
-        n += value.byteLength;
-        if (n > maxBytes) {
-          ctrl.abort();
-          await reader.cancel().catch(() => undefined);
-          throw new EnergyApiError("response_too_large", res.status);
-        }
-        chunks.push(value);
-      }
-      body = Buffer.concat(chunks).toString("utf8");
-    } else {
-      body = await res.text();
-      if (Buffer.byteLength(body, "utf8") > maxBytes) throw new EnergyApiError("response_too_large", res.status);
-    }
-  } catch (e) {
-    if (e instanceof EnergyApiError) throw e;
-    // A body that fails mid-read is treated like no body for error statuses, and as unreachable on success.
-    if (res.status < 200 || res.status >= 300) body = "";
-    else throw mapFetchError(e);
-  }
+  const body = await readCappedBody(res, ctrl, maxBytes);
   return { status: res.status, body, retryAfter: res.headers.get("retry-after") };
+}
+
+/** POST variant of guardedGet (same redirect refusal + streamed body cap). */
+export async function guardedPost(
+  fetchImpl: FetchLike,
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs: number,
+  maxBytes = MAX_BODY_BYTES,
+): Promise<{ status: number; body: string; retryAfter: string | null }> {
+  const ctrl = new AbortController();
+  const signal = AbortSignal.any([ctrl.signal, AbortSignal.timeout(timeoutMs)]);
+  let res: Awaited<ReturnType<FetchLike>>;
+  try {
+    res = await fetchImpl(url, { method: "POST", headers, body, signal, redirect: "error" });
+  } catch (e) {
+    throw mapFetchError(e);
+  }
+  if (res.status >= 300 && res.status < 400) {
+    ctrl.abort();
+    throw new EnergyApiError("redirect_refused", res.status);
+  }
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    ctrl.abort();
+    throw new EnergyApiError("response_too_large", res.status);
+  }
+  const text = await readCappedBody(res, ctrl, maxBytes);
+  return { status: res.status, body: text, retryAfter: res.headers.get("retry-after") };
 }
 
 /** A Retry-After longer than this is capped (a bad header must not silence polling for days). */
