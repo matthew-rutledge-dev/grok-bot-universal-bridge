@@ -19,6 +19,7 @@ import {
 } from "./dashcam-autosave.js";
 import { validateTeslaConfig, type TeslaConfig, type OwnershipEvent } from "./index.js";
 import type { AdapterContext } from "../../core/bridge.js";
+import { auditLine, type AuditEntry } from "../../core/audit.js";
 import type { DashcamCommandResult } from "./signed-command.js";
 
 const CAR_A = "5YJ3EXAMPLE000001";
@@ -239,6 +240,13 @@ test("dashcam: fresh alert → trigger + saved; dedupe audits only (no second no
   assert.equal(calls, 1);
   assert.equal(submits.length, 2); // no deduped notify
   assert.ok(audit.some((a) => (a as { reason?: string }).reason === "dashcam_autosave_deduped"));
+  // Audit lines record the full VIN; notify prompts and envelopes keep vin_last6 only.
+  const lines = audit.map((a) => auditLine(a as AuditEntry)).filter((l) => /^dashcam_/.test(String(l.reason)) && "actor" in l);
+  assert.ok(lines.length >= 4 && lines.every((l) => l.actor === CAR_A), "dashcam audit lines carry the full VIN");
+  const prompts = submits.map((s) => String((s as { prompt?: string }).prompt));
+  assert.equal(prompts.some((p) => p.includes(CAR_A)), false, "notify prompts never carry the full VIN");
+  assert.ok(prompts.every((p) => p.includes(`VIN …${CAR_A.slice(-6)}`) && p.includes(`"vin_last6":"${CAR_A.slice(-6)}"`)), "notifies keep vin_last6");
+  assert.ok(submits.every((s) => (s as { actorKeep?: unknown }).actorKeep === "full"), "the bridge's inbound audit line for a notify also records the full VIN");
   await rt.stop();
 });
 

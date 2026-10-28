@@ -317,7 +317,7 @@ export class DashcamAutosaveRuntime {
         await this.handle(vin, e);
       }
     } catch {
-      this.ctx.audit({ action: "observe", outcome: "error", reason: "dashcam_autosave_handler_failed", actor: vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "error", reason: "dashcam_autosave_handler_failed", actor: vin, actorKeep: "full" });
     }
   }
 
@@ -343,7 +343,7 @@ export class DashcamAutosaveRuntime {
         outcome: "skipped",
         reason: "dashcam_autosave_stale_alert",
         actor: vin,
-        actorKeep: 6,
+        actorKeep: "full",
         type: key.slice(0, 80),
         ...(at !== undefined ? { ms: now - at } : {}),
       });
@@ -351,21 +351,21 @@ export class DashcamAutosaveRuntime {
     }
 
     if (this.state.alertKeys[key] !== undefined) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_deduped", actor: vin, actorKeep: 6, type: key.slice(0, 80) });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_deduped", actor: vin, actorKeep: "full", type: key.slice(0, 80) });
       return;
     }
     if (this.busy.has(e.vehicle_id)) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_in_flight", actor: vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_in_flight", actor: vin, actorKeep: "full" });
       return;
     }
     const last = this.state.lastAttempt[e.vehicle_id] ?? 0;
     if (now - last < cooldownMs) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_cooldown", actor: vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_cooldown", actor: vin, actorKeep: "full" });
       return;
     }
     this.state.globalAttempts = this.state.globalAttempts.filter((t) => now - t < 3600_000);
     if (this.state.globalAttempts.length >= globalMax) {
-      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_global_cap", actor: vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "skipped", reason: "dashcam_autosave_global_cap", actor: vin, actorKeep: "full" });
       return;
     }
 
@@ -387,14 +387,14 @@ export class DashcamAutosaveRuntime {
     const canNotify = this.reserveNotify(now);
     if (canNotify) await this.notify(vin, e, "trigger", { alert_key: key });
 
-    this.ctx.audit({ action: "observe", outcome: "ok", reason: "dashcam_autosave_attempt", actor: vin, actorKeep: 6 });
+    this.ctx.audit({ action: "observe", outcome: "ok", reason: "dashcam_autosave_attempt", actor: vin, actorKeep: "full" });
 
     try {
       if (!this.client) {
         if (canNotify && this.reserveNotify(this.deps.now())) {
           await this.notify(vin, e, "failed", { reason: "no_client", alert_key: key });
         }
-        this.ctx.audit({ action: "observe", outcome: "error", reason: "dashcam_autosave_no_client", actor: vin, actorKeep: 6 });
+        this.ctx.audit({ action: "observe", outcome: "error", reason: "dashcam_autosave_no_client", actor: vin, actorKeep: "full" });
         return;
       }
       const result = await this.client.dashcamSaveClip(vin);
@@ -405,7 +405,7 @@ export class DashcamAutosaveRuntime {
         outcome: outcome === "saved" ? "ok" : "error",
         reason: `dashcam_autosave_${outcome}`,
         actor: vin,
-        actorKeep: 6,
+        actorKeep: "full",
         type: (result.reason ?? outcome).slice(0, 80),
       });
       if (canNotify && this.reserveNotify(this.deps.now())) {
@@ -418,7 +418,7 @@ export class DashcamAutosaveRuntime {
       }
     } catch (err) {
       const code = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "dashcam_autosave_error";
-      this.ctx.audit({ action: "observe", outcome: "error", reason: code.slice(0, 80), actor: vin, actorKeep: 6 });
+      this.ctx.audit({ action: "observe", outcome: "error", reason: code.slice(0, 80), actor: vin, actorKeep: "full" });
       if (canNotify && this.reserveNotify(this.deps.now())) {
         await this.notify(vin, e, "failed", { alert_key: key, reason: code });
       }
@@ -460,7 +460,7 @@ export class DashcamAutosaveRuntime {
       eventId,
       lane: `dashcam_autosave:${e.vehicle_id}`,
       actor: vin,
-      actorKeep: 6,
+      actorKeep: "full",
       match: { kind: "dashcam_autosave" },
       addressed: true,
       prompt: [
@@ -475,7 +475,7 @@ export class DashcamAutosaveRuntime {
       outcome: res.accepted ? "ok" : "skipped",
       reason: res.accepted ? `dashcam_notify_${kind}` : `dashcam_notify_${res.reason}`,
       actor: vin,
-      actorKeep: 6,
+      actorKeep: "full",
       type: kind,
     });
   }
