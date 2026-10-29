@@ -21,6 +21,12 @@ import type { InboundEvent, Route } from "../../core/types.js";
  *     compared in constant time (403 on mismatch).
  *  4. The timestamp must be within maxAgeSec of now, in either direction (403 "stale").
  *  5. A message id seen before is acknowledged (2xx) and dropped (replay / retry).
+ *     Each id is kept until its signed timestamp has left the window (and at least
+ *     dedupeTtlSec), so eviction never reopens a replay. If more than MAX_SEEN_IDS
+ *     ids are still inside that window, new messages get 503 replay_cache_full
+ *     (fail closed; Twitch retries) instead of evicting live ids.
+ *  6. Only then is the body JSON-parsed (the route is registered with rawBody: true,
+ *     so the core never parses unauthenticated bytes).
  *
  * Message types:
  *  - webhook_callback_verification: echo the challenge as text/plain, but only for a
@@ -59,7 +65,7 @@ export interface TwitchConfig {
   secretRef: string;
   /** Reject messages whose timestamp is further than this from now (default 600, max 600). */
   maxAgeSec?: number;
-  /** How long seen message ids are remembered (default = maxAgeSec + 60). */
+  /** Minimum time seen message ids are remembered (default = maxAgeSec + 60). Ids are always kept until their signed timestamp leaves the window. */
   dedupeTtlSec?: number;
   /** Chat: a message is "addressed" when it starts with one of these prefixes or @-mentions botLogin. */
   chat?: { commandPrefixes?: string[]; botLogin?: string; maxChars?: number };
@@ -71,7 +77,15 @@ const H_TS = "twitch-eventsub-message-timestamp";
 const H_SIG = "twitch-eventsub-message-signature";
 const H_TYPE = "twitch-eventsub-message-type";
 const NUMERIC_ID = /^[0-9]{1,20}$/;
-const MAX_IDS = 50_000;
+/**
+ * Seen ids still inside their replay window. Never evicted early: at the cap new
+ * messages are refused with 503 (Twitch retries) until old ids expire. 100k ids in
+ * an 11-minute window is ~150 messages/s sustained, far above one channel's EventSub
+ * volume; the persisted file is then about 7 MB.
+ */
+export const MAX_SEEN_IDS = 100_000;
+/** Seen-id file writes are batched: at most one write per this interval, plus one on stop(). */
+export const SEEN_FLUSH_MS = 1000;
 
 export function validateTwitchConfig(raw: unknown): string[] {
   const c = raw as Partial<TwitchConfig> | null;
@@ -185,8 +199,11 @@ export class TwitchAdapter implements SourceAdapter {
   readonly name = "twitch";
   readonly routes: Route[];
   private ctx!: AdapterContext;
+  /** message id -> expiry (epoch ms). */
   private readonly seen = new Map<string, number>();
   private file = "";
+  private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private dirty = false;
   private counts = { verified: 0, notifications: 0, revocations: 0, rejected: 0, duplicates: 0 };
   private readonly now: () => number;
 
@@ -211,7 +228,7 @@ export class TwitchAdapter implements SourceAdapter {
     this.ctx = ctx;
     this.file = ctx.dataFile("twitch-seen.json");
     this.loadSeen();
-    ctx.route("POST", "/eventsub", (req) => this.handle(req), { maxBytes: 128 * 1024 });
+    ctx.route("POST", "/eventsub", (req) => this.handle(req), { maxBytes: 128 * 1024, rawBody: true });
   }
 
   async start(): Promise<void> {
@@ -219,7 +236,7 @@ export class TwitchAdapter implements SourceAdapter {
   }
 
   async stop(): Promise<void> {
-    this.saveSeen();
+    this.flush();
   }
 
   health(): Record<string, unknown> {
@@ -231,24 +248,46 @@ export class TwitchAdapter implements SourceAdapter {
     return v && v.length >= 10 && v.length <= 100 ? v : undefined;
   }
 
-  /** Seen ids survive a restart (mode 600, atomic rename), so a replay right after a restart is still caught. */
+  /**
+   * Seen ids survive a restart (mode 600, atomic rename), so a replay right after a
+   * restart is still caught. Writes are batched (SEEN_FLUSH_MS); an unclean crash can
+   * lose at most that last interval of ids.
+   */
   private loadSeen(): void {
     if (!this.file) return;
     try {
-      const raw = JSON.parse(readFileSync(this.file, "utf8")) as { seen?: Record<string, number> };
-      const cutoff = this.now() - this.ttlMs();
-      for (const [id, at] of Object.entries(raw.seen ?? {})) if (typeof at === "number" && at >= cutoff) this.seen.set(id, at);
+      const raw = JSON.parse(readFileSync(this.file, "utf8")) as { v?: number; expires?: Record<string, number>; seen?: Record<string, number> };
+      const now = this.now();
+      // v2 stores expiries; the older format stored the time first seen.
+      const entries = raw.v === 2 ? Object.entries(raw.expires ?? {}) : Object.entries(raw.seen ?? {}).map(([id, at]) => [id, typeof at === "number" ? at + this.ttlMs() : 0] as const);
+      for (const [id, exp] of entries) if (typeof exp === "number" && exp > now) this.seen.set(id, exp);
     } catch {
       /* no file yet */
     }
   }
 
-  private saveSeen(): void {
-    if (!this.file) return;
+  private scheduleFlush(): void {
+    this.dirty = true;
+    if (!this.file || this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      this.flush();
+    }, SEEN_FLUSH_MS);
+    this.flushTimer.unref?.();
+  }
+
+  /** Write pending seen ids now (also called on stop). */
+  flush(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    if (!this.file || !this.dirty) return;
+    this.dirty = false;
     try {
       mkdirSync(dirname(this.file), { recursive: true });
       const tmp = `${this.file}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ seen: Object.fromEntries(this.seen) }), { mode: 0o600 });
+      writeFileSync(tmp, JSON.stringify({ v: 2, expires: Object.fromEntries(this.seen) }), { mode: 0o600 });
       renameSync(tmp, this.file);
     } catch {
       this.ctx.audit({ action: "observe", outcome: "error", reason: "twitch_seen_write_failed" });
@@ -256,9 +295,8 @@ export class TwitchAdapter implements SourceAdapter {
   }
 
   private sweep(): void {
-    const cutoff = this.now() - this.ttlMs();
-    for (const [id, at] of this.seen) if (at < cutoff) this.seen.delete(id);
-    while (this.seen.size > MAX_IDS) this.seen.delete(this.seen.keys().next().value as string);
+    const now = this.now();
+    for (const [id, exp] of this.seen) if (exp <= now) this.seen.delete(id);
   }
 
   private reject(status: number, reason: string, eventId?: string): HttpResponse {
@@ -289,10 +327,20 @@ export class TwitchAdapter implements SourceAdapter {
       this.ctx.audit({ action: "inbound", outcome: "skipped", reason: "duplicate", eventId: id });
       return { status: 200, body: { ok: true, duplicate: true } };
     }
-    this.seen.set(id, this.now());
-    this.saveSeen();
+    if (this.seen.size >= MAX_SEEN_IDS) return this.reject(503, "replay_cache_full", id);
 
-    const body = (req.body ?? {}) as { subscription?: Ev; event?: Ev; challenge?: unknown };
+    // Parse only now: the bytes are authenticated and fresh.
+    let parsed: unknown;
+    try {
+      parsed = req.rawBody.length ? JSON.parse(req.rawBody.toString("utf8")) : {};
+    } catch {
+      return this.reject(400, "invalid_json", id);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return this.reject(400, "invalid_json", id);
+    this.seen.set(id, Math.max(at + this.maxAgeMs(), this.now() + this.ttlMs()));
+    this.scheduleFlush();
+
+    const body = parsed as { subscription?: Ev; event?: Ev; challenge?: unknown };
     const sub = body.subscription ?? {};
     const subType = s(sub.type);
     const condition = (sub.condition as Ev | undefined) ?? {};

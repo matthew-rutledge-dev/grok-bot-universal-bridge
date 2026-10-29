@@ -3,7 +3,7 @@ import { authorize, type AuthzResult } from "./allowlist.js";
 import type { AuditEntry, AuditSink } from "./audit.js";
 import { deliver, DeliveryConfigError, failureCode, type FetchLike } from "./deliver.js";
 import { HoldQueue, type HeldItem, type HoldUi } from "./hold.js";
-import { safeEqual, tokenFromHeaders, type Handler, type HttpResponse, HttpServer } from "./http.js";
+import { safeEqual, tokenFromHeaders, type Handler, type HttpResponse, type RouteOptions, HttpServer } from "./http.js";
 import { SlidingWindowRateLimiter } from "./rate-limit.js";
 import type { Registry } from "./registry.js";
 import { readRef, resolveSecret, type SecretEnv } from "./secrets.js";
@@ -27,7 +27,7 @@ export interface AdapterContext {
   check(event: InboundEvent): AuthzResult;
   audit(entry: Omit<AuditEntry, "adapter">): void;
   /** Register an HTTP route under /<adapter>/... */
-  route(method: "GET" | "POST" | "DELETE", subpath: string, handler: Handler, opts?: { maxBytes?: number }): void;
+  route(method: "GET" | "POST" | "DELETE", subpath: string, handler: Handler, opts?: RouteOptions): void;
   /** Same, behind the adapter's callback token + rate limit (agent-facing routes such as voice). */
   authedRoute(
     method: "GET" | "POST",

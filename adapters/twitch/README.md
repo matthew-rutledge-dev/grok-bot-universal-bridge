@@ -16,9 +16,15 @@ Twitch EventSub ──POST /twitch/eventsub──> verify (HMAC, age, replay) �
 | `Twitch-Eventsub-Message-Id`, `-Timestamp`, `-Signature` and `-Type` headers present | 400 `missing_headers` |
 | `Twitch-Eventsub-Message-Signature` equals `sha256=` + hex HMAC-SHA256(secret, message id + timestamp + **raw body bytes**), compared in constant time | 403 `bad_signature` |
 | The timestamp is within `maxAgeSec` (default and max 600) of now, either direction | 403 `stale` |
-| The message id was not seen in the last `dedupeTtlSec` (default `maxAgeSec + 60`; kept in `data/twitch-seen.json`, mode 600, survives restarts) | 200 `{duplicate: true}`, nothing delivered |
+| The message id was not seen before. Each id is kept until its **signed** timestamp has left the window, and for at least `dedupeTtlSec` (default `maxAgeSec + 60`), so an id is never forgotten while a replay of it could still pass the timestamp check | 200 `{duplicate: true}`, nothing delivered |
+| Fewer than 100,000 ids are still inside their window (`MAX_SEEN_IDS`). At the cap nothing is evicted early; new messages are refused until old ids expire, and Twitch retries them | 503 `replay_cache_full` |
+| Only now is the body JSON-parsed | 400 `invalid_json` |
 
-The signature is computed over the exact request bytes. The core keeps them on `HttpRequest.rawBody` for POST/PUT, so nothing is re-serialised.
+The signature is computed over the exact request bytes. The route is registered with `rawBody: true`, so the core hands over the bytes (`HttpRequest.rawBody`) and does **not** JSON-parse unauthenticated input. The adapter parses only after the signature, timestamp and replay checks pass. Bodies over 128 KiB get a clean 413.
+
+Seen ids are kept in `data/twitch-seen.json` (mode 600, atomic rename) and survive restarts. Writes are batched: at most one per second, plus a final flush on shutdown. An unclean crash can lose at most the last second of ids. Those ids could then be replayed while their signed timestamps are still inside the window, but the agent would only see a duplicate of an event that was already delivered.
+
+About the 100,000 cap: the window is about 11 minutes, so reaching it takes roughly 150 messages per second sustained, far above one channel's EventSub volume. The file is then about 7 MB.
 
 ## Message types
 
