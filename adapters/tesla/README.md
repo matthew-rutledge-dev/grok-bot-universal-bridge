@@ -3,7 +3,7 @@
 The bridge's half of the Tesla split. It turns vehicle telemetry and energy-site status into wake events for a Grok Bot. It **never sends vehicle commands, never wakes a car and never calls `vehicle_data`**.
 
 * **Bridge (here):** telemetry receiver, read-only energy polling, filter + debounce, wake rules, VIN and site allowlists, hold-and-retry, and an audit of event type, id (full VIN when `audit_full_vin` is on, the default; masked site id) and time.
-* **Plugin:** OAuth and token refresh, the Fleet API client, read and command tools, safety (read-only fail-closed, confirm, dry-run, `state_unknown`), and the virtual-key proxy client. It also exports the current access token for energy polling (see [Token](#token)).
+* **Plugin:** the reference Tesla plugin is [`grokbot-vehicle-fleet`](https://github.com/matthew-rutledge-dev/grokbot-vehicle-fleet) (any plugin that exports an access token the same way works; the token export needs 0.3.3 or later). It owns OAuth and token refresh, the Fleet API client, read and command tools, safety (read-only fail-closed, confirm, dry-run, `state_unknown`), and the virtual-key proxy client. It also exports the current access token for energy polling (see [Token](#token)).
 * **Operator (one time):** pushing `fleet_telemetry_config` to each car. That's a signed request through the virtual-key proxy and a real change to the car, so it's a deliberate one-time operator step (a confirm-gated plugin tool may do it later). The plugin doesn't push it today and the bridge never does. `telemetry.fields` here is the source of truth for that config; see [`docs/TESLA-CUTOVER.md`](../../docs/TESLA-CUTOVER.md).
 
 ## Hard rules (enforced by the validator and the tests)

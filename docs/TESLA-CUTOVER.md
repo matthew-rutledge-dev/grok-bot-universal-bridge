@@ -12,7 +12,7 @@ Ground rules:
 
 - [ ] The bridge runs at a commit that has the MQTT receiver (`docker compose run -T --rm universal-bridge node dist/src/main.js --check` shows no Tesla config problems).
 - [ ] A public DNS name and a TLS cert for fleet-telemetry exist (`<telemetry-fqdn>`). The cars connect to it over mTLS on its own port. This is the only thing exposed publicly; the broker and the bridge stay loopback or LAN.
-- [ ] The car has the app's virtual key paired, and the Tesla plugin works (`list_vehicles` answers).
+- [ ] The car has the app's virtual key paired, and the Tesla plugin (for example [`grokbot-vehicle-fleet`](https://github.com/matthew-rutledge-dev/grokbot-vehicle-fleet), 0.3.3 or later for the token export) works (`list_vehicles` answers).
 - [ ] You have the VIN(s) for `vin_allowlist` and the energy site id(s) for `site_allowlist` (from the plugin, kept in the host-only config).
 
 ## 1. MQTT broker
