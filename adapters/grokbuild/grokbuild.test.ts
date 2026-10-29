@@ -536,7 +536,8 @@ test("long replies: token lasts 6 h by default (max 24 h); the record lives as l
   try {
     const live = await r.b.call("GET", "/grokbuild/requests/direct-old0001", undefined, client);
     assert.deepEqual([live.status, live.body.state], [200, "awaiting_reply"]);
-    assert.equal((await r.b.call("GET", "/grokbuild/requests/direct-old0002", undefined, client)).status, 404);
+    // token expired while down: an expired tombstone, not a live record
+    assert.equal((await r.b.call("GET", "/grokbuild/requests/direct-old0002", undefined, client)).body.state, "expired");
     assert.equal((await r.b.call("GET", "/grokbuild/requests/relay-old00001", undefined, client)).status, 404);
   } finally {
     await r.close();
@@ -648,5 +649,79 @@ test("request-file writes: durable changes at once (hard-kill safe), housekeepin
     assert.equal((await again.b.call("GET", "/grokbuild/requests/burst-000000", undefined, client)).body.state, "cancelled");
   } finally {
     await again.close();
+  }
+});
+
+test("load after downtime: a direct request whose token expired while down leaves an expired tombstone", async () => {
+  const dir = tmp("ub-gb-down-");
+  const now = Date.now();
+  const rec = (id: string, expiredAgoMs: number) => ({
+    client: "example-client",
+    requestId: id,
+    bot: "direct",
+    createdAt: now - 7 * 3_600_000,
+    replies: [],
+    direct: true,
+    replyTokenHash: "0".repeat(64),
+    replyExpiresAt: now - expiredAgoMs,
+  });
+  writeFileSync(
+    join(dir, "grokbuild-requests.json"),
+    JSON.stringify({
+      version: 1,
+      requests: {
+        "example-client:down-recent01": rec("down-recent01", 10 * 60_000),
+        "example-client:down-ancient1": rec("down-ancient1", 2 * 3_600_000),
+      },
+    }),
+  );
+  const s = await setup({ tombstoneSec: 3600 }, [], {}, join(dir, "hold.json"));
+  try {
+    const r = await s.b.call("GET", "/grokbuild/requests/down-recent01", undefined, client);
+    assert.deepEqual([r.status, r.body.state, r.body.tombstone], [200, "expired", true]);
+    // the tombstone runs from the expiry, not from the restart
+    assert.ok(Math.abs(Date.parse(r.body.until) - (now - 10 * 60_000 + 3_600_000)) < 5000);
+    // expired longer ago than tombstoneSec: nothing left
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/down-ancient1", undefined, client)).status, 404);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a /prompt that reuses a cancelled direct id clears its tombstone (no stale cancelled later)", async () => {
+  const s = await setup({ replyTtlSec: 1 });
+  try {
+    await s.b.call("POST", "/grokbuild/expect", { requestId: "reuse-000001" }, client);
+    await s.b.call("DELETE", "/grokbuild/requests/reuse-000001", undefined, client);
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/reuse-000001", undefined, client)).body.state, "cancelled");
+    const p = await s.b.call("POST", "/grokbuild/prompt", { requestId: "reuse-000001", bot: "example-agent", prompt: "hi" }, client);
+    assert.equal(p.status, 202);
+    assert.notEqual((await s.b.call("GET", "/grokbuild/requests/reuse-000001", undefined, client)).body.state, "cancelled");
+    // once the relayed record ages out, the old "cancelled" must not come back
+    await new Promise((r) => setTimeout(r, 1200));
+    s.adapter.sweepNow();
+    const after = await s.b.call("GET", "/grokbuild/requests/reuse-000001", undefined, client);
+    assert.equal(after.status, 404, `stale tombstone: ${JSON.stringify(after.body)}`);
+  } finally {
+    await s.close();
+  }
+});
+
+test("tombstone cap is per client: one client's churn evicts only its own oldest", async () => {
+  assert.match(validateGrokBuildConfig({ ...example, maxTombstonesPerClient: 0 }).join(), /maxTombstonesPerClient/);
+  const s = await setup({ maxTombstonesPerClient: 2 });
+  const other = { authorization: "Bearer other-token" };
+  try {
+    await s.b.call("POST", "/grokbuild/expect", { requestId: "fair-other01" }, other);
+    await s.b.call("DELETE", "/grokbuild/requests/fair-other01", undefined, other);
+    for (const i of [1, 2, 3]) {
+      await s.b.call("POST", "/grokbuild/expect", { requestId: `fair-mine0${i}` }, client);
+      await s.b.call("DELETE", `/grokbuild/requests/fair-mine0${i}`, undefined, client);
+    }
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/fair-other01", undefined, other)).body.state, "cancelled", "other client's tombstone kept");
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/fair-mine01", undefined, client)).status, 404, "own oldest evicted");
+    for (const i of [2, 3]) assert.equal((await s.b.call("GET", `/grokbuild/requests/fair-mine0${i}`, undefined, client)).body.state, "cancelled");
+  } finally {
+    await s.close();
   }
 });
