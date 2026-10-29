@@ -497,3 +497,63 @@ test("cancel: DELETE frees the slot, spends the token, wakes readers; own direct
     await r.close();
   }
 });
+
+test("long replies: token lasts 6 h by default (max 24 h); the record lives as long as its token", async () => {
+  assert.match(validateGrokBuildConfig({ ...example, replyTokenTtlSec: 86_401 }).join(), /replyTokenTtlSec must be at most 86400/);
+  assert.deepEqual(validateGrokBuildConfig({ ...example, replyTokenTtlSec: 86_400 }), []);
+  const s = await setup({ replyTokenTtlSec: undefined, maxOpenRequests: 1 });
+  try {
+    const t0 = Date.now();
+    const ex = await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-long001" }, client);
+    const exp = Date.parse(ex.body.expiresAt);
+    assert.ok(Math.abs(exp - (t0 + 21_600_000)) < 5000, "default 6 h, not capped at replyTtlSec");
+    const read = await s.b.call("GET", "/grokbuild/requests/direct-long001", undefined, client);
+    assert.equal(read.body.expiresAt, ex.body.expiresAt);
+    assert.ok(Math.abs(Date.parse(read.body.createdAt) - t0) < 5000);
+    // the open cap still applies, and its Retry-After points at the token expiry
+    const capped = await raw(s.b.base, "POST", "/grokbuild/expect", { requestId: "direct-long002" });
+    assert.equal(capped.status, 429);
+    assert.ok(Number(capped.retryAfter) > 21_000);
+  } finally {
+    await s.close();
+  }
+  // after a restart, a direct record older than replyTtlSec still loads while its token is valid
+  const dir = tmp("ub-gb-long-");
+  const old = Date.now() - 2 * 3_600_000;
+  writeFileSync(
+    join(dir, "grokbuild-requests.json"),
+    JSON.stringify({
+      version: 1,
+      requests: {
+        "example-client:direct-old0001": { client: "example-client", requestId: "direct-old0001", bot: "direct", createdAt: old, replies: [], direct: true, replyTokenHash: "0".repeat(64), replyExpiresAt: Date.now() + 3_600_000 },
+        "example-client:direct-old0002": { client: "example-client", requestId: "direct-old0002", bot: "direct", createdAt: old, replies: [], direct: true, replyTokenHash: "0".repeat(64), replyExpiresAt: Date.now() - 1000 },
+        "example-client:relay-old00001": { client: "example-client", requestId: "relay-old00001", bot: "example-agent", createdAt: old, replies: [] },
+      },
+    }),
+  );
+  const r = await setup({ replyTtlSec: 3600 }, [], {}, join(dir, "hold.json"));
+  try {
+    const live = await r.b.call("GET", "/grokbuild/requests/direct-old0001", undefined, client);
+    assert.deepEqual([live.status, live.body.state], [200, "awaiting_reply"]);
+    assert.equal((await r.b.call("GET", "/grokbuild/requests/direct-old0002", undefined, client)).status, 404);
+    assert.equal((await r.b.call("GET", "/grokbuild/requests/relay-old00001", undefined, client)).status, 404);
+  } finally {
+    await r.close();
+  }
+});
+
+test("reply lookup is by requestId: a token for one client's id never matches another client's record", async () => {
+  const s = await setup();
+  try {
+    const a = (await s.b.call("POST", "/grokbuild/expect", { requestId: "shared-id-0001" }, client)).body.replyToken as string;
+    const b = (await s.b.call("POST", "/grokbuild/expect", { requestId: "shared-id-0001" }, { authorization: "Bearer other-token" })).body.replyToken as string;
+    assert.equal((await s.b.call("POST", "/grokbuild/reply", { requestId: "shared-id-0001", content: "for other" }, { authorization: `Bearer ${b}` })).status, 200);
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/shared-id-0001", undefined, client)).body.replies.length, 0);
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/shared-id-0001", undefined, { authorization: "Bearer other-token" })).body.replies[0].content, "for other");
+    // cancel drops it from the index too: the old token no longer finds it
+    assert.equal((await s.b.call("DELETE", "/grokbuild/requests/shared-id-0001", undefined, client)).status, 200);
+    assert.equal((await s.b.call("POST", "/grokbuild/reply", { requestId: "shared-id-0001", content: "x" }, { authorization: `Bearer ${a}` })).status, 401);
+  } finally {
+    await s.close();
+  }
+});

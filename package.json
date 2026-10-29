@@ -1,6 +1,6 @@
 {
   "name": "grok-bot-universal-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Generic, deny-by-default bridge from many sources (chat, CLI, vehicle telemetry, ...) to Grok Bots through pluggable source adapters and a private, read-only registry",
   "license": "MIT",

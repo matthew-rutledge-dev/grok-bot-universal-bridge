@@ -6,7 +6,7 @@
   "promptsPerMin": 20,
   "readsPerMin": 240,
   "maxOpenRequests": 200,
-  "replyTokenTtlSec": 900,
+  "replyTokenTtlSec": 21600,
   "replyAuthFailsPerMin": 60,
   "replyAttemptsPerRequest": 10,
   "maxWaitSec": 25,
