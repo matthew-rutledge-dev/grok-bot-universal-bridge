@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { TwitchAdapter, eventSubSignature, validateTwitchConfig, type TwitchConfig } from "./index.js";
+import { readdirSync } from "node:fs";
+import { MAX_SEEN_IDS, SEEN_FLUSH_MS, TwitchAdapter, eventSubSignature, validateTwitchConfig, type TwitchConfig } from "./index.js";
 import { mockRoutine, startBridge, tmp } from "../../test/helpers.js";
 
 const example = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8")) as TwitchConfig;
@@ -270,4 +271,120 @@ test("allowActors narrows a route: a chatter outside the list is denied", async 
   } finally {
     await s.close();
   }
+});
+
+/** A bare adapter context writing state under `dir` (no HTTP), with a counter for file writes. */
+function bareCtx(dir: string) {
+  const audits: any[] = [];
+  return {
+    audits,
+    ctx: {
+      name: "twitch",
+      log: { info() {}, warn() {}, error() {} },
+      callbackUrl: "",
+      submit: async () => ({ accepted: true as const, id: "x", state: "delivered" as const, agent: "example-agent" }),
+      check: () => ({ ok: false as const, reason: "no_route" as const }),
+      audit: (e: any) => audits.push(e),
+      route() {},
+      authedRoute() {},
+      secret: () => SECRET,
+      state: () => undefined,
+      raw: () => undefined,
+      dataFile: (name: string) => join(dir, name),
+    } as any,
+  };
+}
+function signedReq(id: string, ts: string, raw: string | Buffer) {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw, "utf8");
+  return {
+    method: "POST",
+    path: "/twitch/eventsub",
+    headers: { "twitch-eventsub-message-id": id, "twitch-eventsub-message-timestamp": ts, "twitch-eventsub-message-signature": eventSubSignature(SECRET, id, ts, buf), "twitch-eventsub-message-type": "notification" },
+    params: {},
+    query: new URLSearchParams(),
+    body: undefined,
+    rawBody: buf,
+  };
+}
+
+test("the body is parsed only after verification: core hands over raw bytes, signed garbage is a 400, unsigned garbage a 403", async () => {
+  const s = await setup();
+  try {
+    const garbage = "{not json";
+    const unsigned = await send(s.b.base, "notification", undefined, { raw: garbage, sig: "sha256=" + "0".repeat(64) });
+    assert.equal(unsigned.status, 403, "signature is checked before any parse");
+    const signed = await send(s.b.base, "notification", undefined, { raw: garbage });
+    assert.equal(signed.status, 400);
+    assert.match(signed.text, /invalid_json/);
+    assert.equal(s.m.hits.length, 0);
+  } finally {
+    await s.close();
+  }
+});
+
+test("multibyte chat verifies byte-exact and reaches the agent intact", async () => {
+  const s = await setup();
+  try {
+    const r = await send(s.b.base, "notification", chat("!bot héllo ✓ 😀 日本語"));
+    assert.equal(r.status, 200);
+    assert.match(String(s.m.hits[0].body.prompt), /héllo ✓ 😀 日本語/);
+  } finally {
+    await s.close();
+  }
+});
+
+test("seen-id writes are batched (one write per interval) and flushed on stop", async () => {
+  const dir = tmp();
+  const t0 = Date.parse("2026-01-01T00:05:00Z");
+  const a = new TwitchAdapter(example, { now: () => t0 });
+  const { ctx } = bareCtx(dir);
+  a.init(ctx);
+  for (let i = 0; i < 20; i++) assert.equal((await a.handle(signedReq(`11111111-0000-4000-8000-${String(i).padStart(12, "0")}`, "2026-01-01T00:04:30Z", JSON.stringify(chat("!bot x"))) as any)).status, 200);
+  assert.ok(!readdirSync(dir).includes("twitch-seen.json"), "nothing written synchronously per message");
+  await new Promise((r) => setTimeout(r, SEEN_FLUSH_MS + 200));
+  const first = JSON.parse(readFileSync(join(dir, "twitch-seen.json"), "utf8"));
+  assert.equal(first.v, 2);
+  assert.equal(Object.keys(first.expires).length, 20, "one batched write holds all 20");
+  await a.handle(signedReq("22222222-0000-4000-8000-000000000000", "2026-01-01T00:04:30Z", JSON.stringify(chat("!bot y"))) as any);
+  await a.stop();
+  assert.equal(Object.keys(JSON.parse(readFileSync(join(dir, "twitch-seen.json"), "utf8")).expires).length, 21, "stop() flushes the pending id");
+});
+
+test("ids are kept until their signed timestamp leaves the window (never evicted early); a full cache fails closed with 503", async () => {
+  let now = Date.parse("2026-01-01T00:00:00Z");
+  const a = new TwitchAdapter(example, { now: () => now });
+  const { ctx } = bareCtx("");
+  ctx.dataFile = () => "";
+  a.init(ctx);
+  // Future-dated (still inside the window) message: its id must outlive dedupeTtl from first sight.
+  const future = new Date(now + 9 * 60_000).toISOString();
+  const id = "33333333-0000-4000-8000-000000000000";
+  const raw = JSON.stringify(chat("!bot hi"));
+  assert.equal((await a.handle(signedReq(id, future, raw) as any)).status, 200);
+  now += 15 * 60_000; // past first-seen + ttl (11 min) but the signed ts is only 6 min old
+  assert.deepEqual((await a.handle(signedReq(id, future, raw) as any)).body, { ok: true, duplicate: true });
+  now += 5 * 60_000; // signed ts now 11 min old: stale check rejects it anyway
+  assert.equal((await a.handle(signedReq(id, future, raw) as any)).status, 403);
+
+  // Fill the cache with live ids: the next new message is refused, nothing is evicted.
+  const seen = (a as any).seen as Map<string, number>;
+  seen.clear();
+  for (let i = 0; i < MAX_SEEN_IDS; i++) seen.set(`fill-${i}`, now + 60_000);
+  const fresh = new Date(now).toISOString();
+  const r = await a.handle(signedReq("44444444-0000-4000-8000-000000000000", fresh, raw) as any);
+  assert.deepEqual([r.status, (r.body as any).error], [503, "replay_cache_full"]);
+  assert.equal(seen.size, MAX_SEEN_IDS);
+  now += 61_000; // fill ids expire
+  assert.equal((await a.handle(signedReq("55555555-0000-4000-8000-000000000000", new Date(now).toISOString(), raw) as any)).status, 200);
+});
+
+test("an older seen-id file (first-seen times) still loads", async () => {
+  const dir = tmp();
+  const t0 = Date.parse("2026-01-01T00:05:00Z");
+  const { writeFileSync } = await import("node:fs");
+  const id = "66666666-0000-4000-8000-000000000000";
+  writeFileSync(join(dir, "twitch-seen.json"), JSON.stringify({ seen: { [id]: t0 - 60_000 } }));
+  const a = new TwitchAdapter(example, { now: () => t0 });
+  a.init(bareCtx(dir).ctx);
+  assert.deepEqual((await a.handle(signedReq(id, "2026-01-01T00:04:00Z", JSON.stringify(chat("!bot hi"))) as any)).body, { ok: true, duplicate: true });
 });

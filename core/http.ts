@@ -11,9 +11,20 @@ export interface HttpRequest {
   headers: IncomingHttpHeaders;
   params: Record<string, string>;
   query: URLSearchParams;
+  /** Parsed JSON (or MultipartBody). Undefined for routes registered with `rawBody: true`. */
   body: unknown;
   /** Exact request bytes for POST/PUT (for adapters that verify a signature over the raw body). */
   rawBody?: Buffer;
+}
+
+export interface RouteOptions {
+  maxBytes?: number;
+  /**
+   * Deliver only the raw bytes: the core does not JSON-parse the body, so
+   * nothing touches unauthenticated input before the handler verifies it
+   * (for example an HMAC signature). The handler parses after verification.
+   */
+  rawBody?: boolean;
 }
 
 export interface HttpResponse {
@@ -29,6 +40,7 @@ interface RouteDef {
   parts: string[];
   handler: Handler;
   maxBytes: number;
+  rawBody: boolean;
 }
 
 export const DEFAULT_MAX_BODY = 256 * 1024;
@@ -52,21 +64,50 @@ export function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(da, db);
 }
 
+/**
+ * Read the body up to maxBytes. An oversize body (by content-length or by
+ * counting) is not buffered: the rest is read and discarded so the client
+ * gets a clean 413 instead of a reset socket. Past a hard drain cap the
+ * socket is destroyed, so a sender cannot keep the connection busy forever.
+ */
+export const DRAIN_CAP_BYTES = 4 * 1024 * 1024;
+
 function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let over = false;
+    let settled = false;
+    const tooLarge = () => Object.assign(new Error("body too large"), { status: 413 });
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > maxBytes) over = true;
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => {
       size += c.length;
-      if (size > maxBytes) {
-        reject(Object.assign(new Error("body too large"), { status: 413 }));
-        req.destroy();
+      if (!over && size > maxBytes) {
+        over = true;
+        chunks.length = 0;
+      }
+      if (over) {
+        if (size > maxBytes + DRAIN_CAP_BYTES && !settled) {
+          settled = true;
+          reject(tooLarge());
+          req.destroy();
+        }
         return;
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      if (over) reject(tooLarge());
+      else resolve(Buffer.concat(chunks));
+    });
+    req.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      reject(e);
+    });
   });
 }
 
@@ -76,12 +117,12 @@ export class HttpServer {
 
   constructor(private readonly log: Logger = consoleLogger) {}
 
-  route(method: string, pattern: string, handler: Handler, opts?: { maxBytes?: number }): void {
+  route(method: string, pattern: string, handler: Handler, opts?: RouteOptions): void {
     const parts = pattern.split("/").filter(Boolean);
     if (this.routes.some((r) => r.method === method && r.parts.join("/") === parts.join("/"))) {
       throw new Error(`duplicate route ${method} ${pattern}`);
     }
-    this.routes.push({ method, parts, handler, maxBytes: opts?.maxBytes ?? DEFAULT_MAX_BODY });
+    this.routes.push({ method, parts, handler, maxBytes: opts?.maxBytes ?? DEFAULT_MAX_BODY, rawBody: opts?.rawBody === true });
   }
 
   /** undefined = no route; "bad_path" = a parameter is not valid percent-encoding. */
@@ -117,7 +158,13 @@ export class HttpServer {
           // A string body with an explicit text/plain content-type is written as-is (e.g. a webhook challenge echo).
           const plain = typeof out.body === "string" && /^text\/plain\b/i.test(out.headers?.["content-type"] ?? "");
           const body = plain ? (out.body as string) : JSON.stringify(out.body ?? {});
-          res.writeHead(out.status, { "content-type": "application/json", "cache-control": "no-store", ...(out.headers ?? {}) });
+          res.writeHead(out.status, {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+            ...(out.headers ?? {}),
+            ...(plain ? { "content-type": "text/plain; charset=utf-8" } : {}),
+          });
           res.end(body);
         })
         .catch((err) => {
@@ -156,14 +203,18 @@ export class HttpServer {
       if (method === "POST" || method === "PUT") {
         const raw = await readBody(req, m.def.maxBytes);
         rawBody = raw;
-        const boundary = multipartBoundary(req.headers["content-type"]);
-        // multipart/form-data stays raw until the handler parses it (after auth).
-        if (boundary) body = new MultipartBody(raw, boundary);
-        else body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+        // rawBody routes get the bytes only; the handler parses after verifying them.
+        if (!m.def.rawBody) {
+          const boundary = multipartBoundary(req.headers["content-type"]);
+          // multipart/form-data stays raw until the handler parses it (after auth).
+          if (boundary) body = new MultipartBody(raw, boundary);
+          else body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+        }
       }
     } catch (err) {
       const status = (err as { status?: number }).status ?? 400;
-      return { status, body: { ok: false, error: status === 413 ? "body_too_large" : "invalid_json" } };
+      if (status === 413) return { status, body: { ok: false, error: "body_too_large" }, headers: { connection: "close" } };
+      return { status, body: { ok: false, error: "invalid_json" } };
     }
     try {
       return await m.def.handler({ method, path: url.pathname, headers: req.headers, params: m.params, query: url.searchParams, body, rawBody });
