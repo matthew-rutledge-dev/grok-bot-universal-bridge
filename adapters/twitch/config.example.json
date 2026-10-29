@@ -1,0 +1,47 @@
+{
+  "secretRef": "env:TWITCH_EVENTSUB_SECRET",
+  "maxAgeSec": 600,
+  "chat": {
+    "commandPrefixes": ["!bot"],
+    "botLogin": "example_bot",
+    "maxChars": 500
+  },
+  "routes": [
+    {
+      "id": "example-channel-chat",
+      "enabled": true,
+      "match": { "broadcaster": "11111111", "type": "channel.chat.message" },
+      "allowActors": ["*"],
+      "requireAddressed": true,
+      "agent": "example-agent"
+    },
+    {
+      "id": "example-channel-follows",
+      "enabled": true,
+      "match": { "broadcaster": "11111111", "type": "channel.follow" },
+      "allowActors": ["*"],
+      "agent": "example-agent"
+    },
+    {
+      "id": "example-channel-raids",
+      "enabled": true,
+      "match": { "broadcaster": "11111111", "type": "channel.raid" },
+      "allowActors": ["*"],
+      "agent": "example-agent"
+    },
+    {
+      "id": "example-channel-live",
+      "enabled": true,
+      "match": { "broadcaster": "11111111", "type": "stream.online" },
+      "allowActors": ["11111111"],
+      "agent": "example-agent"
+    },
+    {
+      "id": "example-channel-revocations",
+      "enabled": true,
+      "match": { "broadcaster": "11111111", "type": "revocation" },
+      "allowActors": ["11111111"],
+      "agent": "example-agent"
+    }
+  ]
+}
