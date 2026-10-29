@@ -55,6 +55,15 @@ node scripts/grokbuild-live-check.mjs \
 - [ ] The audit shows `inbound allow`, `deliver ok` (or `hold` then `deliver`), `callback ok reply_stored` and `reply_read`, with masked ids only.
 - [ ] Point the real Grok Build client at the bridge URL with its client token and send one prompt from a coding session.
 
+## 3b. Direct replies (optional, for clients that post to the webhook routine themselves)
+
+Used by clients such as the grokbuild-grokbots plugin when it is given the bridge URL and a client token. No new secret on the host: it reuses the client token and `http.publicBaseUrl`.
+
+- [ ] Deploy this version. The tunnel already routes `/grokbuild/*`, so `/grokbuild/expect` and `/grokbuild/reply` need no tunnel or firewall change: the service still binds loopback only (`127.0.0.1:<port>`, `18090` in `compose.example.yml`) and nothing new listens.
+- [ ] Optional limits in the host `grokbuild.json`: `replyTokenTtlSec` (default 900), `replyPostsPerMin` (default 90), `maxWaitSec` (default 25, max 60; keep it below the tunnel's idle/response timeout). Recreate the container after editing it.
+- [ ] `GET /grokbuild/status` with the client token reports `"directReplies": "ready"` and `"readOnly": false` (read-only also refuses `/grokbuild/expect`).
+- [ ] One round trip from the client (for the plugin: `send_prompt` with `confirm: true`, then `wait_reply`). The audit shows `ingest ok reply_route_issued`, `callback ok direct_reply_stored` and `reply_read`, with masked ids only.
+
 ## 4. Soak
 
 - [ ] Watch the audit for `rate_limited`, `agent_not_ready`, `give_up` and `bad_token_suppressed`.

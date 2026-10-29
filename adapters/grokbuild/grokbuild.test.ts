@@ -287,3 +287,126 @@ test("a request file from before per-client keys still loads and takes late repl
     await s.close();
   }
 });
+
+// ---- direct replies: POST /expect -> one-time reply token -> POST /reply -> long-poll read ----
+
+test("direct reply: expect -> reply with the one-time token -> long-poll read gets it", async () => {
+  const s = await setup();
+  try {
+    const ex = await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-0000001", bot: "example-agent" }, client);
+    assert.equal(ex.status, 201);
+    assert.equal(ex.body.replyUrl, "https://bridge.example.com/grokbuild/reply");
+    assert.match(ex.body.replyToken, /^[A-Za-z0-9_-]{43}$/);
+    assert.ok(Date.parse(ex.body.expiresAt) > Date.now());
+    const token = ex.body.replyToken as string;
+    // nothing was delivered by the bridge
+    assert.equal(s.m.hits.length, 0);
+    const before = await s.b.call("GET", "/grokbuild/requests/direct-0000001", undefined, client);
+    assert.deepEqual([before.body.state, before.body.replies.length], ["awaiting_reply", 0]);
+
+    const t0 = Date.now();
+    const pending = s.b.call("GET", "/grokbuild/requests/direct-0000001?waitSec=10", undefined, client);
+    await new Promise((r) => setTimeout(r, 100));
+    const rep = await s.b.call("POST", "/grokbuild/reply", { requestId: "direct-0000001", content: "Done: tests pass." }, { authorization: `Bearer ${token}` });
+    assert.equal(rep.status, 200);
+    const read = await pending;
+    assert.ok(Date.now() - t0 < 5000, "long-poll returned as soon as the reply landed");
+    assert.deepEqual([read.status, read.body.state, read.body.replies[0].content], [200, "replied", "Done: tests pass."]);
+
+    // one reply per token
+    const again = await s.b.call("POST", "/grokbuild/reply", { requestId: "direct-0000001", content: "again" }, { authorization: `Bearer ${token}` });
+    assert.equal(again.status, 401);
+    // another client cannot read it
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/direct-0000001", undefined, { authorization: "Bearer other-token" })).status, 404);
+    // the audit never carries the token or reply text
+    const text = JSON.stringify(s.b.audit.lines);
+    assert.ok(!text.includes(token) && !text.includes("tests pass"));
+  } finally {
+    await s.close();
+  }
+});
+
+test("direct reply auth: missing, wrong, other request's, query and x-callback-token", async () => {
+  const s = await setup();
+  try {
+    const a = (await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-aaaaaaa" }, client)).body.replyToken as string;
+    const b = (await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-bbbbbbb" }, client)).body.replyToken as string;
+    const post = (body: unknown, headers: Record<string, string> = {}) => s.b.call("POST", "/grokbuild/reply", body, headers);
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "x" })).status, 401);
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "x" }, { authorization: "Bearer nope" })).status, 401);
+    // a token is bound to its own requestId
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "x" }, { authorization: `Bearer ${b}` })).status, 401);
+    // client and callback tokens are not reply tokens
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "x" }, { authorization: "Bearer client-token" })).status, 401);
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "x" }, { authorization: "Bearer cb-grokbuild" })).status, 401);
+    const q = await s.b.call("POST", `/grokbuild/reply?token=${a}`, { requestId: "direct-aaaaaaa", content: "x" });
+    assert.equal(q.status, 400);
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "" }, { authorization: `Bearer ${a}` })).status, 400);
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "y".repeat(8001) }, { authorization: `Bearer ${a}` })).status, 413);
+    // the token still works after refused attempts, and x-callback-token is accepted too
+    assert.equal((await post({ requestId: "direct-aaaaaaa", content: "ok" }, { "x-callback-token": a })).status, 200);
+    // the bridge's shared callback token can still answer a direct request
+    assert.equal((await s.b.call("POST", "/grokbuild/callback", { requestId: "direct-bbbbbbb", content: "via callback" }, { authorization: "Bearer cb-grokbuild" })).status, 200);
+    // duplicate and bad ids
+    assert.equal((await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-aaaaaaa" }, client)).status, 409);
+    assert.equal((await s.b.call("POST", "/grokbuild/expect", { requestId: "short" }, client)).status, 400);
+    assert.equal((await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-ccccccc" })).status, 401);
+  } finally {
+    await s.close();
+  }
+});
+
+test("direct reply: token expires; read-only refuses expect; long-poll times out", async () => {
+  const s = await setup({ replyTokenTtlSec: 1 });
+  try {
+    const t = (await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-exp0001" }, client)).body.replyToken as string;
+    const t0 = Date.now();
+    const idle = await s.b.call("GET", "/grokbuild/requests/direct-exp0001?waitSec=1", undefined, client);
+    assert.ok(Date.now() - t0 >= 900);
+    assert.equal(idle.body.replies.length, 0);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal((await s.b.call("POST", "/grokbuild/reply", { requestId: "direct-exp0001", content: "late" }, { authorization: `Bearer ${t}` })).status, 401);
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/direct-exp0001", undefined, client)).body.state, "expired");
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/direct-exp0001?waitSec=-1", undefined, client)).status, 400);
+  } finally {
+    await s.close();
+  }
+  const ro = await setup({}, [], { GROKBUILD_READ_ONLY: "1" });
+  try {
+    const r = await ro.b.call("POST", "/grokbuild/expect", { requestId: "direct-ro00001" }, client);
+    assert.deepEqual([r.status, r.body.error], [403, "read_only"]);
+  } finally {
+    await ro.close();
+  }
+});
+
+test("direct reply: stop releases long-poll readers; token stored only as a hash", async () => {
+  const dir = tmp();
+  const holdFile = join(dir, "hold.json");
+  const s = await setup({}, [], {}, holdFile);
+  const t = (await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-stop001" }, client)).body.replyToken as string;
+  const pending = s.b.call("GET", "/grokbuild/requests/direct-stop001?waitSec=20", undefined, client);
+  await new Promise((r) => setTimeout(r, 100));
+  const t0 = Date.now();
+  await s.adapter.stop();
+  const r = await pending;
+  assert.ok(Date.now() - t0 < 3000);
+  assert.equal(r.body.state, "awaiting_reply");
+  await s.close();
+  const saved = readFileSync(join(dir, "grokbuild-requests.json"), "utf8");
+  assert.ok(!saved.includes(t), "raw token not persisted");
+  assert.match(saved, /replyTokenHash/);
+});
+
+test("direct reply config validation and status", async () => {
+  assert.match(validateGrokBuildConfig({ ...example, replyTokenTtlSec: 0 }).join(), /replyTokenTtlSec/);
+  assert.match(validateGrokBuildConfig({ ...example, maxWaitSec: 61 }).join(), /maxWaitSec/);
+  assert.match(validateGrokBuildConfig({ ...example, replyPostsPerMin: -1 }).join(), /replyPostsPerMin/);
+  const s = await setup();
+  try {
+    const st = await s.b.call("GET", "/grokbuild/status", undefined, client);
+    assert.equal(st.body.directReplies, "ready");
+  } finally {
+    await s.close();
+  }
+});
