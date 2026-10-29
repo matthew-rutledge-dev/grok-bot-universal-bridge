@@ -27,6 +27,8 @@ interface SourceAdapter {
 
 An adapter builds an `InboundEvent` (`eventId`, `lane`, `actor`, `match`, `prompt`, optional `actorGroups`, `addressed`, `metadata`, `ref`) and calls `ctx.submit(event)`. The core runs the allowlist, resolves the agent in the registry, delivers it with hold-and-retry and writes the audit line. Adapters never see registry secrets.
 
+Routes registered with `ctx.route(method, subpath, handler, { maxBytes?, rawBody? })`: `rawBody: true` skips the core's JSON parse and hands the handler only `req.rawBody`. Use it when the source signs the raw bytes, and parse after verifying.
+
 Rules for every adapter:
 
 * Deny by default: the config validator must reject routes whose `match` shape is wrong for the source.
