@@ -82,6 +82,8 @@ export interface GrokBuildConfig {
   repliedKeepSec?: number;
   /** ...or this long after the first read that returned the reply, whichever comes first (default 600; at least 1). */
   readKeepSec?: number;
+  /** Tombstones kept per client; past it that client's oldest goes first (default 10000; at least 1). */
+  maxTombstonesPerClient?: number;
 }
 
 interface RequestRecord {
@@ -122,7 +124,8 @@ const MAX_WAIT_CAP_SEC = 60;
 const MAX_LONG_POLLS_CAP = 1000;
 const DEFAULT_TOKEN_TTL_SEC = 21_600;
 const MAX_TOKEN_TTL_SEC = 86_400;
-const MAX_TOMBSTONES = 10_000;
+/** Tombstones kept per client (default; maxTombstonesPerClient). One client's churn evicts only its own oldest. */
+const DEFAULT_TOMBSTONES_PER_CLIENT = 10_000;
 /** Housekeeping writes (sweep, read marks) are coalesced: at most one per SAVE_DEBOUNCE_MS (flushed on stop). */
 const SAVE_DEBOUNCE_MS = 1000;
 
@@ -158,6 +161,9 @@ export function validateGrokBuildConfig(raw: unknown): string[] {
   }
   if (typeof c.replyTokenTtlSec === "number" && c.replyTokenTtlSec > MAX_TOKEN_TTL_SEC) p.push(`grokbuild.replyTokenTtlSec must be at most ${MAX_TOKEN_TTL_SEC} (24 h)`);
   if (typeof c.tombstoneSec === "number" && c.tombstoneSec > MAX_TOKEN_TTL_SEC) p.push(`grokbuild.tombstoneSec must be at most ${MAX_TOKEN_TTL_SEC}`);
+  if (c.maxTombstonesPerClient !== undefined && !(Number.isInteger(c.maxTombstonesPerClient) && c.maxTombstonesPerClient >= 1 && c.maxTombstonesPerClient <= 100_000)) {
+    p.push("grokbuild.maxTombstonesPerClient must be a whole number from 1 to 100000");
+  }
   for (const k of ["repliedKeepSec", "readKeepSec"] as const) {
     const v = c[k];
     if (v !== undefined && !(Number.isInteger(v) && v >= 1 && v <= MAX_TOKEN_TTL_SEC)) p.push(`grokbuild.${k} must be a whole number from 1 to ${MAX_TOKEN_TTL_SEC}`);
@@ -214,6 +220,8 @@ export class GrokBuildAdapter implements SourceAdapter {
   private readonly waiters = new Map<string, Set<() => void>>();
   private longPolls = 0;
   private readonly tombstones = new Map<string, Tombstone>();
+  /** client -> its tombstone keys, oldest first (for the per-client cap). */
+  private readonly tombsByClient = new Map<string, Set<string>>();
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
   /** Number of request-file writes (for tests and the debounce check). */
   writes = 0;
@@ -225,13 +233,24 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (!this.file) return;
     try {
       const raw = JSON.parse(readFileSync(this.file, "utf8")) as { requests?: Record<string, RequestRecord>; tombstones?: Record<string, Tombstone> };
-      for (const [k, t] of Object.entries(raw.tombstones ?? {})) if (t && t.until > Date.now()) this.tombstones.set(k, t);
+      let buried = 0;
       for (const [id, r] of Object.entries(raw.requests ?? {})) {
-        if (!r || this.expiresAt(r) < Date.now()) continue;
+        if (!r) continue;
         // Older files were keyed by requestId alone.
         const requestId = r.requestId ?? (id.includes(":") ? id.slice(id.indexOf(":") + 1) : id);
-        this.putRecord(requestKey(r.client, requestId), { ...r, requestId });
+        const key = requestKey(r.client, requestId);
+        const ends = this.expiresAt(r);
+        if (ends < Date.now()) {
+          // The token expired while the bridge was down: leave the same "expired" tombstone the sweep would have.
+          if (r.direct && r.replies.length === 0) buried += Number(this.bury(key, { ...r, requestId }, "expired", ends));
+          continue;
+        }
+        this.putRecord(key, { ...r, requestId });
       }
+      for (const [k, t] of Object.entries(raw.tombstones ?? {})) {
+        if (t && t.until > Date.now() && !this.requests.has(k) && !this.tombstones.has(k)) this.addTomb(k, t);
+      }
+      if (buried) this.saveRequests(false);
     } catch {
       /* none yet */
     }
@@ -302,13 +321,38 @@ export class GrokBuildAdapter implements SourceAdapter {
     return Math.max(r.createdAt + this.ttlMs(), r.direct ? (r.replyExpiresAt ?? 0) : 0);
   }
 
-  /** Leave a short-lived final state for a dropped direct request (no-op when tombstoneSec is 0). */
-  private bury(key: string, rec: RequestRecord, state: Tombstone["state"]): void {
+  /**
+   * Leave a short-lived final state for a dropped direct request (no-op when tombstoneSec is 0).
+   * `at` is when it ended (now for a cancel or sweep, the expiry time when found on load).
+   */
+  private bury(key: string, rec: RequestRecord, state: Tombstone["state"], at = Date.now()): boolean {
     const sec = this.cfg.tombstoneSec ?? 3600;
-    if (!(sec > 0) || !rec.direct) return;
+    if (!(sec > 0) || !rec.direct) return false;
+    const until = at + sec * 1000;
+    if (until <= Date.now()) return false;
+    this.dropTomb(key);
+    this.addTomb(key, { client: rec.client, requestId: rec.requestId ?? key.slice(key.indexOf(":") + 1), state, until });
+    return true;
+  }
+
+  private addTomb(key: string, t: Tombstone): void {
+    this.tombstones.set(key, t);
+    let set = this.tombsByClient.get(t.client);
+    if (!set) this.tombsByClient.set(t.client, (set = new Set()));
+    set.add(key);
+    const cap = this.cfg.maxTombstonesPerClient ?? DEFAULT_TOMBSTONES_PER_CLIENT;
+    // Fair eviction: only this client's own oldest tombstones make room.
+    while (set.size > cap) this.dropTomb(set.values().next().value as string);
+  }
+
+  private dropTomb(key: string): boolean {
+    const t = this.tombstones.get(key);
+    if (!t) return false;
     this.tombstones.delete(key);
-    this.tombstones.set(key, { client: rec.client, requestId: rec.requestId ?? key.slice(key.indexOf(":") + 1), state, until: Date.now() + sec * 1000 });
-    while (this.tombstones.size > MAX_TOMBSTONES) this.tombstones.delete(this.tombstones.keys().next().value as string);
+    const set = this.tombsByClient.get(t.client);
+    set?.delete(key);
+    if (set && set.size === 0) this.tombsByClient.delete(t.client);
+    return true;
   }
 
   /** One sweep: drop expired records (unreplied direct ones leave an "expired" tombstone) and old tombstones. */
@@ -319,12 +363,14 @@ export class GrokBuildAdapter implements SourceAdapter {
       if (r.direct && r.replies.length === 0) this.bury(id, r, "expired");
       n += Number(this.dropRecord(id));
     }
-    for (const [k, t] of this.tombstones) if (t.until <= now) n += Number(this.tombstones.delete(k));
+    for (const [k, t] of this.tombstones) if (t.until <= now) n += Number(this.dropTomb(k));
     if (n) this.saveRequests(false);
     for (const k of this.replyAttempts.keys()) if (!this.requests.has(k)) this.replyAttempts.delete(k);
   }
 
   private putRecord(key: string, rec: RequestRecord): void {
+    // A new record for a reused id (/expect or /prompt) supersedes any old final state.
+    this.dropTomb(key);
     this.requests.set(key, rec);
     const id = rec.requestId ?? key.slice(key.indexOf(":") + 1);
     let set = this.byId.get(id);
@@ -633,7 +679,6 @@ export class GrokBuildAdapter implements SourceAdapter {
     const token = randomBytes(32).toString("base64url");
     const now = Date.now();
     const expires = now + this.tokenTtlMs();
-    this.tombstones.delete(key);
     this.putRecord(key, { client, requestId, bot, createdAt: now, replies: [], direct: true, replyTokenHash: hashReplyToken(token), replyExpiresAt: expires });
     this.saveRequests();
     this.ctx.audit({ action: "ingest", outcome: "ok", reason: "reply_route_issued", eventId: requestId, actor: client });
