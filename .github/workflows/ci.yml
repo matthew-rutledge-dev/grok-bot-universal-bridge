@@ -29,6 +29,6 @@ jobs:
       - name: config check against the shipped examples
         shell: bash
         run: |
-          node -e "const fs=require('fs'),path=require('path');const c=JSON.parse(fs.readFileSync('config/bridge.example.json','utf8'));c.registryPath='config/registry.example.json';for(const n of ['discord','grokbuild','tesla']){c.adapters[n].configPath='adapters/'+n+'/config.example.json';c.adapters[n].enabled=true;}fs.writeFileSync(path.join(process.env.RUNNER_TEMP,'bridge.json'),JSON.stringify(c));"
+          node -e "const fs=require('fs'),path=require('path');const c=JSON.parse(fs.readFileSync('config/bridge.example.json','utf8'));c.registryPath='config/registry.example.json';for(const n of ['discord','grokbuild','tesla','twitch']){c.adapters[n].configPath='adapters/'+n+'/config.example.json';c.adapters[n].enabled=true;}fs.writeFileSync(path.join(process.env.RUNNER_TEMP,'bridge.json'),JSON.stringify(c));"
           BRIDGE_CONFIG="$RUNNER_TEMP/bridge.json" node dist/src/main.js --check
       - run: npm run leak-check

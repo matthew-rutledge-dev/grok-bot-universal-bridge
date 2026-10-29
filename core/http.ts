@@ -12,6 +12,8 @@ export interface HttpRequest {
   params: Record<string, string>;
   query: URLSearchParams;
   body: unknown;
+  /** Exact request bytes for POST/PUT (for adapters that verify a signature over the raw body). */
+  rawBody?: Buffer;
 }
 
 export interface HttpResponse {
@@ -112,7 +114,9 @@ export class HttpServer {
     this.server = createServer((req, res) => {
       void this.handle(req)
         .then((out) => {
-          const body = JSON.stringify(out.body ?? {});
+          // A string body with an explicit text/plain content-type is written as-is (e.g. a webhook challenge echo).
+          const plain = typeof out.body === "string" && /^text\/plain\b/i.test(out.headers?.["content-type"] ?? "");
+          const body = plain ? (out.body as string) : JSON.stringify(out.body ?? {});
           res.writeHead(out.status, { "content-type": "application/json", "cache-control": "no-store", ...(out.headers ?? {}) });
           res.end(body);
         })
@@ -147,9 +151,11 @@ export class HttpServer {
     if (m === "bad_path") return { status: 400, body: { ok: false, error: "bad_path_encoding" } };
     if (!m) return { status: 404, body: { ok: false, error: "not_found" } };
     let body: unknown = undefined;
+    let rawBody: Buffer | undefined;
     try {
       if (method === "POST" || method === "PUT") {
         const raw = await readBody(req, m.def.maxBytes);
+        rawBody = raw;
         const boundary = multipartBoundary(req.headers["content-type"]);
         // multipart/form-data stays raw until the handler parses it (after auth).
         if (boundary) body = new MultipartBody(raw, boundary);
@@ -160,7 +166,7 @@ export class HttpServer {
       return { status, body: { ok: false, error: status === 413 ? "body_too_large" : "invalid_json" } };
     }
     try {
-      return await m.def.handler({ method, path: url.pathname, headers: req.headers, params: m.params, query: url.searchParams, body });
+      return await m.def.handler({ method, path: url.pathname, headers: req.headers, params: m.params, query: url.searchParams, body, rawBody });
     } catch (err) {
       this.log.error(`[http] handler error ${method} ${m.def.parts[0] ?? "/"} ${(err as Error).name}`);
       return { status: 500, body: { ok: false, error: "internal" } };

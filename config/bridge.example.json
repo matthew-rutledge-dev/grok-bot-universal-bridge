@@ -19,6 +19,7 @@
   "adapters": {
     "discord": { "enabled": true, "configPath": "./config/discord.json" },
     "grokbuild": { "enabled": true, "configPath": "./config/grokbuild.json" },
-    "tesla": { "enabled": false, "configPath": "./config/tesla.json" }
+    "tesla": { "enabled": false, "configPath": "./config/tesla.json" },
+    "twitch": { "enabled": false, "configPath": "./config/twitch.json" }
   }
 }

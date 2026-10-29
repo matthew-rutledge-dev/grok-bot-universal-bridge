@@ -41,3 +41,25 @@ test("a throwing handler and an unserialisable answer both give 500, not a crash
 test("listen refuses an empty bind address (regression)", async () => {
   await assert.rejects(new HttpServer(silentLogger).listen("", 0), /bind address required/);
 });
+
+test("handlers get the exact raw body; a text/plain string answer is written unquoted", async () => {
+  const http = new HttpServer(silentLogger);
+  let seen = "";
+  http.route("POST", "/echo", (req) => {
+    seen = req.rawBody?.toString("utf8") ?? "";
+    return { status: 200, body: "challenge-abc", headers: { "content-type": "text/plain" } };
+  });
+  http.route("POST", "/json", () => ({ status: 200, body: "still-json" }));
+  const port = await http.listen("127.0.0.1", 0);
+  try {
+    const raw = '{"b": 1,  "a":"x"}';
+    const r = await fetch(`http://127.0.0.1:${port}/echo`, { method: "POST", headers: { "content-type": "application/json" }, body: raw });
+    assert.equal(await r.text(), "challenge-abc");
+    assert.match(r.headers.get("content-type") ?? "", /^text\/plain/);
+    assert.equal(seen, raw, "byte-exact, not re-serialised");
+    const j = await fetch(`http://127.0.0.1:${port}/json`, { method: "POST", body: "{}" });
+    assert.equal(await j.text(), '"still-json"', "no content-type override keeps JSON encoding");
+  } finally {
+    await http.close();
+  }
+});
