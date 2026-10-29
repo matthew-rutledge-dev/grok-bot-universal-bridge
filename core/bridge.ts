@@ -27,7 +27,7 @@ export interface AdapterContext {
   check(event: InboundEvent): AuthzResult;
   audit(entry: Omit<AuditEntry, "adapter">): void;
   /** Register an HTTP route under /<adapter>/... */
-  route(method: "GET" | "POST", subpath: string, handler: Handler, opts?: { maxBytes?: number }): void;
+  route(method: "GET" | "POST" | "DELETE", subpath: string, handler: Handler, opts?: { maxBytes?: number }): void;
   /** Same, behind the adapter's callback token + rate limit (agent-facing routes such as voice). */
   authedRoute(
     method: "GET" | "POST",
