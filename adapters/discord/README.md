@@ -14,6 +14,7 @@ Status: **working** (Gateway in, callback out incl. multipart and DM-by-user, at
 * **Bots.** Messages from bots are ignored unless `ignoreBots` is `false`.
 * **Prompt.** The compact grammar of the existing bridge: `Discord #<channel> from <label>[ (N attachments)]: <text>` + `⟂ d:<slug>:<msgId> u=<user> c=<channel> [g=<guild>] [map=<agent>] [a=<url>]...`. `slug` comes from the route. An attachment-only message has no `: text` part.
 * **While held.** Posts ONE reply, "Bot is waking up, holding your message…", and later edits it to "Delivered. The bot is on it." or "❌ Couldn't reach the bot, please try again." It never posts once per retry.
+* **Wake on sleep (recommended).** Grok Bot computers sleep when idle, and a Discord message alone can't wake them. Set the core wake hook (`wake.urlRef` / `wake.keyRef` / `wake.header` in the bridge config, see [`config/bridge.example.json`](../../config/bridge.example.json) and [docs/DESIGN.md](../../docs/DESIGN.md), **Wake-on-sleep**) to a webhook-triggered routine on the agent's account, so the first held message of an outage wakes the computer. Without it, a message sent while the computer sleeps is held until `hold.maxSec` (default 1800 s) and then gets the ❌ reply. Skipping it is allowed but not recommended. Agent-side setup (one routine per Grok Bot account): the `discord-wake-on-sleep` skill in [grokbot-discord-fleet](https://github.com/matthew-rutledge-dev/grokbot-discord-fleet).
 
 ## Attachments
 
