@@ -478,7 +478,8 @@ test("cancel: DELETE frees the slot, spends the token, wakes readers; own direct
     const t0 = Date.now();
     const c = await s.b.call("DELETE", "/grokbuild/requests/direct-cx00001", undefined, client);
     assert.deepEqual([c.status, c.body.cancelled], [200, true]);
-    assert.equal((await pending).status, 404);
+    const woke = await pending;
+    assert.deepEqual([woke.status, woke.body.state, woke.body.tombstone], [200, "cancelled", true], "reader released with the final state");
     assert.ok(Date.now() - t0 < 3000, "reader released");
     assert.equal((await s.b.call("POST", "/grokbuild/reply", { requestId: "direct-cx00001", content: "late" }, { authorization: `Bearer ${t}` })).status, 401);
     assert.equal((await s.b.call("DELETE", "/grokbuild/requests/direct-cx00001", undefined, client)).status, 404);
@@ -555,5 +556,97 @@ test("reply lookup is by requestId: a token for one client's id never matches an
     assert.equal((await s.b.call("POST", "/grokbuild/reply", { requestId: "shared-id-0001", content: "x" }, { authorization: `Bearer ${a}` })).status, 401);
   } finally {
     await s.close();
+  }
+});
+
+test("tombstones: cancelled and expired direct requests answer their final state for tombstoneSec, then 404", async () => {
+  const s = await setup({ tombstoneSec: 2, replyTokenTtlSec: 1, replyTtlSec: 1 });
+  try {
+    await s.b.call("POST", "/grokbuild/expect", { requestId: "tomb-cancel01" }, client);
+    await s.b.call("POST", "/grokbuild/expect", { requestId: "tomb-expire01" }, client);
+    assert.equal((await s.b.call("DELETE", "/grokbuild/requests/tomb-cancel01", undefined, client)).status, 200);
+    const c = await s.b.call("GET", "/grokbuild/requests/tomb-cancel01?waitSec=5", undefined, client);
+    assert.deepEqual([c.status, c.body.state, c.body.tombstone, c.body.replies.length], [200, "cancelled", true, 0]);
+    // owner only: another client still gets 404
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/tomb-cancel01", undefined, { authorization: "Bearer other-token" })).status, 404);
+    // the token expires, the sweep drops the record and leaves "expired"
+    await new Promise((r) => setTimeout(r, 1200));
+    s.adapter.sweepNow();
+    const e = await s.b.call("GET", "/grokbuild/requests/tomb-expire01", undefined, client);
+    assert.deepEqual([e.status, e.body.state], [200, "expired"]);
+    // a new expect may reuse the id; it clears the tombstone
+    assert.equal((await s.b.call("POST", "/grokbuild/expect", { requestId: "tomb-cancel01" }, client)).status, 201);
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/tomb-cancel01", undefined, client)).body.state, "awaiting_reply");
+    // after tombstoneSec the final state is gone too
+    await new Promise((r) => setTimeout(r, 2100));
+    s.adapter.sweepNow();
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/tomb-expire01", undefined, client)).status, 404);
+  } finally {
+    await s.close();
+  }
+  const off = await setup({ tombstoneSec: 0 });
+  try {
+    await off.b.call("POST", "/grokbuild/expect", { requestId: "tomb-off00001" }, client);
+    await off.b.call("DELETE", "/grokbuild/requests/tomb-off00001", undefined, client);
+    assert.equal((await off.b.call("GET", "/grokbuild/requests/tomb-off00001", undefined, client)).status, 404);
+  } finally {
+    await off.close();
+  }
+  assert.match(validateGrokBuildConfig({ ...example, tombstoneSec: 86_401 }).join(), /tombstoneSec/);
+  assert.match(validateGrokBuildConfig({ ...example, readKeepSec: 0 }).join(), /readKeepSec/);
+  assert.match(validateGrokBuildConfig({ ...example, repliedKeepSec: 86_401 }).join(), /repliedKeepSec/);
+});
+
+test("replied direct requests are dropped soon after the reply is read (or after repliedKeepSec), not at token expiry", async () => {
+  const s = await setup({ readKeepSec: 1, repliedKeepSec: 3 });
+  try {
+    const t1 = (await s.b.call("POST", "/grokbuild/expect", { requestId: "kept-read0001" }, client)).body.replyToken as string;
+    const t2 = (await s.b.call("POST", "/grokbuild/expect", { requestId: "kept-unread01" }, client)).body.replyToken as string;
+    for (const [id, t] of [["kept-read0001", t1], ["kept-unread01", t2]]) {
+      assert.equal((await s.b.call("POST", "/grokbuild/reply", { requestId: id, content: "done" }, { authorization: `Bearer ${t}` })).status, 200);
+    }
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/kept-read0001", undefined, client)).body.state, "replied");
+    await new Promise((r) => setTimeout(r, 1200));
+    s.adapter.sweepNow();
+    // read once, then readKeepSec passed: gone (no tombstone for replied requests)
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/kept-read0001", undefined, client)).status, 404);
+    // never read: kept until repliedKeepSec after the reply
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/kept-unread01", undefined, client)).body.state, "replied");
+    await new Promise((r) => setTimeout(r, 2000));
+    s.adapter.sweepNow();
+    assert.equal((await s.b.call("GET", "/grokbuild/requests/kept-unread01", undefined, client)).status, 404);
+  } finally {
+    await s.close();
+  }
+});
+
+test("request-file writes: durable changes at once (hard-kill safe), housekeeping debounced; stop flushes; tombstones persist", async () => {
+  const dir = tmp("ub-gb-debounce-");
+  const holdFile = join(dir, "hold.json");
+  const s = await setup({ readKeepSec: 1 }, [], {}, holdFile);
+  const tokens: string[] = [];
+  for (let i = 0; i < 3; i++) tokens.push((await s.b.call("POST", "/grokbuild/expect", { requestId: `burst-${String(i).padStart(6, "0")}` }, client)).body.replyToken);
+  assert.equal(s.adapter.writes, 3, "each new record is on disk at once");
+  await s.b.call("DELETE", "/grokbuild/requests/burst-000000", undefined, client);
+  assert.equal(s.adapter.writes, 4, "a cancel is on disk at once");
+  await s.b.call("POST", "/grokbuild/reply", { requestId: "burst-000001", content: "ok" }, { authorization: `Bearer ${tokens[1]}` });
+  assert.equal(s.adapter.writes, 5, "a stored reply is on disk at once");
+  // housekeeping: read marks and sweeps coalesce
+  for (let i = 0; i < 5; i++) await s.b.call("GET", "/grokbuild/requests/burst-000001", undefined, client);
+  await new Promise((r) => setTimeout(r, 1100));
+  s.adapter.sweepNow();
+  assert.ok(s.adapter.writes <= 6, `read mark + sweep coalesced (${s.adapter.writes})`);
+  await s.close();
+  const final = s.adapter.writes;
+  assert.ok(final <= 7, `stop flushed at most one pending write (${final})`);
+  const saved = JSON.parse(readFileSync(join(dir, "grokbuild-requests.json"), "utf8"));
+  assert.deepEqual(Object.keys(saved.requests).sort(), ["example-client:burst-000002"]);
+  assert.equal(saved.tombstones["example-client:burst-000000"].state, "cancelled");
+  // a restart keeps answering the tombstone
+  const again = await setup({}, [], {}, holdFile);
+  try {
+    assert.equal((await again.b.call("GET", "/grokbuild/requests/burst-000000", undefined, client)).body.state, "cancelled");
+  } finally {
+    await again.close();
   }
 });
