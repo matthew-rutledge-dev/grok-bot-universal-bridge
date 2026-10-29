@@ -35,7 +35,7 @@ Lifetimes (0.2.3+):
 - **Cancelled** (`DELETE`): dropped at once, with a `cancelled` tombstone.
 - **Tombstones** last `tombstoneSec` (default 3600, max 86400, `0` = off). They are owner-only and survive a restart. A new `/expect` with the same id clears it.
 
-The request file (`grokbuild-requests.json`, mode 600) is rewritten atomically, debounced to at most one write per second, and flushed on stop. A crash can lose the last second of changes; the worst case is a reply token that stops working, or a reply that has to be sent again.
+The request file (`grokbuild-requests.json`, mode 600) is rewritten atomically. Changes a late reply depends on are written at once, so a hard kill loses none of them: a new request, a stored reply, a spent token, a cancel. Housekeeping is debounced to at most one write per second and flushed on stop: sweeps, read marks, tombstone expiry. A crash can lose only that housekeeping, which the next sweep redoes.
 
 **Clients: DELETE when you stop waiting for good** (the user gave up, or the session ends), so the slot and the token go at once instead of at `replyTokenTtlSec`. The grokbuild-grokbots plugin cancels when its webhook send fails. When the host aborts a wait, it stops polling at once but keeps the route, because the same request can be resumed with another wait.
 

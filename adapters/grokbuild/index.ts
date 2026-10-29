@@ -123,7 +123,7 @@ const MAX_LONG_POLLS_CAP = 1000;
 const DEFAULT_TOKEN_TTL_SEC = 21_600;
 const MAX_TOKEN_TTL_SEC = 86_400;
 const MAX_TOMBSTONES = 10_000;
-/** Request-file writes are coalesced: at most one per SAVE_DEBOUNCE_MS (flushed on stop). */
+/** Housekeeping writes (sweep, read marks) are coalesced: at most one per SAVE_DEBOUNCE_MS (flushed on stop). */
 const SAVE_DEBOUNCE_MS = 1000;
 
 export function hashReplyToken(token: string): string {
@@ -237,9 +237,15 @@ export class GrokBuildAdapter implements SourceAdapter {
     }
   }
 
-  /** Debounced: many changes within SAVE_DEBOUNCE_MS become one atomic rewrite. */
-  private saveRequests(): void {
-    if (!this.file || this.saveTimer) return;
+  /**
+   * Changes a late reply depends on (new record, reply stored, token spent, cancel) are written at
+   * once, so a hard kill loses none of them. Housekeeping (sweep, read marks, tombstone expiry) is
+   * debounced: many such changes within SAVE_DEBOUNCE_MS become one atomic rewrite.
+   */
+  private saveRequests(urgent = true): void {
+    if (!this.file) return;
+    if (urgent) return this.flushSave();
+    if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => this.flushSave(), SAVE_DEBOUNCE_MS);
     this.saveTimer.unref?.();
   }
@@ -314,7 +320,7 @@ export class GrokBuildAdapter implements SourceAdapter {
       n += Number(this.dropRecord(id));
     }
     for (const [k, t] of this.tombstones) if (t.until <= now) n += Number(this.tombstones.delete(k));
-    if (n) this.saveRequests();
+    if (n) this.saveRequests(false);
     for (const k of this.replyAttempts.keys()) if (!this.requests.has(k)) this.replyAttempts.delete(k);
   }
 
@@ -733,7 +739,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     this.ctx.audit({ action: "reply_read", outcome: "ok", eventId: id, actor: a.client });
     if (rec.direct && rec.replies.length && !rec.readAt) {
       rec.readAt = Date.now();
-      this.saveRequests();
+      this.saveRequests(false);
     }
     // Event states are memory-only: after a restart a request that already has replies was delivered.
     const state = rec.direct

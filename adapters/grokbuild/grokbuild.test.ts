@@ -620,19 +620,27 @@ test("replied direct requests are dropped soon after the reply is read (or after
   }
 });
 
-test("request-file writes are debounced: a burst of changes is one write; stop flushes; tombstones persist", async () => {
+test("request-file writes: durable changes at once (hard-kill safe), housekeeping debounced; stop flushes; tombstones persist", async () => {
   const dir = tmp("ub-gb-debounce-");
   const holdFile = join(dir, "hold.json");
-  const s = await setup({}, [], {}, holdFile);
-  for (let i = 0; i < 10; i++) await s.b.call("POST", "/grokbuild/expect", { requestId: `burst-${String(i).padStart(6, "0")}` }, client);
+  const s = await setup({ readKeepSec: 1 }, [], {}, holdFile);
+  const tokens: string[] = [];
+  for (let i = 0; i < 3; i++) tokens.push((await s.b.call("POST", "/grokbuild/expect", { requestId: `burst-${String(i).padStart(6, "0")}` }, client)).body.replyToken);
+  assert.equal(s.adapter.writes, 3, "each new record is on disk at once");
   await s.b.call("DELETE", "/grokbuild/requests/burst-000000", undefined, client);
-  assert.equal(s.adapter.writes, 0, "nothing written yet inside the debounce window");
-  await until(() => s.adapter.writes === 1, 3000);
-  await s.b.call("POST", "/grokbuild/expect", { requestId: "burst-late0001" }, client);
+  assert.equal(s.adapter.writes, 4, "a cancel is on disk at once");
+  await s.b.call("POST", "/grokbuild/reply", { requestId: "burst-000001", content: "ok" }, { authorization: `Bearer ${tokens[1]}` });
+  assert.equal(s.adapter.writes, 5, "a stored reply is on disk at once");
+  // housekeeping: read marks and sweeps coalesce
+  for (let i = 0; i < 5; i++) await s.b.call("GET", "/grokbuild/requests/burst-000001", undefined, client);
+  await new Promise((r) => setTimeout(r, 1100));
+  s.adapter.sweepNow();
+  assert.ok(s.adapter.writes <= 6, `read mark + sweep coalesced (${s.adapter.writes})`);
   await s.close();
-  assert.equal(s.adapter.writes, 2, "stop flushed the pending change");
+  const final = s.adapter.writes;
+  assert.ok(final <= 7, `stop flushed at most one pending write (${final})`);
   const saved = JSON.parse(readFileSync(join(dir, "grokbuild-requests.json"), "utf8"));
-  assert.equal(Object.keys(saved.requests).length, 10);
+  assert.deepEqual(Object.keys(saved.requests).sort(), ["example-client:burst-000002"]);
   assert.equal(saved.tombstones["example-client:burst-000000"].state, "cancelled");
   // a restart keeps answering the tombstone
   const again = await setup({}, [], {}, holdFile);
