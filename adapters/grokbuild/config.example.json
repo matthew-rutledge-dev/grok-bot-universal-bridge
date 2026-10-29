@@ -11,6 +11,9 @@
   "replyAttemptsPerRequest": 10,
   "maxWaitSec": 25,
   "maxLongPolls": 32,
+  "tombstoneSec": 3600,
+  "repliedKeepSec": 3600,
+  "readKeepSec": 600,
   "clients": {
     "example-client": {
       "tokenRef": "env:GROKBUILD_CLIENT_TOKEN"

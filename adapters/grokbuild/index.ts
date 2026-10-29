@@ -76,6 +76,12 @@ export interface GrokBuildConfig {
   maxWaitSec?: number;
   /** Long-poll reads held open at once, all clients together (default 32; 0 = no long-poll). Past it, reads answer at once with busy: true. */
   maxLongPolls?: number;
+  /** How long a cancelled or expired direct request still answers reads with its final state instead of 404 (default 3600; max 86400; 0 = off). */
+  tombstoneSec?: number;
+  /** A replied direct request is dropped this long after its first reply (default 3600; at least 1). */
+  repliedKeepSec?: number;
+  /** ...or this long after the first read that returned the reply, whichever comes first (default 600; at least 1). */
+  readKeepSec?: number;
 }
 
 interface RequestRecord {
@@ -90,6 +96,18 @@ interface RequestRecord {
   /** SHA-256 (hex) of the one-time reply token; removed once a reply is stored. */
   replyTokenHash?: string;
   replyExpiresAt?: number;
+  /** First reply stored (ms). Older files: derived from replies[0].at. */
+  firstReplyAt?: number;
+  /** First read that returned a reply (ms). */
+  readAt?: number;
+}
+
+/** A dropped direct request's final state, kept briefly so readers get it instead of a 404. */
+interface Tombstone {
+  client: string;
+  requestId: string;
+  state: "expired" | "cancelled";
+  until: number;
 }
 
 type Auth = { ok: true; client: string } | { ok: false; res: HttpResponse };
@@ -104,6 +122,9 @@ const MAX_WAIT_CAP_SEC = 60;
 const MAX_LONG_POLLS_CAP = 1000;
 const DEFAULT_TOKEN_TTL_SEC = 21_600;
 const MAX_TOKEN_TTL_SEC = 86_400;
+const MAX_TOMBSTONES = 10_000;
+/** Request-file writes are coalesced: at most one per SAVE_DEBOUNCE_MS (flushed on stop). */
+const SAVE_DEBOUNCE_MS = 1000;
 
 export function hashReplyToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -129,13 +150,18 @@ export function validateGrokBuildConfig(raw: unknown): string[] {
   if (c.callbackTokenRef !== undefined && !isSecretRef(c.callbackTokenRef)) {
     p.push("grokbuild.callbackTokenRef must be env:NAME or file:/absolute/path (literal tokens are refused)");
   }
-  for (const k of ["maxPromptChars", "replyTtlSec", "promptsPerMin", "readsPerMin", "maxOpenRequests", "replyPostsPerMin", "replyAuthFailsPerMin", "replyAttemptsPerRequest", "maxWaitSec", "maxLongPolls"] as const) {
+  for (const k of ["maxPromptChars", "replyTtlSec", "promptsPerMin", "readsPerMin", "maxOpenRequests", "replyPostsPerMin", "replyAuthFailsPerMin", "replyAttemptsPerRequest", "maxWaitSec", "maxLongPolls", "tombstoneSec"] as const) {
     if (!isLimit(c[k])) p.push(`grokbuild.${k} must be a whole number >= 0`);
   }
   if (c.replyTokenTtlSec !== undefined && !(Number.isInteger(c.replyTokenTtlSec) && c.replyTokenTtlSec >= 1)) {
     p.push("grokbuild.replyTokenTtlSec must be a whole number >= 1");
   }
   if (typeof c.replyTokenTtlSec === "number" && c.replyTokenTtlSec > MAX_TOKEN_TTL_SEC) p.push(`grokbuild.replyTokenTtlSec must be at most ${MAX_TOKEN_TTL_SEC} (24 h)`);
+  if (typeof c.tombstoneSec === "number" && c.tombstoneSec > MAX_TOKEN_TTL_SEC) p.push(`grokbuild.tombstoneSec must be at most ${MAX_TOKEN_TTL_SEC}`);
+  for (const k of ["repliedKeepSec", "readKeepSec"] as const) {
+    const v = c[k];
+    if (v !== undefined && !(Number.isInteger(v) && v >= 1 && v <= MAX_TOKEN_TTL_SEC)) p.push(`grokbuild.${k} must be a whole number from 1 to ${MAX_TOKEN_TTL_SEC}`);
+  }
   if (typeof c.maxLongPolls === "number" && c.maxLongPolls > MAX_LONG_POLLS_CAP) p.push(`grokbuild.maxLongPolls must be at most ${MAX_LONG_POLLS_CAP}`);
   if (typeof c.maxWaitSec === "number" && c.maxWaitSec > MAX_WAIT_CAP_SEC) p.push(`grokbuild.maxWaitSec must be at most ${MAX_WAIT_CAP_SEC}`);
   const clients = c.clients && typeof c.clients === "object" ? c.clients : {};
@@ -187,6 +213,10 @@ export class GrokBuildAdapter implements SourceAdapter {
   /** Long-poll readers waiting for a request's first reply, by request key. */
   private readonly waiters = new Map<string, Set<() => void>>();
   private longPolls = 0;
+  private readonly tombstones = new Map<string, Tombstone>();
+  private saveTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Number of request-file writes (for tests and the debounce check). */
+  writes = 0;
   private stopping = false;
   private authFails = { window: 0, audited: 0, suppressed: 0 };
 
@@ -194,7 +224,8 @@ export class GrokBuildAdapter implements SourceAdapter {
   private loadRequests(): void {
     if (!this.file) return;
     try {
-      const raw = JSON.parse(readFileSync(this.file, "utf8")) as { requests?: Record<string, RequestRecord> };
+      const raw = JSON.parse(readFileSync(this.file, "utf8")) as { requests?: Record<string, RequestRecord>; tombstones?: Record<string, Tombstone> };
+      for (const [k, t] of Object.entries(raw.tombstones ?? {})) if (t && t.until > Date.now()) this.tombstones.set(k, t);
       for (const [id, r] of Object.entries(raw.requests ?? {})) {
         if (!r || this.expiresAt(r) < Date.now()) continue;
         // Older files were keyed by requestId alone.
@@ -206,12 +237,26 @@ export class GrokBuildAdapter implements SourceAdapter {
     }
   }
 
+  /** Debounced: many changes within SAVE_DEBOUNCE_MS become one atomic rewrite. */
   private saveRequests(): void {
+    if (!this.file || this.saveTimer) return;
+    this.saveTimer = setTimeout(() => this.flushSave(), SAVE_DEBOUNCE_MS);
+    this.saveTimer.unref?.();
+  }
+
+  flushSave(): void {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
     if (!this.file) return;
     try {
       mkdirSync(dirname(this.file), { recursive: true });
       const tmp = `${this.file}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ version: 1, requests: Object.fromEntries(this.requests) }), { mode: 0o600 });
+      writeFileSync(
+        tmp,
+        JSON.stringify({ version: 1, requests: Object.fromEntries(this.requests), tombstones: Object.fromEntries(this.tombstones) }),
+        { mode: 0o600 },
+      );
+      this.writes += 1;
       renameSync(tmp, this.file);
     } catch {
       this.ctx.log.warn("[grokbuild] request file write failed (memory only)");
@@ -241,7 +286,36 @@ export class GrokBuildAdapter implements SourceAdapter {
 
   /** When a record is dropped: replyTtlSec after creation, or later while a direct-reply token is still valid. */
   private expiresAt(r: RequestRecord): number {
+    if (r.direct && r.replies.length) {
+      // Replied: keep it briefly for the reader, not for the whole token lifetime.
+      const first = r.firstReplyAt ?? (Date.parse(r.replies[0].at) || r.createdAt);
+      const byReply = first + (this.cfg.repliedKeepSec ?? 3600) * 1000;
+      const byRead = r.readAt ? r.readAt + (this.cfg.readKeepSec ?? 600) * 1000 : Infinity;
+      return Math.min(byReply, byRead);
+    }
     return Math.max(r.createdAt + this.ttlMs(), r.direct ? (r.replyExpiresAt ?? 0) : 0);
+  }
+
+  /** Leave a short-lived final state for a dropped direct request (no-op when tombstoneSec is 0). */
+  private bury(key: string, rec: RequestRecord, state: Tombstone["state"]): void {
+    const sec = this.cfg.tombstoneSec ?? 3600;
+    if (!(sec > 0) || !rec.direct) return;
+    this.tombstones.delete(key);
+    this.tombstones.set(key, { client: rec.client, requestId: rec.requestId ?? key.slice(key.indexOf(":") + 1), state, until: Date.now() + sec * 1000 });
+    while (this.tombstones.size > MAX_TOMBSTONES) this.tombstones.delete(this.tombstones.keys().next().value as string);
+  }
+
+  /** One sweep: drop expired records (unreplied direct ones leave an "expired" tombstone) and old tombstones. */
+  sweepNow(now = Date.now()): void {
+    let n = 0;
+    for (const [id, r] of this.requests) {
+      if (this.expiresAt(r) >= now) continue;
+      if (r.direct && r.replies.length === 0) this.bury(id, r, "expired");
+      n += Number(this.dropRecord(id));
+    }
+    for (const [k, t] of this.tombstones) if (t.until <= now) n += Number(this.tombstones.delete(k));
+    if (n) this.saveRequests();
+    for (const k of this.replyAttempts.keys()) if (!this.requests.has(k)) this.replyAttempts.delete(k);
   }
 
   private putRecord(key: string, rec: RequestRecord): void {
@@ -375,11 +449,7 @@ export class GrokBuildAdapter implements SourceAdapter {
 
   async start(): Promise<void> {
     this.sweep = setInterval(() => {
-      const now = Date.now();
-      let n = 0;
-      for (const [id, r] of this.requests) if (this.expiresAt(r) < now) n += Number(this.dropRecord(id));
-      if (n) this.saveRequests();
-      for (const k of this.replyAttempts.keys()) if (!this.requests.has(k)) this.replyAttempts.delete(k);
+      this.sweepNow();
       this.flushAuthFails();
     }, 60_000);
     this.sweep.unref?.();
@@ -392,6 +462,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (this.sweep) clearInterval(this.sweep);
     this.stopping = true;
     for (const key of [...this.waiters.keys()]) this.notify(key);
+    if (this.saveTimer) this.flushSave();
     this.flushAuthFails();
   }
 
@@ -556,6 +627,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     const token = randomBytes(32).toString("base64url");
     const now = Date.now();
     const expires = now + this.tokenTtlMs();
+    this.tombstones.delete(key);
     this.putRecord(key, { client, requestId, bot, createdAt: now, replies: [], direct: true, replyTokenHash: hashReplyToken(token), replyExpiresAt: expires });
     this.saveRequests();
     this.ctx.audit({ action: "ingest", outcome: "ok", reason: "reply_route_issued", eventId: requestId, actor: client });
@@ -618,6 +690,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (!content) return { status: 400, body: { ok: false, error: "content required" } };
     if (content.length > MAX_REPLY_CHARS) return { status: 413, body: { ok: false, error: "content too long" } };
     rec.replies.push({ content, at: new Date().toISOString() });
+    rec.firstReplyAt ??= Date.now();
     // One reply per token: spend it.
     delete rec.replyTokenHash;
     this.replyAttempts.delete(key);
@@ -634,7 +707,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     const key = requestKey(a.client, id);
     // Only the caller's own records are looked up, so another client's ids cannot be probed.
     let rec = this.requests.get(key);
-    if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+    if (!rec) return this.tombstoneRead(key, a.client);
     let busy = false;
     const rawWait = req.query.get("waitSec");
     if (rawWait !== null) {
@@ -653,11 +726,15 @@ export class GrokBuildAdapter implements SourceAdapter {
             this.longPolls -= 1;
           }
           rec = this.requests.get(key);
-          if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+          if (!rec) return this.tombstoneRead(key, a.client);
         }
       }
     }
     this.ctx.audit({ action: "reply_read", outcome: "ok", eventId: id, actor: a.client });
+    if (rec.direct && rec.replies.length && !rec.readAt) {
+      rec.readAt = Date.now();
+      this.saveRequests();
+    }
     // Event states are memory-only: after a restart a request that already has replies was delivered.
     const state = rec.direct
       ? rec.replies.length
@@ -682,6 +759,14 @@ export class GrokBuildAdapter implements SourceAdapter {
     };
   }
 
+  /** A dropped direct request's final state (200), or 404 when there is none. */
+  private tombstoneRead(key: string, client: string): HttpResponse {
+    const t = this.tombstones.get(key);
+    if (!t || t.until <= Date.now()) return { status: 404, body: { ok: false, error: "not_found" } };
+    this.ctx.audit({ action: "reply_read", outcome: "ok", reason: `tombstone_${t.state}`, eventId: t.requestId, actor: client });
+    return { status: 200, body: { ok: true, requestId: t.requestId, state: t.state, replies: [], tombstone: true, until: new Date(t.until).toISOString() } };
+  }
+
   /** Cancel an open direct request: drops the record (frees its open-request slot), so its token no longer works. */
   private onCancel(req: HttpRequest): HttpResponse {
     const a = this.auth(req, "reply_read");
@@ -691,6 +776,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     const rec = this.requests.get(key);
     if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
     if (!rec.direct) return { status: 409, body: { ok: false, error: "only direct requests can be cancelled" } };
+    this.bury(key, rec, "cancelled");
     this.dropRecord(key);
     this.replyAttempts.delete(key);
     this.saveRequests();
@@ -734,6 +820,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (content.length > MAX_REPLY_CHARS) return { status: 413, body: { ok: false, error: "content too long" } };
     if (rec.replies.length >= MAX_REPLIES) return { status: 429, body: { ok: false, error: "too many replies" } };
     rec.replies.push({ content, at: new Date().toISOString() });
+    rec.firstReplyAt ??= Date.now();
     this.saveRequests();
     this.notify(requestKey(rec.client, rec.requestId ?? id));
     this.ctx.audit({ action: "callback", outcome: "ok", reason: "reply_stored", eventId: id, actor: rec.client, count: rec.replies.length });
