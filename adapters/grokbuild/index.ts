@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { validateRoutes } from "../../core/allowlist.js";
@@ -20,6 +20,14 @@ import type { Route } from "../../core/types.js";
  *   GET  /grokbuild/requests/:requestId  client token   -> { state, replies[] }
  *   GET  /grokbuild/status               client token   -> { client, readOnly, replyChannel }  (no write)
  *   POST /grokbuild/callback             callback token { requestId, client?, content }   (the agent's reply)
+ *
+ * Direct replies (the client delivers the prompt itself, e.g. to a webhook routine):
+ *   POST /grokbuild/expect               client token   { requestId, bot? } -> { replyUrl, replyToken, expiresAt }
+ *   POST /grokbuild/reply                reply token    { requestId, content }   (one reply, then the token is spent)
+ *   GET  /grokbuild/requests/:id?waitSec=N  long-polls up to maxWaitSec for the first reply
+ * The reply token is random, bound to one client + requestId, stored only as a
+ * SHA-256 hash, valid for replyTokenTtlSec and accepted once. It is never a
+ * client or callback token, so the woken bot needs no stored secret.
  *
  * Client routes: header-only bearer (?token= refused), 503 while no client
  * token resolves, 401 for a wrong token, a per-client rate limit, then the
@@ -53,6 +61,12 @@ export interface GrokBuildConfig {
   readsPerMin?: number;
   /** Open requests per client (default 200; 0 = no cap). A request stops counting once it has a reply or its delivery failed, or at replyTtlSec. */
   maxOpenRequests?: number;
+  /** Lifetime of a direct-reply token from POST /grokbuild/expect (default 900; at most replyTtlSec). */
+  replyTokenTtlSec?: number;
+  /** POST /grokbuild/reply attempts per minute, all callers together (default 90; 0 = no limit). */
+  replyPostsPerMin?: number;
+  /** Longest long-poll on GET /grokbuild/requests/:id?waitSec= (default 25; 0 = no long-poll). */
+  maxWaitSec?: number;
 }
 
 interface RequestRecord {
@@ -62,6 +76,11 @@ interface RequestRecord {
   bot: string;
   createdAt: number;
   replies: { content: string; at: string }[];
+  /** Set for direct-reply requests (POST /grokbuild/expect): the bridge did not deliver the prompt. */
+  direct?: boolean;
+  /** SHA-256 (hex) of the one-time reply token; removed once a reply is stored. */
+  replyTokenHash?: string;
+  replyExpiresAt?: number;
 }
 
 type Auth = { ok: true; client: string } | { ok: false; res: HttpResponse };
@@ -72,6 +91,11 @@ const BOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MAX_REPLIES = 20;
 const MAX_REPLY_CHARS = 8000;
 const AUTH_FAIL_AUDITS_PER_MIN = 20;
+const MAX_WAIT_CAP_SEC = 60;
+
+export function hashReplyToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
 
 /** Records are keyed per client, so two clients can use the same requestId. ":" is in neither id alphabet. */
 export function requestKey(client: string, requestId: string): string {
@@ -93,9 +117,13 @@ export function validateGrokBuildConfig(raw: unknown): string[] {
   if (c.callbackTokenRef !== undefined && !isSecretRef(c.callbackTokenRef)) {
     p.push("grokbuild.callbackTokenRef must be env:NAME or file:/absolute/path (literal tokens are refused)");
   }
-  for (const k of ["maxPromptChars", "replyTtlSec", "promptsPerMin", "readsPerMin", "maxOpenRequests"] as const) {
+  for (const k of ["maxPromptChars", "replyTtlSec", "promptsPerMin", "readsPerMin", "maxOpenRequests", "replyPostsPerMin", "maxWaitSec"] as const) {
     if (!isLimit(c[k])) p.push(`grokbuild.${k} must be a whole number >= 0`);
   }
+  if (c.replyTokenTtlSec !== undefined && !(Number.isInteger(c.replyTokenTtlSec) && c.replyTokenTtlSec >= 1)) {
+    p.push("grokbuild.replyTokenTtlSec must be a whole number >= 1");
+  }
+  if (typeof c.maxWaitSec === "number" && c.maxWaitSec > MAX_WAIT_CAP_SEC) p.push(`grokbuild.maxWaitSec must be at most ${MAX_WAIT_CAP_SEC}`);
   const clients = c.clients && typeof c.clients === "object" ? c.clients : {};
   for (const [id, cl] of Object.entries(clients)) {
     if (!CLIENT_ID.test(id)) p.push(`grokbuild.clients.${id}: id must be lowercase [a-z0-9._-]`);
@@ -136,6 +164,10 @@ export class GrokBuildAdapter implements SourceAdapter {
   private file = "";
   private readonly promptLimiters = new Map<string, SlidingWindowRateLimiter>();
   private readonly readLimiter: SlidingWindowRateLimiter;
+  private readonly replyLimiter: SlidingWindowRateLimiter;
+  /** Long-poll readers waiting for a request's first reply, by request key. */
+  private readonly waiters = new Map<string, Set<() => void>>();
+  private stopping = false;
   private authFails = { window: 0, audited: 0, suppressed: 0 };
 
   /** Request records survive a restart so late replies still land (mode 600, atomic rename). */
@@ -176,6 +208,40 @@ export class GrokBuildAdapter implements SourceAdapter {
       this.promptLimiters.set(id, new SlidingWindowRateLimiter(cl.promptsPerMin ?? cfg.promptsPerMin ?? 20));
     }
     this.readLimiter = new SlidingWindowRateLimiter(cfg.readsPerMin ?? 240);
+    this.replyLimiter = new SlidingWindowRateLimiter(cfg.replyPostsPerMin ?? 90);
+  }
+
+  /** Where a woken bot posts a direct reply ("" while http.publicBaseUrl is unset). */
+  directReplyUrl(): string {
+    return this.ctx.callbackUrl ? this.ctx.callbackUrl.replace(/\/callback$/, "/reply") : "";
+  }
+
+  private tokenTtlMs(): number {
+    return Math.min(this.cfg.replyTokenTtlSec ?? 900, this.cfg.replyTtlSec ?? 3600) * 1000;
+  }
+
+  /** Wake long-poll readers of this request (a reply landed, or the bridge is stopping). */
+  private notify(key: string): void {
+    const set = this.waiters.get(key);
+    if (!set) return;
+    this.waiters.delete(key);
+    for (const fn of set) fn();
+  }
+
+  private waitForReply(key: string, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      let set = this.waiters.get(key);
+      if (!set) this.waiters.set(key, (set = new Set()));
+      const done = () => {
+        clearTimeout(timer);
+        set!.delete(done);
+        if (set!.size === 0 && this.waiters.get(key) === set) this.waiters.delete(key);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      timer.unref?.();
+      set.add(done);
+    });
   }
 
   private ttlMs(): number {
@@ -226,8 +292,9 @@ export class GrokBuildAdapter implements SourceAdapter {
     }
   }
 
-  /** Still counts against maxOpenRequests: no reply yet and delivery not failed. */
+  /** Still counts against maxOpenRequests: no reply yet and delivery not failed (direct: reply token not expired). */
   private isOpen(key: string, r: RequestRecord): boolean {
+    if (r.direct) return r.replies.length === 0 && Date.now() <= (r.replyExpiresAt ?? 0);
     return r.replies.length === 0 && this.ctx.state(key) !== "failed";
   }
 
@@ -249,6 +316,8 @@ export class GrokBuildAdapter implements SourceAdapter {
     ctx.route("POST", "prompt", (req) => this.onPrompt(req), { maxBytes: 64 * 1024 });
     ctx.route("GET", "requests/:requestId", (req) => this.onRead(req));
     ctx.route("GET", "status", (req) => this.onClientStatus(req));
+    ctx.route("POST", "expect", (req) => this.onExpect(req), { maxBytes: 4 * 1024 });
+    ctx.route("POST", "reply", (req) => this.onDirectReply(req), { maxBytes: 64 * 1024 });
   }
 
   async start(): Promise<void> {
@@ -267,6 +336,8 @@ export class GrokBuildAdapter implements SourceAdapter {
 
   async stop(): Promise<void> {
     if (this.sweep) clearInterval(this.sweep);
+    this.stopping = true;
+    for (const key of [...this.waiters.keys()]) this.notify(key);
     this.flushAuthFails();
   }
 
@@ -304,7 +375,7 @@ export class GrokBuildAdapter implements SourceAdapter {
   }
 
   /** 401 audit lines are capped per minute; the rest are summed into one line. */
-  private auditAuthFail(action: "ingest" | "reply_read"): void {
+  private auditAuthFail(action: "ingest" | "reply_read" | "callback"): void {
     const now = Date.now();
     if (now - this.authFails.window >= 60_000) this.flushAuthFails(now);
     if (this.authFails.audited < AUTH_FAIL_AUDITS_PER_MIN) {
@@ -365,21 +436,8 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (!REQUEST_ID.test(requestId)) return this.refuse(client, 400, "requestId must be 8-64 of [A-Za-z0-9_-]");
     const key = requestKey(client, requestId);
     if (this.requests.has(key)) return this.refuse(client, 409, "duplicate requestId", requestId);
-    const cap = this.cfg.maxOpenRequests ?? 200;
-    if (cap > 0) {
-      let open = 0;
-      let oldest = Infinity;
-      for (const [k, r] of this.requests) {
-        if (r.client !== client || !this.isOpen(k, r)) continue;
-        open += 1;
-        oldest = Math.min(oldest, r.createdAt);
-      }
-      if (open >= cap) {
-        // The oldest open request stops counting at the latest when it expires.
-        const retry = Math.max(1, Math.ceil((oldest + this.ttlMs() - Date.now()) / 1000));
-        return this.refuse(client, 429, "too_many_open_requests", undefined, { "retry-after": String(retry) });
-      }
-    }
+    const capped = this.openCap(client);
+    if (capped) return capped;
     const replyHint = typeof b.replyHint === "string" ? b.replyHint : undefined;
     // Record first so a fast reply can never arrive before the request is known.
     this.requests.set(key, { client, requestId, bot, createdAt: Date.now(), replies: [] });
@@ -403,17 +461,131 @@ export class GrokBuildAdapter implements SourceAdapter {
     return { status: 202, body: { ok: true, requestId, state: res.state } };
   }
 
-  private onRead(req: HttpRequest): HttpResponse {
+  /** 429 when the client already has maxOpenRequests open requests, else undefined. */
+  private openCap(client: string): HttpResponse | undefined {
+    const cap = this.cfg.maxOpenRequests ?? 200;
+    if (cap <= 0) return undefined;
+    let open = 0;
+    let oldest = Infinity;
+    for (const [k, r] of this.requests) {
+      if (r.client !== client || !this.isOpen(k, r)) continue;
+      open += 1;
+      oldest = Math.min(oldest, r.createdAt);
+    }
+    if (open < cap) return undefined;
+    // The oldest open request stops counting at the latest when it expires.
+    const retry = Math.max(1, Math.ceil((oldest + this.ttlMs() - Date.now()) / 1000));
+    return this.refuse(client, 429, "too_many_open_requests", undefined, { "retry-after": String(retry) });
+  }
+
+  /**
+   * Direct-reply route for a prompt the client delivers itself. Same client auth,
+   * prompt rate limit, read-only switch and open-request cap as /prompt. Returns a
+   * one-time reply token bound to this client + requestId (only its hash is kept).
+   */
+  private onExpect(req: HttpRequest): HttpResponse {
+    const a = this.auth(req, "ingest");
+    if (!a.ok) return a.res;
+    const client = a.client;
+    if (this.isReadOnly()) return this.refuse(client, 403, "read_only");
+    const replyUrl = this.directReplyUrl();
+    if (!replyUrl) return this.refuse(client, 503, "reply_channel_unset");
+    const b = (req.body ?? {}) as { requestId?: unknown; bot?: unknown };
+    const requestId = typeof b.requestId === "string" ? b.requestId : "";
+    if (!REQUEST_ID.test(requestId)) return this.refuse(client, 400, "requestId must be 8-64 of [A-Za-z0-9_-]");
+    const bot = typeof b.bot === "string" && b.bot.trim() ? b.bot.trim() : "direct";
+    if (!BOT_ALIAS.test(bot)) return this.refuse(client, 400, "bot must be a lowercase alias");
+    const key = requestKey(client, requestId);
+    if (this.requests.has(key)) return this.refuse(client, 409, "duplicate requestId", requestId);
+    const capped = this.openCap(client);
+    if (capped) return capped;
+    const token = randomBytes(32).toString("base64url");
+    const now = Date.now();
+    const expires = now + this.tokenTtlMs();
+    this.requests.set(key, { client, requestId, bot, createdAt: now, replies: [], direct: true, replyTokenHash: hashReplyToken(token), replyExpiresAt: expires });
+    this.saveRequests();
+    this.ctx.audit({ action: "ingest", outcome: "ok", reason: "reply_route_issued", eventId: requestId, actor: client });
+    return { status: 201, body: { ok: true, requestId, replyUrl, replyToken: token, expiresAt: new Date(expires).toISOString() } };
+  }
+
+  /**
+   * A woken bot's direct reply. Auth is the one-time reply token (header only), which
+   * must match the record of this requestId; a missing, wrong, expired or spent token
+   * all answer 401. Shared attempt rate limit; content capped like /callback.
+   */
+  private onDirectReply(req: HttpRequest): HttpResponse {
+    if (req.query.has("token")) {
+      this.ctx.audit({ action: "callback", outcome: "deny", reason: "query_token_refused", status: 400 });
+      return { status: 400, body: { ok: false, error: "use the Authorization header, not ?token=" } };
+    }
+    const rl = this.replyLimiter.check("reply");
+    if (!rl.allowed) {
+      this.ctx.audit({ action: "callback", outcome: "deny", reason: "rate_limited", status: 429 });
+      return { status: 429, body: { ok: false, error: "rate_limited" }, headers: { "retry-after": String(rl.retryAfterSec) } };
+    }
+    const b = (req.body ?? {}) as { requestId?: unknown; content?: unknown };
+    const id = typeof b.requestId === "string" ? b.requestId : "";
+    const token = tokenFromHeaders(req.headers);
+    const hash = token ? hashReplyToken(token) : "";
+    let key = "";
+    let rec: RequestRecord | undefined;
+    if (hash && REQUEST_ID.test(id)) {
+      for (const [k, r] of this.requests) {
+        if (r.requestId === id && r.replyTokenHash && safeEqual(r.replyTokenHash, hash)) {
+          key = k;
+          rec = r;
+          break;
+        }
+      }
+    }
+    if (!rec) {
+      this.auditAuthFail("callback");
+      return { status: 401, body: { ok: false, error: "unauthorized" } };
+    }
+    if (Date.now() > (rec.replyExpiresAt ?? 0)) {
+      this.ctx.audit({ action: "callback", outcome: "deny", reason: "reply_token_expired", eventId: id, actor: rec.client, status: 401 });
+      return { status: 401, body: { ok: false, error: "unauthorized" } };
+    }
+    const content = typeof b.content === "string" ? b.content.trim() : "";
+    if (!content) return { status: 400, body: { ok: false, error: "content required" } };
+    if (content.length > MAX_REPLY_CHARS) return { status: 413, body: { ok: false, error: "content too long" } };
+    rec.replies.push({ content, at: new Date().toISOString() });
+    // One reply per token: spend it.
+    delete rec.replyTokenHash;
+    this.saveRequests();
+    this.notify(key);
+    this.ctx.audit({ action: "callback", outcome: "ok", reason: "direct_reply_stored", eventId: id, actor: rec.client, count: rec.replies.length });
+    return { status: 200, body: { ok: true, requestId: id } };
+  }
+
+  private async onRead(req: HttpRequest): Promise<HttpResponse> {
     const a = this.auth(req, "reply_read");
     if (!a.ok) return a.res;
     const id = req.params.requestId;
     const key = requestKey(a.client, id);
     // Only the caller's own records are looked up, so another client's ids cannot be probed.
-    const rec = this.requests.get(key);
+    let rec = this.requests.get(key);
     if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+    const rawWait = req.query.get("waitSec");
+    if (rawWait !== null) {
+      const w = Number(rawWait);
+      if (!Number.isInteger(w) || w < 0) return { status: 400, body: { ok: false, error: "waitSec must be a whole number >= 0" } };
+      const wait = Math.min(w, this.cfg.maxWaitSec ?? 25);
+      if (wait > 0 && rec.replies.length === 0 && !this.stopping) {
+        await this.waitForReply(key, wait * 1000);
+        rec = this.requests.get(key);
+        if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+      }
+    }
     this.ctx.audit({ action: "reply_read", outcome: "ok", eventId: id, actor: a.client });
     // Event states are memory-only: after a restart a request that already has replies was delivered.
-    const state = this.ctx.state(key) ?? (rec.replies.length ? "delivered" : "unknown");
+    const state = rec.direct
+      ? rec.replies.length
+        ? "replied"
+        : Date.now() > (rec.replyExpiresAt ?? 0)
+          ? "expired"
+          : "awaiting_reply"
+      : (this.ctx.state(key) ?? (rec.replies.length ? "delivered" : "unknown"));
     return { status: 200, body: { ok: true, requestId: id, bot: rec.bot, state, replies: rec.replies } };
   }
 
@@ -424,7 +596,14 @@ export class GrokBuildAdapter implements SourceAdapter {
     const bots = this.routes.filter((r) => r.enabled === true && r.match.client === a.client).map((r) => r.match.bot);
     return {
       status: 200,
-      body: { ok: true, client: a.client, readOnly: this.isReadOnly(), replyChannel: this.replyChannelReady() ? "ready" : "unset", bots },
+      body: {
+        ok: true,
+        client: a.client,
+        readOnly: this.isReadOnly(),
+        replyChannel: this.replyChannelReady() ? "ready" : "unset",
+        directReplies: this.directReplyUrl() ? "ready" : "unset",
+        bots,
+      },
     };
   }
 
@@ -446,6 +625,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (rec.replies.length >= MAX_REPLIES) return { status: 429, body: { ok: false, error: "too many replies" } };
     rec.replies.push({ content, at: new Date().toISOString() });
     this.saveRequests();
+    this.notify(requestKey(rec.client, rec.requestId ?? id));
     this.ctx.audit({ action: "callback", outcome: "ok", reason: "reply_stored", eventId: id, actor: rec.client, count: rec.replies.length });
     return { status: 200, body: { ok: true, requestId: id, replies: rec.replies.length } };
   }

@@ -7,6 +7,9 @@ Status: **working, ready for real clients** once the host operator runs the live
 | `POST /grokbuild/prompt` | client token | `{ "bot": "example-agent", "prompt": "…", "requestId": "optional-8-64", "replyHint": "optional" }` -> `202 { requestId, state }` (`delivered` or `held`) |
 | `GET /grokbuild/requests/:requestId` | client token (owner only) | `{ state, replies: [{ content, at }] }`. Another client's id answers 404. |
 | `GET /grokbuild/status` | client token | `{ client, readOnly, replyChannel: "ready"\|"unset", bots: [...] }`. Writes nothing (used by the live check). |
+| `POST /grokbuild/expect` | client token | `{ "requestId": "8-64", "bot": "optional label" }` -> `201 { requestId, replyUrl, replyToken, expiresAt }`. For a prompt the client delivers itself (direct reply, below). Nothing is delivered by the bridge. |
+| `POST /grokbuild/reply` | one-time reply token | `{ "requestId": "…", "content": "…" }` (the woken bot's reply to a direct request; one reply per token) |
+| `GET /grokbuild/requests/:requestId?waitSec=N` | client token (owner only) | Same as above, but waits up to `N` seconds (capped at `maxWaitSec`, default 25) for the first reply. Direct requests report `awaiting_reply`, `replied` or `expired`. |
 | `POST /grokbuild/callback` | callback token | `{ "requestId": "…", "client": "example-client", "content": "…" }` (the agent's reply; `client` comes from the trailer and is required only when two clients use the same requestId, otherwise 409) |
 
 ## End to end
@@ -16,6 +19,18 @@ Status: **working, ready for real clients** once the host operator runs the live
 3. The core delivers through the registry: a webhook routine, or a sendPrompt-style Gateway (`POST { agentId, prompt, metadata }` with the Gateway's bearer token). If the computer is asleep (502/503/504/530, network errors) the prompt is **held** and retried, and the wake hook POSTs once per outage.
 4. The agent gets the prompt labelled as untrusted data plus `⟂ gb:<requestId> client=<id> reply=<callback URL>`, and answers with `POST /grokbuild/callback` (requestId + client from the trailer) and the callback token.
 5. The client polls `GET /grokbuild/requests/:requestId` until `replies` is non-empty (states: `queued`, `held`, `delivered`, `failed`).
+
+## Direct replies (client delivers the prompt itself)
+
+For a client that posts the prompt straight to the bot's webhook routine (for example the grokbuild-grokbots plugin's `send_prompt`) and only needs the reply to come back:
+
+1. The client calls `POST /grokbuild/expect` with its client token and its own `requestId`. Same auth, prompt rate limit, read-only switch and open-request cap as `/prompt`; no route row is needed, because the bridge delivers nothing.
+2. The bridge answers with `replyUrl` (`<http.publicBaseUrl>/grokbuild/reply`), a random `replyToken` and `expiresAt`. The token is bound to that client + requestId, kept only as a SHA-256 hash in the request file, valid for `replyTokenTtlSec` (default 900 s, at most `replyTtlSec`) and accepted **once**.
+3. The client puts `reply: { url, requestId, token, expiresAt }` in the webhook body. Its own client token never goes in the payload.
+4. The woken bot answers with `POST <replyUrl>`, `Authorization: Bearer <replyToken>` (or `x-callback-token`), body `{ requestId, content }` (content up to 8000 chars, body up to 64 KiB). A missing, wrong, expired or already used token, or a token for a different requestId, answers 401; `?token=` answers 400. Attempts share a limit of `replyPostsPerMin` (default 90) per minute.
+5. The client long-polls `GET /grokbuild/requests/<requestId>?waitSec=25` with its client token until `replies` is non-empty.
+
+The bot needs no stored secret: everything it needs is in that one payload, and the token is useless for anything but one reply to that request. The shared `callbackTokenRef` path still works for these requests too.
 
 ## Auth and limits
 
