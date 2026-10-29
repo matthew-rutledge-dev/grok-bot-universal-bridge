@@ -410,3 +410,90 @@ test("direct reply config validation and status", async () => {
     await s.close();
   }
 });
+
+test("direct reply rate limits: bad tokens cannot starve a valid one; per-request bucket after verification", async () => {
+  const s = await setup({ replyAuthFailsPerMin: 3, replyAttemptsPerRequest: 2 });
+  try {
+    const t = (await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-rl00001" }, client)).body.replyToken as string;
+    const u = (await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-rl00002" }, client)).body.replyToken as string;
+    const post = (id: string, content: string, token: string) => s.b.call("POST", "/grokbuild/reply", { requestId: id, content }, { authorization: `Bearer ${token}` });
+    // an attacker burns the shared failed-auth budget
+    const bad = [];
+    for (let i = 0; i < 5; i++) bad.push((await post("direct-rl00001", "x", `wrong-${i}`)).status);
+    assert.deepEqual(bad, [401, 401, 401, 429, 429]);
+    // a valid token still gets through
+    assert.equal((await post("direct-rl00002", "ok", u)).status, 200);
+    // per-request bucket: verified attempts on one request are capped (here 2 per minute)
+    assert.equal((await post("direct-rl00001", "", t)).status, 400);
+    assert.equal((await post("direct-rl00001", "y".repeat(8001), t)).status, 413);
+    assert.equal((await post("direct-rl00001", "ok", t)).status, 429);
+    assert.ok(s.b.audit.lines.some((l: any) => l.reason === "rate_limited" && l.status === 429 && l.actor));
+  } finally {
+    await s.close();
+  }
+  // the 0.2.0 name still sets the shared failed-auth budget
+  const old = await setup({ replyAuthFailsPerMin: undefined, replyPostsPerMin: 1 });
+  try {
+    const p = () => old.b.call("POST", "/grokbuild/reply", { requestId: "direct-none001", content: "x" }, { authorization: "Bearer nope" });
+    assert.deepEqual([(await p()).status, (await p()).status], [401, 429]);
+  } finally {
+    await old.close();
+  }
+});
+
+test("long-poll cap: past maxLongPolls a read answers at once with busy: true", async () => {
+  const s = await setup({ maxLongPolls: 1 });
+  try {
+    await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-lp00001" }, client);
+    await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-lp00002" }, client);
+    const held = s.b.call("GET", "/grokbuild/requests/direct-lp00001?waitSec=3", undefined, client);
+    await new Promise((r) => setTimeout(r, 100));
+    const t0 = Date.now();
+    const second = await s.b.call("GET", "/grokbuild/requests/direct-lp00002?waitSec=3", undefined, client);
+    assert.ok(Date.now() - t0 < 1000, "over the cap: no wait");
+    assert.deepEqual([second.status, second.body.busy, second.body.state], [200, true, "awaiting_reply"]);
+    await held;
+    // the slot is free again once the first reader returns
+    const t1 = Date.now();
+    const third = await s.b.call("GET", "/grokbuild/requests/direct-lp00002?waitSec=1", undefined, client);
+    assert.ok(Date.now() - t1 >= 900);
+    assert.equal(third.body.busy, undefined);
+  } finally {
+    await s.close();
+  }
+  assert.match(validateGrokBuildConfig({ ...example, maxLongPolls: 1001 }).join(), /maxLongPolls/);
+  assert.match(validateGrokBuildConfig({ ...example, replyAttemptsPerRequest: -1 }).join(), /replyAttemptsPerRequest/);
+});
+
+test("cancel: DELETE frees the slot, spends the token, wakes readers; own direct requests only", async () => {
+  const s = await setup({ maxOpenRequests: 1 });
+  try {
+    const t = (await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-cx00001" }, client)).body.replyToken as string;
+    assert.equal((await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-cx00002" }, client)).status, 429);
+    const pending = s.b.call("GET", "/grokbuild/requests/direct-cx00001?waitSec=10", undefined, client);
+    await new Promise((r) => setTimeout(r, 100));
+    // another client and no token cannot cancel it
+    assert.equal((await s.b.call("DELETE", "/grokbuild/requests/direct-cx00001", undefined, { authorization: "Bearer other-token" })).status, 404);
+    assert.equal((await s.b.call("DELETE", "/grokbuild/requests/direct-cx00001")).status, 401);
+    const t0 = Date.now();
+    const c = await s.b.call("DELETE", "/grokbuild/requests/direct-cx00001", undefined, client);
+    assert.deepEqual([c.status, c.body.cancelled], [200, true]);
+    assert.equal((await pending).status, 404);
+    assert.ok(Date.now() - t0 < 3000, "reader released");
+    assert.equal((await s.b.call("POST", "/grokbuild/reply", { requestId: "direct-cx00001", content: "late" }, { authorization: `Bearer ${t}` })).status, 401);
+    assert.equal((await s.b.call("DELETE", "/grokbuild/requests/direct-cx00001", undefined, client)).status, 404);
+    assert.equal((await s.b.call("POST", "/grokbuild/expect", { requestId: "direct-cx00002" }, client)).status, 201);
+    assert.ok(s.b.audit.lines.some((l: any) => l.reason === "request_cancelled"));
+  } finally {
+    await s.close();
+  }
+  // relayed (non-direct) requests are not cancellable
+  const r = await setup({}, [200]);
+  try {
+    const p = await r.b.call("POST", "/grokbuild/prompt", { requestId: "relay-cx00001", bot: "example-agent", prompt: "hi" }, client);
+    assert.equal(p.status, 202);
+    assert.equal((await r.b.call("DELETE", "/grokbuild/requests/relay-cx00001", undefined, client)).status, 409);
+  } finally {
+    await r.close();
+  }
+});

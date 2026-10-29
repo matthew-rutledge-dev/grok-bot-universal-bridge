@@ -25,9 +25,12 @@ import type { Route } from "../../core/types.js";
  *   POST /grokbuild/expect               client token   { requestId, bot? } -> { replyUrl, replyToken, expiresAt }
  *   POST /grokbuild/reply                reply token    { requestId, content }   (one reply, then the token is spent)
  *   GET  /grokbuild/requests/:id?waitSec=N  long-polls up to maxWaitSec for the first reply
+ *   DELETE /grokbuild/requests/:id       client token   cancels an open direct request (frees its slot, spends its token)
  * The reply token is random, bound to one client + requestId, stored only as a
- * SHA-256 hash, valid for replyTokenTtlSec and accepted once. It is never a
- * client or callback token, so the woken bot needs no stored secret.
+ * SHA-256 hash, valid for replyTokenTtlSec and accepted once on /reply. It is never a
+ * client or callback token, so the woken bot needs no stored secret. Only failed
+ * token checks count against the shared replyAuthFailsPerMin bucket; a verified
+ * token has its own per-request bucket, so a flood of bad tokens cannot starve it.
  *
  * Client routes: header-only bearer (?token= refused), 503 while no client
  * token resolves, 401 for a wrong token, a per-client rate limit, then the
@@ -63,10 +66,16 @@ export interface GrokBuildConfig {
   maxOpenRequests?: number;
   /** Lifetime of a direct-reply token from POST /grokbuild/expect (default 900; at most replyTtlSec). */
   replyTokenTtlSec?: number;
-  /** POST /grokbuild/reply attempts per minute, all callers together (default 90; 0 = no limit). */
+  /** Failed POST /grokbuild/reply token checks per minute, all callers together (default 60; 0 = no limit). Past it, bad tokens get 429. */
+  replyAuthFailsPerMin?: number;
+  /** Deprecated 0.2.0 name for replyAuthFailsPerMin (used only when that is unset). */
   replyPostsPerMin?: number;
+  /** POST /grokbuild/reply attempts per minute with a verified token, per request (default 10; 0 = no limit). */
+  replyAttemptsPerRequest?: number;
   /** Longest long-poll on GET /grokbuild/requests/:id?waitSec= (default 25; 0 = no long-poll). */
   maxWaitSec?: number;
+  /** Long-poll reads held open at once, all clients together (default 32; 0 = no long-poll). Past it, reads answer at once with busy: true. */
+  maxLongPolls?: number;
 }
 
 interface RequestRecord {
@@ -92,6 +101,7 @@ const MAX_REPLIES = 20;
 const MAX_REPLY_CHARS = 8000;
 const AUTH_FAIL_AUDITS_PER_MIN = 20;
 const MAX_WAIT_CAP_SEC = 60;
+const MAX_LONG_POLLS_CAP = 1000;
 
 export function hashReplyToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -117,12 +127,13 @@ export function validateGrokBuildConfig(raw: unknown): string[] {
   if (c.callbackTokenRef !== undefined && !isSecretRef(c.callbackTokenRef)) {
     p.push("grokbuild.callbackTokenRef must be env:NAME or file:/absolute/path (literal tokens are refused)");
   }
-  for (const k of ["maxPromptChars", "replyTtlSec", "promptsPerMin", "readsPerMin", "maxOpenRequests", "replyPostsPerMin", "maxWaitSec"] as const) {
+  for (const k of ["maxPromptChars", "replyTtlSec", "promptsPerMin", "readsPerMin", "maxOpenRequests", "replyPostsPerMin", "replyAuthFailsPerMin", "replyAttemptsPerRequest", "maxWaitSec", "maxLongPolls"] as const) {
     if (!isLimit(c[k])) p.push(`grokbuild.${k} must be a whole number >= 0`);
   }
   if (c.replyTokenTtlSec !== undefined && !(Number.isInteger(c.replyTokenTtlSec) && c.replyTokenTtlSec >= 1)) {
     p.push("grokbuild.replyTokenTtlSec must be a whole number >= 1");
   }
+  if (typeof c.maxLongPolls === "number" && c.maxLongPolls > MAX_LONG_POLLS_CAP) p.push(`grokbuild.maxLongPolls must be at most ${MAX_LONG_POLLS_CAP}`);
   if (typeof c.maxWaitSec === "number" && c.maxWaitSec > MAX_WAIT_CAP_SEC) p.push(`grokbuild.maxWaitSec must be at most ${MAX_WAIT_CAP_SEC}`);
   const clients = c.clients && typeof c.clients === "object" ? c.clients : {};
   for (const [id, cl] of Object.entries(clients)) {
@@ -164,9 +175,13 @@ export class GrokBuildAdapter implements SourceAdapter {
   private file = "";
   private readonly promptLimiters = new Map<string, SlidingWindowRateLimiter>();
   private readonly readLimiter: SlidingWindowRateLimiter;
-  private readonly replyLimiter: SlidingWindowRateLimiter;
+  /** Failed reply-token checks, all callers together. */
+  private readonly replyFailLimiter: SlidingWindowRateLimiter;
+  /** Verified-token reply attempts, per request key (entries dropped when the token is spent or the record goes). */
+  private readonly replyAttempts = new Map<string, number[]>();
   /** Long-poll readers waiting for a request's first reply, by request key. */
   private readonly waiters = new Map<string, Set<() => void>>();
+  private longPolls = 0;
   private stopping = false;
   private authFails = { window: 0, audited: 0, suppressed: 0 };
 
@@ -208,7 +223,7 @@ export class GrokBuildAdapter implements SourceAdapter {
       this.promptLimiters.set(id, new SlidingWindowRateLimiter(cl.promptsPerMin ?? cfg.promptsPerMin ?? 20));
     }
     this.readLimiter = new SlidingWindowRateLimiter(cfg.readsPerMin ?? 240);
-    this.replyLimiter = new SlidingWindowRateLimiter(cfg.replyPostsPerMin ?? 90);
+    this.replyFailLimiter = new SlidingWindowRateLimiter(cfg.replyAuthFailsPerMin ?? cfg.replyPostsPerMin ?? 60);
   }
 
   /** Where a woken bot posts a direct reply ("" while http.publicBaseUrl is unset). */
@@ -315,6 +330,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     this.loadRequests();
     ctx.route("POST", "prompt", (req) => this.onPrompt(req), { maxBytes: 64 * 1024 });
     ctx.route("GET", "requests/:requestId", (req) => this.onRead(req));
+    ctx.route("DELETE", "requests/:requestId", (req) => this.onCancel(req));
     ctx.route("GET", "status", (req) => this.onClientStatus(req));
     ctx.route("POST", "expect", (req) => this.onExpect(req), { maxBytes: 4 * 1024 });
     ctx.route("POST", "reply", (req) => this.onDirectReply(req), { maxBytes: 64 * 1024 });
@@ -326,6 +342,7 @@ export class GrokBuildAdapter implements SourceAdapter {
       let n = 0;
       for (const [id, r] of this.requests) if (r.createdAt < cutoff) n += Number(this.requests.delete(id));
       if (n) this.saveRequests();
+      for (const k of this.replyAttempts.keys()) if (!this.requests.has(k)) this.replyAttempts.delete(k);
       this.flushAuthFails();
     }, 60_000);
     this.sweep.unref?.();
@@ -518,11 +535,6 @@ export class GrokBuildAdapter implements SourceAdapter {
       this.ctx.audit({ action: "callback", outcome: "deny", reason: "query_token_refused", status: 400 });
       return { status: 400, body: { ok: false, error: "use the Authorization header, not ?token=" } };
     }
-    const rl = this.replyLimiter.check("reply");
-    if (!rl.allowed) {
-      this.ctx.audit({ action: "callback", outcome: "deny", reason: "rate_limited", status: 429 });
-      return { status: 429, body: { ok: false, error: "rate_limited" }, headers: { "retry-after": String(rl.retryAfterSec) } };
-    }
     const b = (req.body ?? {}) as { requestId?: unknown; content?: unknown };
     const id = typeof b.requestId === "string" ? b.requestId : "";
     const token = tokenFromHeaders(req.headers);
@@ -539,8 +551,27 @@ export class GrokBuildAdapter implements SourceAdapter {
       }
     }
     if (!rec) {
+      // Only failed checks spend the shared budget, so bad tokens cannot starve a valid one.
+      const rl = this.replyFailLimiter.check("reply");
+      if (!rl.allowed) {
+        this.ctx.audit({ action: "callback", outcome: "deny", reason: "rate_limited", status: 429 });
+        return { status: 429, body: { ok: false, error: "rate_limited" }, headers: { "retry-after": String(rl.retryAfterSec) } };
+      }
       this.auditAuthFail("callback");
       return { status: 401, body: { ok: false, error: "unauthorized" } };
+    }
+    const perReq = this.cfg.replyAttemptsPerRequest ?? 10;
+    if (perReq > 0) {
+      const now = Date.now();
+      const stamps = (this.replyAttempts.get(key) ?? []).filter((t) => t > now - 60_000);
+      if (stamps.length >= perReq) {
+        this.replyAttempts.set(key, stamps);
+        const retry = Math.max(1, Math.ceil((stamps[0] + 60_000 - now) / 1000));
+        this.ctx.audit({ action: "callback", outcome: "deny", reason: "rate_limited", eventId: id, actor: rec.client, status: 429 });
+        return { status: 429, body: { ok: false, error: "rate_limited" }, headers: { "retry-after": String(retry) } };
+      }
+      stamps.push(now);
+      this.replyAttempts.set(key, stamps);
     }
     if (Date.now() > (rec.replyExpiresAt ?? 0)) {
       this.ctx.audit({ action: "callback", outcome: "deny", reason: "reply_token_expired", eventId: id, actor: rec.client, status: 401 });
@@ -552,6 +583,7 @@ export class GrokBuildAdapter implements SourceAdapter {
     rec.replies.push({ content, at: new Date().toISOString() });
     // One reply per token: spend it.
     delete rec.replyTokenHash;
+    this.replyAttempts.delete(key);
     this.saveRequests();
     this.notify(key);
     this.ctx.audit({ action: "callback", outcome: "ok", reason: "direct_reply_stored", eventId: id, actor: rec.client, count: rec.replies.length });
@@ -566,15 +598,26 @@ export class GrokBuildAdapter implements SourceAdapter {
     // Only the caller's own records are looked up, so another client's ids cannot be probed.
     let rec = this.requests.get(key);
     if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+    let busy = false;
     const rawWait = req.query.get("waitSec");
     if (rawWait !== null) {
       const w = Number(rawWait);
       if (!Number.isInteger(w) || w < 0) return { status: 400, body: { ok: false, error: "waitSec must be a whole number >= 0" } };
       const wait = Math.min(w, this.cfg.maxWaitSec ?? 25);
       if (wait > 0 && rec.replies.length === 0 && !this.stopping) {
-        await this.waitForReply(key, wait * 1000);
-        rec = this.requests.get(key);
-        if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+        if (this.longPolls >= (this.cfg.maxLongPolls ?? 32)) {
+          // Too many readers held open: answer now; the client polls again later.
+          busy = true;
+        } else {
+          this.longPolls += 1;
+          try {
+            await this.waitForReply(key, wait * 1000);
+          } finally {
+            this.longPolls -= 1;
+          }
+          rec = this.requests.get(key);
+          if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+        }
       }
     }
     this.ctx.audit({ action: "reply_read", outcome: "ok", eventId: id, actor: a.client });
@@ -586,7 +629,28 @@ export class GrokBuildAdapter implements SourceAdapter {
           ? "expired"
           : "awaiting_reply"
       : (this.ctx.state(key) ?? (rec.replies.length ? "delivered" : "unknown"));
-    return { status: 200, body: { ok: true, requestId: id, bot: rec.bot, state, replies: rec.replies } };
+    return {
+      status: 200,
+      body: { ok: true, requestId: id, bot: rec.bot, state, replies: rec.replies, ...(busy ? { busy: true } : {}) },
+      ...(busy ? { headers: { "retry-after": "2" } } : {}),
+    };
+  }
+
+  /** Cancel an open direct request: drops the record (frees its open-request slot), so its token no longer works. */
+  private onCancel(req: HttpRequest): HttpResponse {
+    const a = this.auth(req, "reply_read");
+    if (!a.ok) return a.res;
+    const id = req.params.requestId;
+    const key = requestKey(a.client, id);
+    const rec = this.requests.get(key);
+    if (!rec) return { status: 404, body: { ok: false, error: "not_found" } };
+    if (!rec.direct) return { status: 409, body: { ok: false, error: "only direct requests can be cancelled" } };
+    this.requests.delete(key);
+    this.replyAttempts.delete(key);
+    this.saveRequests();
+    this.notify(key);
+    this.ctx.audit({ action: "ingest", outcome: "ok", reason: "request_cancelled", eventId: id, actor: a.client });
+    return { status: 200, body: { ok: true, requestId: id, cancelled: true } };
   }
 
   /** What a client may know about its own access. Writes nothing; safe for live checks. */

@@ -7,8 +7,10 @@
   "readsPerMin": 240,
   "maxOpenRequests": 200,
   "replyTokenTtlSec": 900,
-  "replyPostsPerMin": 90,
+  "replyAuthFailsPerMin": 60,
+  "replyAttemptsPerRequest": 10,
   "maxWaitSec": 25,
+  "maxLongPolls": 32,
   "clients": {
     "example-client": {
       "tokenRef": "env:GROKBUILD_CLIENT_TOKEN"
