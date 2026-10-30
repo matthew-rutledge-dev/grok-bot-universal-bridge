@@ -725,3 +725,20 @@ test("tombstone cap is per client: one client's churn evicts only its own oldest
     await s.close();
   }
 });
+
+test("a refused /prompt on a reused id keeps the caller's tombstone (cleared only once a prompt is accepted)", async () => {
+  const s = await setup();
+  try {
+    await s.b.call("POST", "/grokbuild/expect", { requestId: "refused-00001" }, client);
+    await s.b.call("DELETE", "/grokbuild/requests/refused-00001", undefined, client);
+    const p = await s.b.call("POST", "/grokbuild/prompt", { requestId: "refused-00001", bot: "unrouted-bot", prompt: "hi" }, client);
+    assert.equal(p.status, 403);
+    const r = await s.b.call("GET", "/grokbuild/requests/refused-00001", undefined, client);
+    assert.deepEqual([r.status, r.body.state], [200, "cancelled"], "tombstone survives a refused prompt");
+    // an accepted prompt for the same id still clears it
+    assert.equal((await s.b.call("POST", "/grokbuild/prompt", { requestId: "refused-00001", bot: "example-agent", prompt: "hi" }, client)).status, 202);
+    assert.notEqual((await s.b.call("GET", "/grokbuild/requests/refused-00001", undefined, client)).body.state, "cancelled");
+  } finally {
+    await s.close();
+  }
+});
