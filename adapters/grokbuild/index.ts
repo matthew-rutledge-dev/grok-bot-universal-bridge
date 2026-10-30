@@ -368,9 +368,9 @@ export class GrokBuildAdapter implements SourceAdapter {
     for (const k of this.replyAttempts.keys()) if (!this.requests.has(k)) this.replyAttempts.delete(k);
   }
 
-  private putRecord(key: string, rec: RequestRecord): void {
-    // A new record for a reused id (/expect or /prompt) supersedes any old final state.
-    this.dropTomb(key);
+  private putRecord(key: string, rec: RequestRecord, opts: { keepTomb?: boolean } = {}): void {
+    // A new record for a reused id supersedes any old final state (/prompt clears it only once accepted).
+    if (!opts.keepTomb) this.dropTomb(key);
     this.requests.set(key, rec);
     const id = rec.requestId ?? key.slice(key.indexOf(":") + 1);
     let set = this.byId.get(id);
@@ -617,7 +617,8 @@ export class GrokBuildAdapter implements SourceAdapter {
     if (capped) return capped;
     const replyHint = typeof b.replyHint === "string" ? b.replyHint : undefined;
     // Record first so a fast reply can never arrive before the request is known.
-    this.putRecord(key, { client, requestId, bot, createdAt: Date.now(), replies: [] });
+    // Keep an old tombstone for this id until the prompt is accepted, so a refused prompt leaves it intact.
+    this.putRecord(key, { client, requestId, bot, createdAt: Date.now(), replies: [] }, { keepTomb: true });
     this.saveRequests();
     const res = await this.ctx.submit({
       eventId: key,
@@ -635,6 +636,7 @@ export class GrokBuildAdapter implements SourceAdapter {
       const status = res.reason === "agent_not_ready" ? 503 : res.reason === "duplicate" ? 409 : 403;
       return { status, body: { ok: false, error: res.reason } };
     }
+    if (this.dropTomb(key)) this.saveRequests();
     return { status: 202, body: { ok: true, requestId, state: res.state } };
   }
 
