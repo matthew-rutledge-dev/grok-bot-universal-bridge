@@ -50,12 +50,13 @@ docker compose up -d
 
 ## Backup upload
 
-A write-only drop for bot backups. Off by default: with `BRIDGE_BACKUP_UPLOAD_KEY` unset or empty the route answers 404 like any unknown path.
+A write-only drop for bot backups. Off by default: with `BRIDGE_BACKUP_UPLOAD_KEY` unset, empty or shorter than 32 characters the route answers 404 like any unknown path (a too-short key also logs a startup warning, never the value).
 
 | Env | Meaning |
 |---|---|
-| `BRIDGE_BACKUP_UPLOAD_KEY` | Bearer key for uploads (host `.env` only, never in git). Unset/empty = route disabled. |
+| `BRIDGE_BACKUP_UPLOAD_KEY` | Bearer key for uploads, at least 32 characters (host `.env` only, never in git). Unset, empty or shorter = route disabled. |
 | `BACKUP_ROOT` | Directory uploads land in, inside the container. Default `/backup`; bind-mount a host dir there (see `compose.example.yml`), writable by the container's `bridge` user. |
+| `BACKUP_HOST_DIR` | Compose only: the host directory mounted at `/backup` (default `/mnt/grokbot_backup`). Create it before `docker compose up`, or Docker creates it owned by root. |
 
 ```bash
 curl -sS -X POST --data-binary @db.sqlite.gz \
@@ -64,9 +65,11 @@ curl -sS -X POST --data-binary @db.sqlite.gz \
 # 201 {"path":"example-agent/2026-01-02/db.sqlite.gz","bytes":12345,"sha256":"<hex>"}
 ```
 
-* `POST /backup/upload?bot=<alias>&name=<file>`: `bot` must be a registry alias; `name` must match `^[A-Za-z0-9._-]{1,128}$` and not be `.` or `..`.
-* The body is streamed (never buffered) to `<BACKUP_ROOT>/<alias>/<YYYY-MM-DD, UTC>/<name>`, created with `O_EXCL`. `path` in the answer is relative to `BACKUP_ROOT`; `sha256` is computed while streaming, so the client can compare it with its own.
-* Answers: `201` stored; `400` bad alias/name (or `?token=`); `401` no key; `403` wrong key; `404` disabled; `409` that name already exists for that bot today (nothing is overwritten); `413` over 95 MiB (by `Content-Length` up front, or counted while streaming); `500` write failed. A failed, aborted or oversize upload leaves no partial file.
+* `POST /backup/upload?bot=<alias>&name=<file>`: `bot` must be a registry alias; `name` must match `^[A-Za-z0-9._-]{1,128}$`, not be `.` or `..`, and not be a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, any case, with or without an extension).
+* The body is streamed (never buffered) to a temp file `<BACKUP_ROOT>/<alias>/.incoming/<random>.part` (`O_EXCL`), fsynced, then published with a hard link to `<BACKUP_ROOT>/<alias>/<YYYY-MM-DD, UTC>/<name>` (the link fails if the name exists, so nothing is overwritten), the temp name is removed and the date directory is fsynced (not on Windows). A file under a real name is therefore always complete. A killed process can leave a stray `.part` under `.incoming/`; it never blocks a name and is safe for the host to prune.
+* `path` in the answer is relative to `BACKUP_ROOT`; `sha256` is computed while streaming, so the client can compare it with its own. A `201` is the proof of a stored upload.
+* Symlinks are not followed: if the alias or date directory is a symlink the upload is refused (`500`, audit reason `symlink_dir`).
+* Answers: `201` stored; `400` bad alias/name (or `?token=`); `401` no key; `403` wrong key; `404` disabled; `409` that name already exists for that bot today (nothing is overwritten); `413` over 95 MiB (by `Content-Length` up front, or counted while streaming); `500` write failed. A failed, aborted or oversize upload leaves no file under its name.
 * One `audit.jsonl` line per attempt: `adapter: "backup"`, `action: "upload"`, `outcome` (`ok`, `auth_fail`, `bad_request`, `conflict`, `too_large`, `error`), `agent` (the alias), `name`, `bytes`, `sha256`, `status`. Never the body or the key.
 * There are no list, read, delete or overwrite routes. Retention and pruning are the host's job.
 * A reverse proxy in front must allow bodies up to 95 MiB on this path.

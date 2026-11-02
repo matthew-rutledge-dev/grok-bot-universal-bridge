@@ -64,14 +64,14 @@ test("POST /backup/upload is wired: 404 without BRIDGE_BACKUP_UPLOAD_KEY, writes
   const root = tmp("ubridge-svc-backup-");
   const on = await buildService(file, {
     discordPort: new FakeDiscordPort(BOT),
-    env: { BRIDGE_BACKUP_UPLOAD_KEY: "svc-test-key", BACKUP_ROOT: root },
+    env: { BRIDGE_BACKUP_UPLOAD_KEY: "svc-test-key-0123456789abcdef-0000", BACKUP_ROOT: root },
     log: silentLogger,
   });
   const port = await on.http.listen("127.0.0.1", 0);
   try {
     const r = await fetch(`http://127.0.0.1:${port}/backup/upload?bot=example-agent&name=a.bin`, {
       method: "POST",
-      headers: { authorization: "Bearer svc-test-key" },
+      headers: { authorization: "Bearer svc-test-key-0123456789abcdef-0000" },
       body: "hello",
     });
     assert.equal(r.status, 201);
