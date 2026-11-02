@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
-import { copyFile, link, lstat, mkdir, open, statfs, unlink, type FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, open, statfs, unlink, type FileHandle } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Transform, Writable } from "node:stream";
@@ -29,8 +28,11 @@ import { consoleLogger, type Logger } from "./types.js";
  * file under a real name. `.incoming` cannot clash with an upload: uploads
  * only ever land in a YYYY-MM-DD folder, and that is the only thing `name`
  * can address. Where the filesystem has no hard links (EPERM, ENOTSUP,
- * EXDEV, ...) the publish falls back to copyFile with COPYFILE_EXCL, which
- * keeps the same never-overwrite / 409 semantics.
+ * EXDEV, ...) the publish falls back to an exclusive copy: the final name is
+ * opened with O_EXCL by this request (so a concurrent publish gives 409 and is
+ * never deleted), filled from the temp file and fsynced. Copy mode is not
+ * crash-atomic (see README); the first upload probes which mode is active and
+ * logs it once.
  *
  * Free space: before anything is written, statfs(BACKUP_ROOT) must show
  * free - (Content-Length, or the cap when absent) >= BACKUP_MIN_FREE_BYTES
@@ -73,7 +75,10 @@ export interface BackupFsOps {
   /** Free bytes available to this process on the filesystem holding `path`. */
   freeBytes(path: string): Promise<number>;
   link(existing: string, target: string): Promise<void>;
-  copyFileExcl(src: string, dest: string): Promise<void>;
+  /** Create a file exclusively (O_EXCL, 'wx'); EEXIST when the name is taken. */
+  openExcl(path: string): Promise<FileHandle>;
+  /** fsync an open file (`path` only identifies it, e.g. for tests). */
+  sync(fh: FileHandle, path: string): Promise<void>;
   /** Write part of a buffer to the temp file; returns bytes written. */
   write(fh: FileHandle, buf: Buffer, offset: number, length: number): Promise<number>;
 }
@@ -84,7 +89,8 @@ const realFsOps: BackupFsOps = {
     return Number(st.bavail) * Number(st.bsize);
   },
   link: (a, b) => link(a, b),
-  copyFileExcl: (a, b) => copyFile(a, b, fsConstants.COPYFILE_EXCL),
+  openExcl: (path) => open(path, "wx", 0o640),
+  sync: (fh) => fh.sync(),
   write: async (fh, buf, offset, length) => (await fh.write(buf, offset, length)).bytesWritten,
 };
 
@@ -146,14 +152,65 @@ async function ensureRealDir(dir: string, log: Logger): Promise<void> {
 }
 
 class NoSpace extends Error {}
+/** statfs failed or returned nonsense: the upload is refused (500), never let through unchecked. */
+class StatfsFailed extends Error {
+  constructor(readonly why: string) {
+    super("statfs failed");
+  }
+}
 
-/** fsync an already-written file by path (after the copy fallback). */
-async function syncFile(path: string): Promise<void> {
-  const fh = await open(path, "r+");
+const errCode = (err: unknown): string => String((err as NodeJS.ErrnoException)?.code ?? "");
+
+/**
+ * Publish without hard links: create `file` with O_EXCL (so we know this
+ * request owns it), copy the temp file in, fsync. On failure only the file this
+ * request created is removed; an EEXIST from the create is a 409 and the other
+ * request's file is never touched.
+ */
+async function copyExclusive(fsOps: BackupFsOps, temp: string, file: string): Promise<void> {
+  const out = await fsOps.openExcl(file); // throws before creating anything -> nothing of ours to remove
   try {
-    await fh.sync();
-  } finally {
+    const inp = await open(temp, "r");
+    try {
+      const buf = Buffer.allocUnsafe(1024 * 1024);
+      for (;;) {
+        const { bytesRead } = await inp.read(buf, 0, buf.length, null);
+        if (!bytesRead) break;
+        let off = 0;
+        while (off < bytesRead) off += await fsOps.write(out, buf, off, bytesRead - off);
+      }
+    } finally {
+      await inp.close();
+    }
+    await fsOps.sync(out, file);
+    await out.close();
+  } catch (err) {
+    await out.close().catch(() => undefined);
+    await unlink(file).catch(() => undefined);
+    throw err;
+  }
+}
+
+export type PublishMode = "link" | "copy";
+
+/** Probe hard-link support inside `incoming` with throwaway files. undefined = could not tell (try again later). */
+async function probePublishMode(fsOps: BackupFsOps, incoming: string): Promise<PublishMode | undefined> {
+  const base = join(incoming, `${randomBytes(12).toString("hex")}.probe`);
+  const linked = `${base}-link`;
+  try {
+    const fh = await open(base, "wx", 0o600);
     await fh.close();
+    try {
+      await fsOps.link(base, linked);
+      return "link";
+    } catch (err) {
+      return NO_HARDLINK.has(errCode(err)) ? "copy" : undefined;
+    }
+  } catch {
+    return undefined;
+  } finally {
+    await unlink(linked).catch(() => undefined);
+    await unlink(base).catch(() => undefined);
   }
 }
 
@@ -170,6 +227,15 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
   }
   const reserve = minFree;
   const recheckEvery = o.spaceRecheckBytes ?? BACKUP_SPACE_RECHECK_BYTES;
+  let mode: PublishMode | undefined;
+  const detectMode = async (incoming: string) => {
+    if (mode) return;
+    mode = await probePublishMode(fsOps, incoming);
+    if (mode === "link") log.info("[backup] publish mode: link (atomic)");
+    else if (mode === "copy") {
+      log.warn("[backup] publish mode: copy (no hard links on BACKUP_ROOT): a crash mid-copy can leave a truncated file under its final name, see README");
+    }
+  };
 
   const configured = (env.BRIDGE_BACKUP_UPLOAD_KEY ?? "").trim();
   if (configured && !backupKey(env)) {
@@ -237,7 +303,7 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
         return { status: 507, body: { ok: false, error: "insufficient_storage" } };
       };
       const fail = (err: unknown, bytes?: number): HttpResponse => {
-        const code = String((err as NodeJS.ErrnoException).code ?? (err as Error).name ?? "error");
+        const code = err instanceof StatfsFailed ? `statfs_${err.why}` : String((err as NodeJS.ErrnoException).code ?? (err as Error).name ?? "error");
         log.warn(`[backup] upload failed ${code}`);
         audit("error", { reason: code === "SYMLINK_DIR" ? "symlink_dir" : code, status: 500, bytes });
         return { status: 500, body: { ok: false, error: "write_failed" } };
@@ -257,11 +323,18 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
       if (reserve > 0) {
         try {
           await mkdir(root, { recursive: true, mode: 0o750 });
-          const free = await fsOps.freeBytes(root);
-          if (free - expectedBytes < reserve) return noSpace("below_reserve");
         } catch (err) {
-          return fail(err);
+          return NO_SPACE.has(errCode(err)) ? noSpace(errCode(err)) : fail(err);
         }
+        let free: number;
+        try {
+          free = await fsOps.freeBytes(root);
+        } catch (err) {
+          // Fail closed: without a reading we cannot promise the reserve.
+          return fail(new StatfsFailed(errCode(err) || "error"));
+        }
+        if (!Number.isFinite(free)) return fail(new StatfsFailed("bad_value"));
+        if (free - expectedBytes < reserve) return noSpace("below_reserve");
       }
 
       let temp = "";
@@ -271,10 +344,11 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
         await ensureRealDir(dir, log);
         await ensureRealDir(incoming, log);
         temp = join(incoming, `${randomBytes(12).toString("hex")}.part`);
-        fh = await open(temp, "wx", 0o640);
+        fh = await fsOps.openExcl(temp);
       } catch (err) {
-        return fail(err);
+        return NO_SPACE.has(errCode(err)) ? noSpace(errCode(err)) : fail(err);
       }
+      await detectMode(incoming);
 
       const hash = createHash("sha256");
       let bytes = 0;
@@ -288,8 +362,8 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
           nextCheck = bytes + recheckEvery;
           // Re-check while streaming: other writers share the volume.
           fsOps.freeBytes(root).then(
-            (free) => (free < reserve ? cb(new NoSpace("below reserve")) : cb(null, chunk)),
-            (err) => cb(err as Error),
+            (free) => (!Number.isFinite(free) ? cb(new StatfsFailed("bad_value")) : free < reserve ? cb(new NoSpace("below reserve")) : cb(null, chunk)),
+            (err) => cb(new StatfsFailed(errCode(err) || "error")),
           );
         },
       });
@@ -316,7 +390,7 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
           },
         });
         await pipeline(meter, sink);
-        await fh.sync();
+        await fsOps.sync(fh, temp);
         await fh.close();
         try {
           await fsOps.link(temp, file);
@@ -324,16 +398,7 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
           const code = (err as NodeJS.ErrnoException).code ?? "";
           if (!NO_HARDLINK.has(code)) throw err;
           // No hard links here: exclusive copy keeps "never overwrite" (EEXIST -> 409).
-          let copied = false;
-          try {
-            await fsOps.copyFileExcl(temp, file);
-            copied = true;
-            await syncFile(file);
-          } catch (copyErr) {
-            // A failed copy must not leave a partial file under the real name.
-            if (copied || (copyErr as NodeJS.ErrnoException).code !== "EEXIST") await unlink(file).catch(() => undefined);
-            throw copyErr;
-          }
+          await copyExclusive(fsOps, temp, file);
         }
         linked = true;
       } catch (err) {

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { open, type FileHandle } from "node:fs/promises";
 import { request } from "node:http";
 import { join } from "node:path";
 import { MemoryAudit } from "./audit.js";
@@ -453,14 +454,14 @@ test("ENOSPC mid-stream: 507, empty .incoming, no final file, and the server kee
   }
 });
 
-test("no hard links (link fails EPERM/ENOTSUP/EXDEV): exclusive copy publishes the file; a name that appears meanwhile still gives 409", async () => {
-  for (const code of ["EPERM", "ENOTSUP", "EXDEV"]) {
+test("no hard links (link fails EPERM/ENOTSUP/EXDEV/ENOSYS/EOPNOTSUPP): exclusive copy publishes the file; a name that appears meanwhile still gives 409", async () => {
+  for (const code of ["EPERM", "ENOTSUP", "EXDEV", "ENOSYS", "EOPNOTSUPP"]) {
     let racer = false;
     const s = await server({
       fsOps: {
         link: async (_temp, final) => {
           // Simulate another upload winning the name between the early check and the publish.
-          if (racer) writeFileSync(final, "someone else");
+          if (racer && final.includes(DAY)) writeFileSync(final, "someone else");
           throw Object.assign(new Error("hard links unsupported"), { code });
         },
       },
@@ -491,8 +492,9 @@ test("any other link error is a 500 (no copy fallback), temp removed", async () 
       link: async () => {
         throw Object.assign(new Error("io"), { code: "EIO" });
       },
-      copyFileExcl: async () => {
-        throw new Error("copy must not be tried");
+      openExcl: async (path) => {
+        if (path.includes(DAY)) throw new Error("copy must not be tried");
+        return open(path, "wx");
       },
     },
   });
@@ -504,5 +506,184 @@ test("any other link error is a 500 (no copy fallback), temp removed", async () 
     assert.deepEqual(leftovers(s.root), []);
   } finally {
     await s.http.close();
+  }
+});
+
+const noLink: Partial<BackupFsOps> = {
+  link: async () => {
+    throw Object.assign(new Error("hard links unsupported"), { code: "EPERM" });
+  },
+};
+
+test("copy mode fsyncs the copied final file (and the temp file) before answering 201", async () => {
+  const synced: string[] = [];
+  const s = await server({
+    fsOps: {
+      ...noLink,
+      sync: async (fh, path) => {
+        synced.push(path);
+        await fh.sync();
+      },
+    },
+  });
+  try {
+    const r = await post(s.port, "bot=example-agent&name=synced.bin", [randomBytes(3 * 1024 * 1024)], { auth });
+    assert.equal(r.status, 201);
+    const final = join(s.root, "example-agent", DAY, "synced.bin");
+    assert.equal(synced.length, 2);
+    assert.match(synced[0], /\.part$/);
+    assert.equal(synced[1], final);
+    assert.equal(createHash("sha256").update(readFileSync(final)).digest("hex"), r.body.sha256);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("copy mode, concurrent publish of one name: one 201, one 409, and the winner's file is never deleted", async () => {
+  const s = await server({ fsOps: noLink });
+  try {
+    const a = Buffer.alloc(2 * 1024 * 1024, 1);
+    const b = Buffer.alloc(2 * 1024 * 1024, 2);
+    const rs = await Promise.all([
+      post(s.port, "bot=example-agent&name=race.bin", [a.subarray(0, 1000), a.subarray(1000)], { auth }),
+      post(s.port, "bot=example-agent&name=race.bin", [b.subarray(0, 1000), b.subarray(1000)], { auth }),
+    ]);
+    assert.deepEqual(rs.map((r) => r.status).sort(), [201, 409]);
+    const winner = rs.find((r) => r.status === 201)!;
+    const stored = readFileSync(join(s.root, "example-agent", DAY, "race.bin"));
+    assert.equal(stored.length, a.length);
+    assert.equal(createHash("sha256").update(stored).digest("hex"), winner.body.sha256);
+    assert.deepEqual(leftovers(s.root), []);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("copy mode: a create error that is not EEXIST (e.g. EACCES) never deletes a file another request published", async () => {
+  const s = await server({
+    fsOps: {
+      ...noLink,
+      openExcl: async (path) => {
+        if (!path.includes(DAY)) return open(path, "wx");
+        // Another request publishes the name, then our create fails for an unrelated reason.
+        writeFileSync(path, "published by someone else");
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      },
+    },
+  });
+  try {
+    const r = await post(s.port, "bot=example-agent&name=theirs.bin", [Buffer.from("mine")], { auth });
+    assert.equal(r.status, 500);
+    assert.equal(readFileSync(join(s.root, "example-agent", DAY, "theirs.bin"), "utf8"), "published by someone else");
+    assert.deepEqual(leftovers(s.root), []);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("copy mode: ENOSPC while copying removes the final file this request created and answers 507", async () => {
+  let ours: FileHandle | undefined;
+  const s = await server({
+    fsOps: {
+      ...noLink,
+      openExcl: async (path) => {
+        const fh = await open(path, "wx");
+        if (path.includes(DAY)) ours = fh;
+        return fh;
+      },
+      write: async (fh, buf, offset, length) => {
+        if (fh === ours) throw Object.assign(new Error("full"), { code: "ENOSPC" });
+        return (await fh.write(buf, offset, length)).bytesWritten;
+      },
+    },
+  });
+  try {
+    const r = await post(s.port, "bot=example-agent&name=copyfull.bin", [randomBytes(10_000)], { auth });
+    assert.equal(r.status, 507);
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "copyfull.bin")), false);
+    assert.deepEqual(leftovers(s.root), []);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("ENOSPC/EDQUOT creating the temp file: 507 no_space, not 500", async () => {
+  for (const code of ["ENOSPC", "EDQUOT"]) {
+    const s = await server({
+      fsOps: {
+        openExcl: async () => {
+          throw Object.assign(new Error("full"), { code });
+        },
+      },
+    });
+    try {
+      const r = await post(s.port, "bot=example-agent&name=a.bin", [Buffer.from("x")], { auth });
+      assert.equal(r.status, 507, code);
+      assert.deepEqual([s.audit.lines.at(-1)?.outcome, s.audit.lines.at(-1)?.reason], ["no_space", code]);
+    } finally {
+      await s.http.close();
+    }
+  }
+});
+
+test("statfs failing fails closed: 500 with a warning, before writing or mid-stream, nothing left behind", async () => {
+  const warnings: string[] = [];
+  const log: Logger = { ...silentLogger, warn: (m: string) => warnings.push(m) };
+  const before = await server({
+    log,
+    fsOps: {
+      freeBytes: async () => {
+        throw Object.assign(new Error("statfs"), { code: "EIO" });
+      },
+    },
+  });
+  try {
+    const r = await post(before.port, "bot=example-agent&name=a.bin", [Buffer.from("x")], { auth });
+    assert.equal(r.status, 500);
+    assert.equal(before.audit.lines.at(-1)?.reason, "statfs_EIO");
+    assert.deepEqual(readdirSync(before.root), []);
+    assert.ok(warnings.some((w) => /statfs_EIO/.test(w)));
+  } finally {
+    await before.http.close();
+  }
+  let calls = 0;
+  const mid = await server({
+    log,
+    spaceRecheckBytes: 1024,
+    fsOps: {
+      freeBytes: async () => {
+        if (++calls === 1) return TIB;
+        throw Object.assign(new Error("statfs"), { code: "EIO" });
+      },
+    },
+  });
+  try {
+    const r = await post(mid.port, "bot=example-agent&name=b.bin", [randomBytes(800), randomBytes(800), randomBytes(800)], { auth });
+    assert.equal(r.status, 500);
+    assert.equal(mid.audit.lines.at(-1)?.reason, "statfs_EIO");
+    assert.equal(existsSync(join(mid.root, "example-agent", DAY, "b.bin")), false);
+    assert.deepEqual(leftovers(mid.root), []);
+  } finally {
+    await mid.http.close();
+  }
+});
+
+test("publish mode is probed on the first upload and logged once (link, or copy with a warning)", async () => {
+  for (const [ops, expect] of [
+    [{}, "link"],
+    [noLink, "copy"],
+  ] as const) {
+    const lines: string[] = [];
+    const log: Logger = { ...silentLogger, info: (m: string) => lines.push(m), warn: (m: string) => lines.push(m) };
+    const s = await server({ log, fsOps: ops });
+    try {
+      for (const n of ["one.bin", "two.bin"]) assert.equal((await post(s.port, `bot=example-agent&name=${n}`, [Buffer.from(n)], { auth })).status, 201);
+      const modeLines = lines.filter((l) => l.includes("publish mode"));
+      assert.equal(modeLines.length, 1, expect);
+      assert.match(modeLines[0], new RegExp(`publish mode: ${expect}`));
+      assert.deepEqual(leftovers(s.root), [], "probe files removed");
+    } finally {
+      await s.http.close();
+    }
   }
 });
