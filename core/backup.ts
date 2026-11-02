@@ -152,6 +152,7 @@ async function ensureRealDir(dir: string, log: Logger): Promise<void> {
 }
 
 class NoSpace extends Error {}
+class ClientAborted extends Error {}
 /** statfs failed or returned nonsense: the upload is refused (500), never let through unchecked. */
 class StatfsFailed extends Error {
   constructor(readonly why: string) {
@@ -228,13 +229,21 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
   const reserve = minFree;
   const recheckEvery = o.spaceRecheckBytes ?? BACKUP_SPACE_RECHECK_BYTES;
   let mode: PublishMode | undefined;
-  const detectMode = async (incoming: string) => {
-    if (mode) return;
-    mode = await probePublishMode(fsOps, incoming);
-    if (mode === "link") log.info("[backup] publish mode: link (atomic)");
-    else if (mode === "copy") {
-      log.warn("[backup] publish mode: copy (no hard links on BACKUP_ROOT): a crash mid-copy can leave a truncated file under its final name, see README");
-    }
+  /** One probe at a time: concurrent first uploads share it, so the mode is logged once. */
+  let probing: Promise<void> | undefined;
+  const detectMode = (incoming: string): Promise<void> => {
+    if (mode) return Promise.resolve();
+    probing ??= (async () => {
+      const m = await probePublishMode(fsOps, incoming);
+      if (m === "link") log.info("[backup] publish mode: link (atomic)");
+      else if (m === "copy") {
+        log.warn("[backup] publish mode: copy (no hard links on BACKUP_ROOT): a crash mid-copy can leave a truncated file under its final name, see README");
+      }
+      mode = m;
+    })().finally(() => {
+      probing = undefined; // undetermined -> the next upload probes again
+    });
+    return probing;
   };
 
   const configured = (env.BRIDGE_BACKUP_UPLOAD_KEY ?? "").trim();
@@ -309,125 +318,161 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
         return { status: 500, body: { ok: false, error: "write_failed" } };
       };
 
-      // Cheap early 409 (the link() below is what actually guarantees no overwrite).
+      // Track a client disconnect from here on: setup awaits (statfs, mkdir, the
+      // probe) can take a while, and a "close" that fires before the stream
+      // listeners exist would otherwise be missed and the request would hang.
+      const src = req.stream!;
+      let aborted = false;
+      const markAborted = () => {
+        if (!src.readableEnded) aborted = true;
+      };
+      src.once("close", markAborted);
+      src.once("error", markAborted);
       try {
-        await lstat(file);
-        audit("conflict", { status: 409 });
-        return { status: 409, body: { ok: false, error: "exists" } };
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail(err);
+        return await upload();
+      } finally {
+        src.removeListener("close", markAborted);
+        src.removeListener("error", markAborted);
       }
 
-      // Free space before anything is written: free - expected size must stay >= reserve.
-      const expectedBytes = Number.isFinite(declared) && declared >= 0 ? declared : maxBytes;
-      if (reserve > 0) {
+      function gone(): boolean {
+        return aborted || src.readableAborted || (src.destroyed && !src.readableEnded);
+      }
+      function abortedResponse(bytes?: number): HttpResponse {
+        audit("error", { reason: "client_aborted", status: 499, bytes });
+        return { status: 499, body: { ok: false, error: "client_aborted" } };
+      }
+
+      async function upload(): Promise<HttpResponse> {
+        // Cheap early 409 (the link() below is what actually guarantees no overwrite).
         try {
-          await mkdir(root, { recursive: true, mode: 0o750 });
+          await lstat(file);
+          audit("conflict", { status: 409 });
+          return { status: 409, body: { ok: false, error: "exists" } };
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail(err);
+        }
+        if (gone()) return abortedResponse();
+
+        // Free space before anything is written: free - expected size must stay >= reserve.
+        const expectedBytes = Number.isFinite(declared) && declared >= 0 ? declared : maxBytes;
+        if (reserve > 0) {
+          try {
+            await mkdir(root, { recursive: true, mode: 0o750 });
+          } catch (err) {
+            return NO_SPACE.has(errCode(err)) ? noSpace(errCode(err)) : fail(err);
+          }
+          let free: number;
+          try {
+            free = await fsOps.freeBytes(root);
+          } catch (err) {
+            // Fail closed: without a reading we cannot promise the reserve.
+            return fail(new StatfsFailed(errCode(err) || "error"));
+          }
+          if (gone()) return abortedResponse();
+          if (!Number.isFinite(free)) return fail(new StatfsFailed("bad_value"));
+          if (free - expectedBytes < reserve) return noSpace("below_reserve");
+        }
+
+        let temp = "";
+        let fh;
+        try {
+          await ensureRealDir(botDir, log);
+          await ensureRealDir(dir, log);
+          await ensureRealDir(incoming, log);
+          temp = join(incoming, `${randomBytes(12).toString("hex")}.part`);
+          fh = await fsOps.openExcl(temp);
         } catch (err) {
           return NO_SPACE.has(errCode(err)) ? noSpace(errCode(err)) : fail(err);
         }
-        let free: number;
-        try {
-          free = await fsOps.freeBytes(root);
-        } catch (err) {
-          // Fail closed: without a reading we cannot promise the reserve.
-          return fail(new StatfsFailed(errCode(err) || "error"));
+        await detectMode(incoming).catch(() => undefined);
+        if (gone()) {
+          await fh.close().catch(() => undefined);
+          await unlink(temp).catch(() => undefined);
+          return abortedResponse();
         }
-        if (!Number.isFinite(free)) return fail(new StatfsFailed("bad_value"));
-        if (free - expectedBytes < reserve) return noSpace("below_reserve");
-      }
 
-      let temp = "";
-      let fh;
-      try {
-        await ensureRealDir(botDir, log);
-        await ensureRealDir(dir, log);
-        await ensureRealDir(incoming, log);
-        temp = join(incoming, `${randomBytes(12).toString("hex")}.part`);
-        fh = await fsOps.openExcl(temp);
-      } catch (err) {
-        return NO_SPACE.has(errCode(err)) ? noSpace(errCode(err)) : fail(err);
-      }
-      await detectMode(incoming);
-
-      const hash = createHash("sha256");
-      let bytes = 0;
-      let nextCheck = recheckEvery;
-      const meter = new Transform({
-        transform(chunk: Buffer, _enc, cb) {
-          bytes += chunk.length;
-          if (bytes > maxBytes) return cb(new TooLarge("too large"));
-          hash.update(chunk);
-          if (reserve <= 0 || bytes < nextCheck) return cb(null, chunk);
-          nextCheck = bytes + recheckEvery;
-          // Re-check while streaming: other writers share the volume.
-          fsOps.freeBytes(root).then(
-            (free) => (!Number.isFinite(free) ? cb(new StatfsFailed("bad_value")) : free < reserve ? cb(new NoSpace("below reserve")) : cb(null, chunk)),
-            (err) => cb(new StatfsFailed(errCode(err) || "error")),
-          );
-        },
-      });
-      // pipe (not pipeline) for the request side: on 413 the request must stay
-      // open so the core can drain it and the client reads the 413, not a reset.
-      const src = req.stream!;
-      const onAbort = () => {
-        if (!src.readableEnded) meter.destroy(Object.assign(new Error("client aborted"), { code: "ECONNRESET" }));
-      };
-      const onError = (e: Error) => meter.destroy(e);
-      src.once("close", onAbort);
-      src.once("error", onError);
-      src.pipe(meter);
-      let linked = false;
-      try {
-        const handle = fh;
-        // Our own sink (not fh.createWriteStream) so the handle stays open for fsync.
-        const sink = new Writable({
-          write(chunk: Buffer, _enc, cb) {
-            (async () => {
-              let off = 0;
-              while (off < chunk.length) off += await fsOps.write(handle, chunk, off, chunk.length - off);
-            })().then(() => cb(), cb);
+        const hash = createHash("sha256");
+        let bytes = 0;
+        let nextCheck = recheckEvery;
+        const meter = new Transform({
+          transform(chunk: Buffer, _enc, cb) {
+            bytes += chunk.length;
+            if (bytes > maxBytes) return cb(new TooLarge("too large"));
+            hash.update(chunk);
+            if (reserve <= 0 || bytes < nextCheck) return cb(null, chunk);
+            nextCheck = bytes + recheckEvery;
+            // Re-check while streaming: other writers share the volume.
+            fsOps.freeBytes(root).then(
+              (free) => (!Number.isFinite(free) ? cb(new StatfsFailed("bad_value")) : free < reserve ? cb(new NoSpace("below reserve")) : cb(null, chunk)),
+              (err) => cb(new StatfsFailed(errCode(err) || "error")),
+            );
           },
         });
-        await pipeline(meter, sink);
-        await fsOps.sync(fh, temp);
-        await fh.close();
+        // pipe (not pipeline) for the request side: on 413 the request must stay
+        // open so the core can drain it and the client reads the 413, not a reset.
+        const onAbort = () => {
+          if (!src.readableEnded) meter.destroy(new ClientAborted("client aborted"));
+        };
+        const onError = (e: Error) => meter.destroy(e);
+        src.once("close", onAbort);
+        src.once("error", onError);
+        src.pipe(meter);
+        // A disconnect after the last check but before the listeners above.
+        if (gone()) onAbort();
+        let linked = false;
         try {
-          await fsOps.link(temp, file);
+          const handle = fh;
+          // Our own sink (not fh.createWriteStream) so the handle stays open for fsync.
+          const sink = new Writable({
+            write(chunk: Buffer, _enc, cb) {
+              (async () => {
+                let off = 0;
+                while (off < chunk.length) off += await fsOps.write(handle, chunk, off, chunk.length - off);
+              })().then(() => cb(), cb);
+            },
+          });
+          await pipeline(meter, sink);
+          await fsOps.sync(fh, temp);
+          await fh.close();
+          try {
+            await fsOps.link(temp, file);
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code ?? "";
+            if (!NO_HARDLINK.has(code)) throw err;
+            // No hard links here: exclusive copy keeps "never overwrite" (EEXIST -> 409).
+            await copyExclusive(fsOps, temp, file);
+          }
+          linked = true;
         } catch (err) {
-          const code = (err as NodeJS.ErrnoException).code ?? "";
-          if (!NO_HARDLINK.has(code)) throw err;
-          // No hard links here: exclusive copy keeps "never overwrite" (EEXIST -> 409).
-          await copyExclusive(fsOps, temp, file);
+          src.unpipe(meter);
+          await fh.close().catch(() => undefined);
+          if (err instanceof TooLarge) {
+            audit("too_large", { reason: "streamed", status: 413, bytes });
+            return { status: 413, body: { ok: false, error: "body_too_large", maxBytes } };
+          }
+          if (err instanceof NoSpace) return noSpace("below_reserve_streaming", bytes);
+          if (err instanceof ClientAborted || gone()) return abortedResponse(bytes);
+          if (NO_SPACE.has((err as NodeJS.ErrnoException).code ?? "")) return noSpace(String((err as NodeJS.ErrnoException).code), bytes);
+          if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+            audit("conflict", { status: 409, bytes });
+            return { status: 409, body: { ok: false, error: "exists" } };
+          }
+          return fail(err, bytes);
+        } finally {
+          src.removeListener("close", onAbort);
+          src.removeListener("error", onError);
+          await unlink(temp).catch(() => undefined);
         }
-        linked = true;
-      } catch (err) {
-        src.unpipe(meter);
-        await fh.close().catch(() => undefined);
-        if (err instanceof TooLarge) {
-          audit("too_large", { reason: "streamed", status: 413, bytes });
-          return { status: 413, body: { ok: false, error: "body_too_large", maxBytes } };
+        if (linked) {
+          // Best effort: the data is already fsynced; this makes the new name durable too.
+          await syncDir(dir).catch((err) => log.warn(`[backup] directory fsync failed ${(err as NodeJS.ErrnoException).code ?? "error"}`));
         }
-        if (err instanceof NoSpace) return noSpace("below_reserve_streaming", bytes);
-        if (NO_SPACE.has((err as NodeJS.ErrnoException).code ?? "")) return noSpace(String((err as NodeJS.ErrnoException).code), bytes);
-        if ((err as NodeJS.ErrnoException).code === "EEXIST") {
-          audit("conflict", { status: 409, bytes });
-          return { status: 409, body: { ok: false, error: "exists" } };
-        }
-        return fail(err, bytes);
-      } finally {
-        src.removeListener("close", onAbort);
-        src.removeListener("error", onError);
-        await unlink(temp).catch(() => undefined);
+        const sha256 = hash.digest("hex");
+        const path = rel.split(sep).join("/");
+        audit("ok", { status: 201, bytes, sha256 });
+        return { status: 201, body: { path, bytes, sha256 } };
       }
-      if (linked) {
-        // Best effort: the data is already fsynced; this makes the new name durable too.
-        await syncDir(dir).catch((err) => log.warn(`[backup] directory fsync failed ${(err as NodeJS.ErrnoException).code ?? "error"}`));
-      }
-      const sha256 = hash.digest("hex");
-      const path = rel.split(sep).join("/");
-      audit("ok", { status: 201, bytes, sha256 });
-      return { status: 201, body: { path, bytes, sha256 } };
     },
     { stream: true },
   );

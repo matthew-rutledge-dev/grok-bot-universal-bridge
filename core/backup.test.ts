@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { open, type FileHandle } from "node:fs/promises";
+import { link, open, type FileHandle } from "node:fs/promises";
 import { request } from "node:http";
 import { join } from "node:path";
 import { MemoryAudit } from "./audit.js";
@@ -685,5 +685,110 @@ test("publish mode is probed on the first upload and logged once (link, or copy 
     } finally {
       await s.http.close();
     }
+  }
+});
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Send headers and a first chunk of a declared 100 kB body, then disconnect after `ms`. */
+function postAndDisconnect(port: number, query: string, ms: number): void {
+  const req = request({ host: "127.0.0.1", port, method: "POST", path: `/backup/upload?${query}`, headers: { authorization: auth, "content-length": "100000" } });
+  req.on("error", () => undefined);
+  req.write(randomBytes(1000));
+  setTimeout(() => req.destroy(), ms);
+}
+
+async function waitForAudit(audit: MemoryAudit, pred: (l: Record<string, unknown>) => boolean, ms = 2000): Promise<Record<string, unknown>> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const hit = audit.lines.find(pred);
+    if (hit) return hit;
+    await sleep(10);
+  }
+  assert.fail(`no matching audit line within ${ms} ms: ${JSON.stringify(audit.lines)}`);
+}
+
+test("client disconnects during a slow statfs (setup, before streaming): the handler settles, no fd or .part left, audited as an abort", async () => {
+  const handles: FileHandle[] = [];
+  const s = await server({
+    fsOps: {
+      freeBytes: async () => {
+        await sleep(300);
+        return TIB;
+      },
+      openExcl: async (path) => {
+        const fh = await open(path, "wx");
+        handles.push(fh);
+        return fh;
+      },
+    },
+  });
+  try {
+    const t0 = Date.now();
+    postAndDisconnect(s.port, "bot=example-agent&name=gone.bin", 100);
+    const line = await waitForAudit(s.audit, () => true);
+    assert.ok(Date.now() - t0 < 2000);
+    assert.deepEqual([line.outcome, line.reason, line.status], ["error", "client_aborted", 499]);
+    assert.ok(handles.every((h) => h.fd === -1), "every file handle closed");
+    assert.deepEqual(leftovers(s.root), []);
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "gone.bin")), false);
+    assert.equal(s.audit.lines.length, 1);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("client disconnects during the publish-mode probe (temp already open): fd closed, .part removed, audited as an abort", async () => {
+  const handles: FileHandle[] = [];
+  const s = await server({
+    fsOps: {
+      link: async (a, b) => {
+        if (a.endsWith(".probe")) await sleep(300);
+        await link(a, b);
+      },
+      openExcl: async (path) => {
+        const fh = await open(path, "wx");
+        handles.push(fh);
+        return fh;
+      },
+    },
+  });
+  try {
+    postAndDisconnect(s.port, "bot=example-agent&name=gone2.bin", 100);
+    const line = await waitForAudit(s.audit, () => true);
+    assert.deepEqual([line.outcome, line.reason], ["error", "client_aborted"]);
+    assert.equal(handles.length, 1, "the temp file was opened before the abort was seen");
+    assert.equal(handles[0].fd, -1, "and closed");
+    assert.deepEqual(leftovers(s.root), [], "no .part and no probe files");
+    // The server still works afterwards.
+    assert.equal((await post(s.port, "bot=example-agent&name=after.bin", [Buffer.from("ok")], { auth })).status, 201);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("concurrent first uploads share one probe: the mode is probed and logged once", async () => {
+  const lines: string[] = [];
+  let probeLinks = 0;
+  const s = await server({
+    log: { ...silentLogger, info: (m: string) => lines.push(m), warn: (m: string) => lines.push(m) },
+    fsOps: {
+      link: async (a, b) => {
+        if (a.endsWith(".probe")) {
+          probeLinks++;
+          await sleep(100);
+        }
+        await link(a, b);
+      },
+    },
+  });
+  try {
+    const rs = await Promise.all(["p1.bin", "p2.bin", "p3.bin"].map((n) => post(s.port, `bot=example-agent&name=${n}`, [Buffer.from(n)], { auth })));
+    assert.deepEqual(rs.map((r) => r.status), [201, 201, 201]);
+    assert.equal(probeLinks, 1);
+    assert.equal(lines.filter((l) => l.includes("publish mode")).length, 1);
+    assert.deepEqual(leftovers(s.root), []);
+  } finally {
+    await s.http.close();
   }
 });
