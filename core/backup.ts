@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
-import { link, lstat, mkdir, open, unlink } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { copyFile, link, lstat, mkdir, open, statfs, unlink, type FileHandle } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { AuditEntry, AuditSink } from "./audit.js";
@@ -27,13 +28,26 @@ import { consoleLogger, type Logger } from "./types.js";
  * A crash mid-upload can only leave a stray .part under .incoming/, never a
  * file under a real name. `.incoming` cannot clash with an upload: uploads
  * only ever land in a YYYY-MM-DD folder, and that is the only thing `name`
- * can address.
+ * can address. Where the filesystem has no hard links (EPERM, ENOTSUP,
+ * EXDEV, ...) the publish falls back to copyFile with COPYFILE_EXCL, which
+ * keeps the same never-overwrite / 409 semantics.
+ *
+ * Free space: before anything is written, statfs(BACKUP_ROOT) must show
+ * free - (Content-Length, or the cap when absent) >= BACKUP_MIN_FREE_BYTES
+ * (default 5 GiB), else 507. Re-checked every 8 MiB while streaming, and
+ * ENOSPC/EDQUOT also answer 507; the temp file is removed either way.
  */
 export const BACKUP_PATH = "/backup/upload";
 export const BACKUP_MAX_BYTES = 95 * 1024 * 1024;
 export const BACKUP_MIN_KEY_LENGTH = 32;
 export const DEFAULT_BACKUP_ROOT = "/backup";
 export const BACKUP_INCOMING_DIR = ".incoming";
+/** Default free-space reserve: 5 GiB (see README). 0 disables the check. */
+export const DEFAULT_BACKUP_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024;
+/** Free space is re-checked after every this many streamed bytes. */
+export const BACKUP_SPACE_RECHECK_BYTES = 8 * 1024 * 1024;
+const NO_HARDLINK = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS"]);
+const NO_SPACE = new Set(["ENOSPC", "EDQUOT"]);
 const NAME = /^[A-Za-z0-9._-]{1,128}$/;
 /** Windows device names, with or without an extension (CON, nul.txt, COM1.tar.gz, ...). */
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
@@ -49,6 +63,38 @@ export interface BackupOptions {
   maxBytes?: number;
   /** Test hook: clock for the date folder. */
   now?: () => Date;
+  /** Test hooks: filesystem calls that tests need to fail or fake. */
+  fsOps?: Partial<BackupFsOps>;
+  /** Test hook: re-check free space after this many streamed bytes (default 8 MiB). */
+  spaceRecheckBytes?: number;
+}
+
+export interface BackupFsOps {
+  /** Free bytes available to this process on the filesystem holding `path`. */
+  freeBytes(path: string): Promise<number>;
+  link(existing: string, target: string): Promise<void>;
+  copyFileExcl(src: string, dest: string): Promise<void>;
+  /** Write part of a buffer to the temp file; returns bytes written. */
+  write(fh: FileHandle, buf: Buffer, offset: number, length: number): Promise<number>;
+}
+
+const realFsOps: BackupFsOps = {
+  async freeBytes(path) {
+    const st = await statfs(path);
+    return Number(st.bavail) * Number(st.bsize);
+  },
+  link: (a, b) => link(a, b),
+  copyFileExcl: (a, b) => copyFile(a, b, fsConstants.COPYFILE_EXCL),
+  write: async (fh, buf, offset, length) => (await fh.write(buf, offset, length)).bytesWritten,
+};
+
+/** BACKUP_MIN_FREE_BYTES: a non-negative integer of bytes; anything else = undefined (caller warns, uses the default). */
+export function parseMinFree(raw: string | undefined): number | undefined {
+  const v = (raw ?? "").trim();
+  if (!v) return DEFAULT_BACKUP_MIN_FREE_BYTES;
+  if (!/^\d+$/.test(v)) return undefined;
+  const n = Number(v);
+  return Number.isSafeInteger(n) ? n : undefined;
 }
 
 /** null = ok, else a short reason. */
@@ -75,13 +121,6 @@ function bearer(headers: IncomingMessage["headers"]): string {
   return m ? m[1].trim() : "";
 }
 
-/** mkdir -p, then refuse a directory that is (or was swapped for) a symlink. */
-async function ensureRealDir(dir: string): Promise<void> {
-  await mkdir(dir, { recursive: true, mode: 0o750 });
-  const st = await lstat(dir);
-  if (st.isSymbolicLink() || !st.isDirectory()) throw Object.assign(new Error("not a real directory"), { code: "SYMLINK_DIR" });
-}
-
 /** fsync a directory so a new entry survives power loss. Not possible on Windows. */
 async function syncDir(dir: string): Promise<void> {
   if (process.platform === "win32") return;
@@ -93,11 +132,44 @@ async function syncDir(dir: string): Promise<void> {
   }
 }
 
+/**
+ * mkdir -p, then refuse a directory that is (or was swapped for) a symlink.
+ * A directory created here has its parent fsynced (best effort, warn only).
+ */
+async function ensureRealDir(dir: string, log: Logger): Promise<void> {
+  const created = await mkdir(dir, { recursive: true, mode: 0o750 });
+  const st = await lstat(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw Object.assign(new Error("not a real directory"), { code: "SYMLINK_DIR" });
+  if (created !== undefined) {
+    await syncDir(dirname(dir)).catch((err) => log.warn(`[backup] parent directory fsync failed ${(err as NodeJS.ErrnoException).code ?? "error"}`));
+  }
+}
+
+class NoSpace extends Error {}
+
+/** fsync an already-written file by path (after the copy fallback). */
+async function syncFile(path: string): Promise<void> {
+  const fh = await open(path, "r+");
+  try {
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
 export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
   const env = o.env ?? process.env;
   const log = o.log ?? consoleLogger;
   const maxBytes = o.maxBytes ?? BACKUP_MAX_BYTES;
   const now = o.now ?? (() => new Date());
+  const fsOps: BackupFsOps = { ...realFsOps, ...(o.fsOps ?? {}) };
+  let minFree = parseMinFree(env.BACKUP_MIN_FREE_BYTES);
+  if (minFree === undefined) {
+    log.warn(`[backup] BACKUP_MIN_FREE_BYTES is not a whole number of bytes; using the default ${DEFAULT_BACKUP_MIN_FREE_BYTES}`);
+    minFree = DEFAULT_BACKUP_MIN_FREE_BYTES;
+  }
+  const reserve = minFree;
+  const recheckEvery = o.spaceRecheckBytes ?? BACKUP_SPACE_RECHECK_BYTES;
 
   const configured = (env.BRIDGE_BACKUP_UPLOAD_KEY ?? "").trim();
   if (configured && !backupKey(env)) {
@@ -160,6 +232,10 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
         return { status: 400, body: { ok: false, error: "bad_path" } };
       }
 
+      const noSpace = (reason: string, bytes?: number): HttpResponse => {
+        audit("no_space", { reason, status: 507, bytes });
+        return { status: 507, body: { ok: false, error: "insufficient_storage" } };
+      };
       const fail = (err: unknown, bytes?: number): HttpResponse => {
         const code = String((err as NodeJS.ErrnoException).code ?? (err as Error).name ?? "error");
         log.warn(`[backup] upload failed ${code}`);
@@ -176,12 +252,24 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail(err);
       }
 
+      // Free space before anything is written: free - expected size must stay >= reserve.
+      const expectedBytes = Number.isFinite(declared) && declared >= 0 ? declared : maxBytes;
+      if (reserve > 0) {
+        try {
+          await mkdir(root, { recursive: true, mode: 0o750 });
+          const free = await fsOps.freeBytes(root);
+          if (free - expectedBytes < reserve) return noSpace("below_reserve");
+        } catch (err) {
+          return fail(err);
+        }
+      }
+
       let temp = "";
       let fh;
       try {
-        await ensureRealDir(botDir);
-        await ensureRealDir(dir);
-        await ensureRealDir(incoming);
+        await ensureRealDir(botDir, log);
+        await ensureRealDir(dir, log);
+        await ensureRealDir(incoming, log);
         temp = join(incoming, `${randomBytes(12).toString("hex")}.part`);
         fh = await open(temp, "wx", 0o640);
       } catch (err) {
@@ -190,12 +278,19 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
 
       const hash = createHash("sha256");
       let bytes = 0;
+      let nextCheck = recheckEvery;
       const meter = new Transform({
         transform(chunk: Buffer, _enc, cb) {
           bytes += chunk.length;
           if (bytes > maxBytes) return cb(new TooLarge("too large"));
           hash.update(chunk);
-          cb(null, chunk);
+          if (reserve <= 0 || bytes < nextCheck) return cb(null, chunk);
+          nextCheck = bytes + recheckEvery;
+          // Re-check while streaming: other writers share the volume.
+          fsOps.freeBytes(root).then(
+            (free) => (free < reserve ? cb(new NoSpace("below reserve")) : cb(null, chunk)),
+            (err) => cb(err as Error),
+          );
         },
       });
       // pipe (not pipeline) for the request side: on 413 the request must stay
@@ -216,14 +311,30 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
           write(chunk: Buffer, _enc, cb) {
             (async () => {
               let off = 0;
-              while (off < chunk.length) off += (await handle.write(chunk, off, chunk.length - off)).bytesWritten;
+              while (off < chunk.length) off += await fsOps.write(handle, chunk, off, chunk.length - off);
             })().then(() => cb(), cb);
           },
         });
         await pipeline(meter, sink);
         await fh.sync();
         await fh.close();
-        await link(temp, file);
+        try {
+          await fsOps.link(temp, file);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code ?? "";
+          if (!NO_HARDLINK.has(code)) throw err;
+          // No hard links here: exclusive copy keeps "never overwrite" (EEXIST -> 409).
+          let copied = false;
+          try {
+            await fsOps.copyFileExcl(temp, file);
+            copied = true;
+            await syncFile(file);
+          } catch (copyErr) {
+            // A failed copy must not leave a partial file under the real name.
+            if (copied || (copyErr as NodeJS.ErrnoException).code !== "EEXIST") await unlink(file).catch(() => undefined);
+            throw copyErr;
+          }
+        }
         linked = true;
       } catch (err) {
         src.unpipe(meter);
@@ -232,6 +343,8 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
           audit("too_large", { reason: "streamed", status: 413, bytes });
           return { status: 413, body: { ok: false, error: "body_too_large", maxBytes } };
         }
+        if (err instanceof NoSpace) return noSpace("below_reserve_streaming", bytes);
+        if (NO_SPACE.has((err as NodeJS.ErrnoException).code ?? "")) return noSpace(String((err as NodeJS.ErrnoException).code), bytes);
         if ((err as NodeJS.ErrnoException).code === "EEXIST") {
           audit("conflict", { status: 409, bytes });
           return { status: 409, body: { ok: false, error: "exists" } };

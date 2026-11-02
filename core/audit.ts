@@ -57,7 +57,7 @@ export interface AuditEntry {
 }
 
 /** Outcomes of a backup upload attempt. */
-export type BackupOutcome = "auth_fail" | "bad_request" | "conflict" | "too_large";
+export type BackupOutcome = "auth_fail" | "bad_request" | "conflict" | "too_large" | "no_space";
 
 /** actorKeep "full" only ever writes a VIN-shaped actor. */
 const VIN_SHAPED = /^[A-HJ-NPR-Z0-9]{17}$/;

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFil
 import { request } from "node:http";
 import { join } from "node:path";
 import { MemoryAudit } from "./audit.js";
-import { BACKUP_INCOMING_DIR, backupNameProblem, registerBackupRoute } from "./backup.js";
+import { BACKUP_INCOMING_DIR, backupNameProblem, DEFAULT_BACKUP_MIN_FREE_BYTES, parseMinFree, registerBackupRoute, type BackupFsOps } from "./backup.js";
 import { HttpServer } from "./http.js";
 import { Registry } from "./registry.js";
 import { silentLogger, type Logger } from "./types.js";
@@ -15,7 +15,12 @@ const KEY = "test-upload-key-not-a-secret-000000"; // >= 32 chars
 const DAY = "2026-01-02";
 const registry = Registry.fromObject(JSON.parse(readFileSync("config/registry.example.json", "utf8")), {});
 
-async function server(opts: { env?: Record<string, string>; maxBytes?: number; log?: Logger; root?: string } = {}) {
+const TIB = 1024 ** 4;
+const GIB = 1024 ** 3;
+
+async function server(
+  opts: { env?: Record<string, string>; maxBytes?: number; log?: Logger; root?: string; fsOps?: Partial<BackupFsOps>; spaceRecheckBytes?: number } = {},
+) {
   const root = opts.root ?? tmp("ubridge-backup-");
   const audit = new MemoryAudit();
   const http = new HttpServer(silentLogger);
@@ -27,6 +32,9 @@ async function server(opts: { env?: Record<string, string>; maxBytes?: number; l
     root,
     maxBytes: opts.maxBytes,
     now: () => new Date(`${DAY}T23:59:00Z`),
+    // Fake a roomy disk unless a test says otherwise (the runner's real free space varies).
+    fsOps: { freeBytes: async () => TIB, ...(opts.fsOps ?? {}) },
+    spaceRecheckBytes: opts.spaceRecheckBytes,
   });
   const port = await http.listen("127.0.0.1", 0);
   return { root, audit, http, port };
@@ -322,6 +330,177 @@ test("two concurrent uploads of the same name: exactly one 201, the other 409 (l
     const winner = rs.find((r) => r.status === 201)!;
     const stored = readFileSync(join(s.root, "example-agent", DAY, "race.bin"));
     assert.equal(createHash("sha256").update(stored).digest("hex"), winner.body.sha256);
+    assert.deepEqual(leftovers(s.root), []);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("BACKUP_MIN_FREE_BYTES: default 5 GiB, 0 disables, junk warns (without the value mattering) and falls back to the default", async () => {
+  assert.equal(DEFAULT_BACKUP_MIN_FREE_BYTES, 5 * GIB);
+  assert.equal(parseMinFree(undefined), 5 * GIB);
+  assert.equal(parseMinFree(" "), 5 * GIB);
+  assert.equal(parseMinFree("0"), 0);
+  assert.equal(parseMinFree("1073741824"), GIB);
+  for (const bad of ["abc", "-1", "1.5", "5GiB", "1e9", "99999999999999999999"]) assert.equal(parseMinFree(bad), undefined, bad);
+  const warnings: string[] = [];
+  const s = await server({
+    env: { BRIDGE_BACKUP_UPLOAD_KEY: KEY, BACKUP_MIN_FREE_BYTES: "lots" },
+    log: { ...silentLogger, warn: (m: string) => warnings.push(m) },
+    fsOps: { freeBytes: async () => 5 * GIB + 10 },
+  });
+  try {
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /BACKUP_MIN_FREE_BYTES/);
+    // Default reserve applied: 5 GiB + 10 free, 11 bytes declared -> refused.
+    const r = await post(s.port, "bot=example-agent&name=a.bin", [Buffer.alloc(11)], { auth, length: 11 });
+    assert.equal(r.status, 507);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("low space: 507 insufficient_storage before anything is written; the cap counts when Content-Length is absent; reserve 0 skips statfs", async () => {
+  const reserve = 1000;
+  let calls = 0;
+  const s = await server({
+    env: { BRIDGE_BACKUP_UPLOAD_KEY: KEY, BACKUP_MIN_FREE_BYTES: String(reserve) },
+    maxBytes: 4096,
+    fsOps: {
+      freeBytes: async () => {
+        calls++;
+        return reserve + 2000;
+      },
+    },
+  });
+  try {
+    const tooBig = await post(s.port, "bot=example-agent&name=a.bin", [Buffer.alloc(2001)], { auth, length: 2001 });
+    assert.equal(tooBig.status, 507);
+    assert.deepEqual(tooBig.body, { ok: false, error: "insufficient_storage" });
+    // Chunked: the 4096-byte cap is assumed, so even a tiny body is refused.
+    const chunked = await post(s.port, "bot=example-agent&name=b.bin", [Buffer.alloc(10)], { auth });
+    assert.equal(chunked.status, 507);
+    assert.deepEqual(readdirSync(s.root), [], "nothing created under the root");
+    assert.deepEqual(
+      s.audit.lines.map((l) => [l.outcome, l.reason, l.status]),
+      [
+        ["no_space", "below_reserve", 507],
+        ["no_space", "below_reserve", 507],
+      ],
+    );
+    // Fits exactly: free - declared == reserve.
+    const fits = await post(s.port, "bot=example-agent&name=c.bin", [Buffer.alloc(2000)], { auth, length: 2000 });
+    assert.equal(fits.status, 201);
+    assert.equal(calls, 3);
+  } finally {
+    await s.http.close();
+  }
+  const off = await server({
+    env: { BRIDGE_BACKUP_UPLOAD_KEY: KEY, BACKUP_MIN_FREE_BYTES: "0" },
+    fsOps: {
+      freeBytes: async () => {
+        throw new Error("statfs must not be called");
+      },
+    },
+  });
+  try {
+    assert.equal((await post(off.port, "bot=example-agent&name=a.bin", [Buffer.from("x")], { auth })).status, 201);
+  } finally {
+    await off.http.close();
+  }
+});
+
+test("space re-checked while streaming: dropping below the reserve mid-upload gives 507, temp removed, no final file", async () => {
+  let calls = 0;
+  const s = await server({
+    env: { BRIDGE_BACKUP_UPLOAD_KEY: KEY, BACKUP_MIN_FREE_BYTES: "1000" },
+    spaceRecheckBytes: 1024,
+    fsOps: { freeBytes: async () => (++calls === 1 ? TIB : 999) },
+  });
+  try {
+    const r = await post(s.port, "bot=example-agent&name=grow.bin", [randomBytes(800), randomBytes(800), randomBytes(800)], { auth });
+    assert.equal(r.status, 507);
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "grow.bin")), false);
+    assert.deepEqual(leftovers(s.root), []);
+    assert.equal(s.audit.lines.at(-1)?.reason, "below_reserve_streaming");
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("ENOSPC mid-stream: 507, empty .incoming, no final file, and the server keeps serving", async () => {
+  let writes = 0;
+  let full = true;
+  const s = await server({
+    fsOps: {
+      write: async (fh, buf, offset, length) => {
+        if (full && ++writes > 1) throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+        return (await fh.write(buf, offset, length)).bytesWritten;
+      },
+    },
+  });
+  try {
+    const r = await post(s.port, "bot=example-agent&name=full.bin", [randomBytes(70_000), randomBytes(70_000), randomBytes(70_000)], { auth });
+    assert.equal(r.status, 507);
+    assert.deepEqual(r.body, { ok: false, error: "insufficient_storage" });
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "full.bin")), false);
+    assert.deepEqual(leftovers(s.root), []);
+    assert.deepEqual([s.audit.lines.at(-1)?.outcome, s.audit.lines.at(-1)?.reason], ["no_space", "ENOSPC"]);
+    full = false;
+    assert.equal((await post(s.port, "bot=example-agent&name=full.bin", [Buffer.from("fits now")], { auth })).status, 201);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("no hard links (link fails EPERM/ENOTSUP/EXDEV): exclusive copy publishes the file; a name that appears meanwhile still gives 409", async () => {
+  for (const code of ["EPERM", "ENOTSUP", "EXDEV"]) {
+    let racer = false;
+    const s = await server({
+      fsOps: {
+        link: async (_temp, final) => {
+          // Simulate another upload winning the name between the early check and the publish.
+          if (racer) writeFileSync(final, "someone else");
+          throw Object.assign(new Error("hard links unsupported"), { code });
+        },
+      },
+    });
+    try {
+      const body = randomBytes(100_000);
+      const r = await post(s.port, "bot=example-agent&name=copy.bin", [body], { auth });
+      assert.equal(r.status, 201, code);
+      const stored = readFileSync(join(s.root, "example-agent", DAY, "copy.bin"));
+      assert.equal(createHash("sha256").update(stored).digest("hex"), r.body.sha256);
+      assert.equal(r.body.sha256, createHash("sha256").update(body).digest("hex"));
+      assert.deepEqual(leftovers(s.root), []);
+
+      racer = true;
+      const dup = await post(s.port, "bot=example-agent&name=raced.bin", [Buffer.from("mine")], { auth });
+      assert.equal(dup.status, 409, code);
+      assert.equal(readFileSync(join(s.root, "example-agent", DAY, "raced.bin"), "utf8"), "someone else", "never overwritten");
+      assert.deepEqual(leftovers(s.root), []);
+    } finally {
+      await s.http.close();
+    }
+  }
+});
+
+test("any other link error is a 500 (no copy fallback), temp removed", async () => {
+  const s = await server({
+    fsOps: {
+      link: async () => {
+        throw Object.assign(new Error("io"), { code: "EIO" });
+      },
+      copyFileExcl: async () => {
+        throw new Error("copy must not be tried");
+      },
+    },
+  });
+  try {
+    const r = await post(s.port, "bot=example-agent&name=a.bin", [Buffer.from("x")], { auth });
+    assert.equal(r.status, 500);
+    assert.equal(s.audit.lines.at(-1)?.reason, "EIO");
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "a.bin")), false);
     assert.deepEqual(leftovers(s.root), []);
   } finally {
     await s.http.close();

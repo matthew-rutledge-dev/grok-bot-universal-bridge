@@ -64,7 +64,8 @@ test("POST /backup/upload is wired: 404 without BRIDGE_BACKUP_UPLOAD_KEY, writes
   const root = tmp("ubridge-svc-backup-");
   const on = await buildService(file, {
     discordPort: new FakeDiscordPort(BOT),
-    env: { BRIDGE_BACKUP_UPLOAD_KEY: "svc-test-key-0123456789abcdef-0000", BACKUP_ROOT: root },
+    // Reserve 1 byte: exercises the real statfs without depending on the runner's free space.
+    env: { BRIDGE_BACKUP_UPLOAD_KEY: "svc-test-key-0123456789abcdef-0000", BACKUP_ROOT: root, BACKUP_MIN_FREE_BYTES: "1" },
     log: silentLogger,
   });
   const port = await on.http.listen("127.0.0.1", 0);
