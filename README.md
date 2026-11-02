@@ -48,12 +48,35 @@ docker compose up -d
   ```
 * `http.publicBaseUrl` is only needed when an enabled adapter has a live callback route (its `callbackTokenRef` is set). Startup fails with a clear message if it's missing then.
 
+## Backup upload
+
+A write-only drop for bot backups. Off by default: with `BRIDGE_BACKUP_UPLOAD_KEY` unset or empty the route answers 404 like any unknown path.
+
+| Env | Meaning |
+|---|---|
+| `BRIDGE_BACKUP_UPLOAD_KEY` | Bearer key for uploads (host `.env` only, never in git). Unset/empty = route disabled. |
+| `BACKUP_ROOT` | Directory uploads land in, inside the container. Default `/backup`; bind-mount a host dir there (see `compose.example.yml`), writable by the container's `bridge` user. |
+
+```bash
+curl -sS -X POST --data-binary @db.sqlite.gz \
+  -H "Authorization: Bearer $BRIDGE_BACKUP_UPLOAD_KEY" \
+  "https://bridge.example.com/backup/upload?bot=example-agent&name=db.sqlite.gz"
+# 201 {"path":"example-agent/2026-01-02/db.sqlite.gz","bytes":12345,"sha256":"<hex>"}
+```
+
+* `POST /backup/upload?bot=<alias>&name=<file>`: `bot` must be a registry alias; `name` must match `^[A-Za-z0-9._-]{1,128}$` and not be `.` or `..`.
+* The body is streamed (never buffered) to `<BACKUP_ROOT>/<alias>/<YYYY-MM-DD, UTC>/<name>`, created with `O_EXCL`. `path` in the answer is relative to `BACKUP_ROOT`; `sha256` is computed while streaming, so the client can compare it with its own.
+* Answers: `201` stored; `400` bad alias/name (or `?token=`); `401` no key; `403` wrong key; `404` disabled; `409` that name already exists for that bot today (nothing is overwritten); `413` over 95 MiB (by `Content-Length` up front, or counted while streaming); `500` write failed. A failed, aborted or oversize upload leaves no partial file.
+* One `audit.jsonl` line per attempt: `adapter: "backup"`, `action: "upload"`, `outcome` (`ok`, `auth_fail`, `bad_request`, `conflict`, `too_large`, `error`), `agent` (the alias), `name`, `bytes`, `sha256`, `status`. Never the body or the key.
+* There are no list, read, delete or overwrite routes. Retention and pruning are the host's job.
+* A reverse proxy in front must allow bodies up to 95 MiB on this path.
+
 ## Rules
 
 * Real config, `registry.json` and `.env` live only on the deployment host, and the registry is mounted read-only. Git holds examples only (see `.gitignore`).
 * **Registry aliases are lowercase** (`a-z 0-9 . _ -`, starting with a letter or digit). They are case-sensitive and are not normalised: a mixed-case alias is rejected with a "rename it to …" message, and an adapter route (e.g. a Discord route's `agent`) that differs from a registry alias only by case fails at startup. Write aliases in lowercase everywhere.
 * Config holds secret **references** (`env:NAME`, `file:/path`). Literal secrets are refused.
-* The service binds loopback only. Put the tunnel in front of it and route by path: `/discord/*`, `/grokbuild/*`, `/tesla/*`.
+* The service binds loopback only. Put the tunnel in front of it and route by path: `/discord/*`, `/grokbuild/*`, `/tesla/*` (and `/backup/upload` if backups are enabled).
 * Marketplace plugins stay thin clients: a bridge URL plus their own client token.
 
 ## License
