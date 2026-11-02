@@ -49,3 +49,37 @@ test("a Discord route that references an alias in the wrong case fails at startu
     /discord\.routes\[0\]: agent "Example-Agent" must be lowercase "example-agent"/,
   );
 });
+
+test("POST /backup/upload is wired: 404 without BRIDGE_BACKUP_UPLOAD_KEY, writes under BACKUP_ROOT with it", async () => {
+  const file = hostDir({ publicBaseUrl: "https://bridge.example.com" });
+  const off = await build(file);
+  // Only the HTTP side is needed (start() would also connect the Discord adapter).
+  const offPort = await off.http.listen("127.0.0.1", 0);
+  try {
+    const r = await fetch(`http://127.0.0.1:${offPort}/backup/upload?bot=example-agent&name=a.bin`, { method: "POST", body: "x" });
+    assert.equal(r.status, 404);
+  } finally {
+    await off.http.close();
+  }
+  const root = tmp("ubridge-svc-backup-");
+  const on = await buildService(file, {
+    discordPort: new FakeDiscordPort(BOT),
+    // Reserve 1 byte: exercises the real statfs without depending on the runner's free space.
+    env: { BRIDGE_BACKUP_UPLOAD_KEY: "svc-test-key-0123456789abcdef-0000", BACKUP_ROOT: root, BACKUP_MIN_FREE_BYTES: "1" },
+    log: silentLogger,
+  });
+  const port = await on.http.listen("127.0.0.1", 0);
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/backup/upload?bot=example-agent&name=a.bin`, {
+      method: "POST",
+      headers: { authorization: "Bearer svc-test-key-0123456789abcdef-0000" },
+      body: "hello",
+    });
+    assert.equal(r.status, 201);
+    const body = (await r.json()) as { path: string; bytes: number };
+    assert.equal(body.bytes, 5);
+    assert.equal(readFileSync(join(root, ...body.path.split("/")), "utf8"), "hello");
+  } finally {
+    await on.http.close();
+  }
+});

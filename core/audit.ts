@@ -24,13 +24,15 @@ export type AuditAction =
   | "attachment"
   | "planner"
   | "voice"
+  /** A backup file upload (POST /backup/upload). */
+  | "upload"
   /** A source's upstream connection (e.g. the Tesla MQTT broker): connected / disconnected / connect_failed. */
   | "connection";
 
 export interface AuditEntry {
   adapter: string;
   action: AuditAction;
-  outcome: "allow" | "deny" | "ok" | "error" | "held" | "skipped";
+  outcome: "allow" | "deny" | "ok" | "error" | "held" | "skipped" | BackupOutcome;
   reason?: string;
   agent?: string;
   route?: string;
@@ -49,11 +51,17 @@ export interface AuditEntry {
   count?: number;
   bytes?: number;
   kinds?: string;
+  /** Backup uploads only: the validated file name (^[A-Za-z0-9._-]{1,128}$) and the sha256 hex of the stored bytes. */
+  name?: string;
+  sha256?: string;
 }
+
+/** Outcomes of a backup upload attempt. */
+export type BackupOutcome = "auth_fail" | "bad_request" | "conflict" | "too_large" | "no_space";
 
 /** actorKeep "full" only ever writes a VIN-shaped actor. */
 const VIN_SHAPED = /^[A-HJ-NPR-Z0-9]{17}$/;
-const KEEP = ["adapter", "action", "outcome", "reason", "agent", "route", "type", "status", "tries", "ms", "count", "bytes", "kinds"] as const;
+const KEEP = ["adapter", "action", "outcome", "reason", "agent", "route", "type", "status", "tries", "ms", "count", "bytes", "kinds", "name", "sha256"] as const;
 const MASK = ["eventId", "lane", "actor"] as const;
 
 export interface AuditSink {
@@ -66,7 +74,7 @@ export function auditLine(entry: AuditEntry, now = new Date()): Record<string, u
   for (const k of KEEP) {
     const v = src[k];
     if (v === undefined || v === null) continue;
-    out[k] = typeof v === "string" ? v.replace(/[\u0000-\u001f]/g, " ").slice(0, 80) : v;
+    out[k] = typeof v === "string" ? v.replace(/[\u0000-\u001f]/g, " ").slice(0, k === "name" ? 128 : 80) : v;
   }
   for (const k of MASK) {
     const v = src[k];
