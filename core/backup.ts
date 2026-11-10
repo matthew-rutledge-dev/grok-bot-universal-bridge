@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { link, lstat, mkdir, open, statfs, unlink, type FileHandle } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
+import { isIP } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -38,6 +39,14 @@ import { consoleLogger, type Logger } from "./types.js";
  * free - (Content-Length, or the cap when absent) >= BACKUP_MIN_FREE_BYTES
  * (default 5 GiB), else 507. Re-checked every 8 MiB while streaming, and
  * ENOSPC/EDQUOT also answer 507; the temp file is removed either way.
+ *
+ * Optional `X-Content-SHA256: <64 hex>`: the digest is compared with the
+ * hash already computed while streaming. A mismatch answers 422 and the
+ * temp file is removed (nothing is published). A malformed header answers
+ * 400 before anything is written. Absent header = no check.
+ *
+ * Every audit line includes `ip`: the socket remote address, or
+ * `CF-Connecting-IP` only when that peer is loopback (the trusted tunnel).
  */
 export const BACKUP_PATH = "/backup/upload";
 export const BACKUP_MAX_BYTES = 95 * 1024 * 1024;
@@ -116,6 +125,80 @@ export function backupNameProblem(name: string | null): string | null {
 export function backupKey(env: SecretEnv): string {
   const k = (env.BRIDGE_BACKUP_UPLOAD_KEY ?? "").trim();
   return k.length >= BACKUP_MIN_KEY_LENGTH ? k : "";
+}
+
+/** Strip brackets / zone ids and unwrap IPv4-mapped IPv6 (`::ffff:127.0.0.1` -> `127.0.0.1`). */
+export function normalizeIp(addr: string): string {
+  const raw = addr.trim().replace(/^\[|\]$/g, "").split("%")[0] ?? "";
+  const dotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(raw);
+  if (dotted) return dotted[1];
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(raw);
+  if (hex) {
+    const hi = Number.parseInt(hex[1], 16);
+    const lo = Number.parseInt(hex[2], 16);
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+  }
+  return raw;
+}
+
+/** True for 127.0.0.0/8 and IPv6 loopback, including IPv4-mapped forms. */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  if (!addr) return false;
+  const a = normalizeIp(addr);
+  if (a === "::1" || a === "0:0:0:0:0:0:0:1") return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(a);
+  if (!m) return false;
+  const o = m.slice(1).map(Number);
+  return o[0] === 127 && o.every((n) => n <= 255);
+}
+
+function singleIp(raw: string | string[] | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (Array.isArray(raw)) {
+    if (raw.length !== 1) return undefined;
+    raw = raw[0];
+  }
+  if (typeof raw !== "string") return undefined;
+  const v = raw.trim();
+  if (!v || /[,\s]/.test(v)) return undefined;
+  const ip = normalizeIp(v);
+  return isIP(ip) ? ip : undefined;
+}
+
+/**
+ * IP recorded on every backup audit line: the socket peer, except
+ * `CF-Connecting-IP` is used when that peer is loopback (trusted tunnel).
+ * A missing or invalid header falls back to the socket address. The header
+ * is never trusted from any other peer.
+ */
+export function backupUploaderIp(
+  socketRemote: string | undefined,
+  cfConnectingIp: string | string[] | undefined,
+): string | undefined {
+  const socket = typeof socketRemote === "string" && socketRemote.trim() ? normalizeIp(socketRemote) : undefined;
+  if (isLoopbackAddress(socket)) {
+    const forwarded = singleIp(cfConnectingIp);
+    if (forwarded) return forwarded;
+  }
+  return socket;
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/**
+ * Optional `X-Content-SHA256` value. `expected: null` means the header was
+ * absent (do not check). `{ ok: false }` means it was present but not a 64-char hex digest.
+ */
+export function parseContentSha256(raw: string | string[] | undefined): { ok: true; expected: string | null } | { ok: false } {
+  if (raw === undefined) return { ok: true, expected: null };
+  if (Array.isArray(raw)) {
+    if (raw.length !== 1) return { ok: false };
+    raw = raw[0];
+  }
+  if (typeof raw !== "string") return { ok: false };
+  const v = raw.trim().toLowerCase();
+  if (!SHA256_HEX.test(v)) return { ok: false };
+  return { ok: true, expected: v };
 }
 
 class TooLarge extends Error {}
@@ -261,8 +344,9 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
 
       const bot = req.query.get("bot") ?? "";
       const name = req.query.get("name");
+      const ip = backupUploaderIp(req.stream?.socket?.remoteAddress, req.headers["cf-connecting-ip"]);
       const audit = (outcome: AuditEntry["outcome"], extra: Partial<AuditEntry> = {}) =>
-        o.audit.write({ adapter: "backup", action: "upload", outcome, agent: bot || undefined, name: name ?? undefined, ...extra });
+        o.audit.write({ adapter: "backup", action: "upload", outcome, agent: bot || undefined, name: name ?? undefined, ip, ...extra });
 
       if (req.query.has("token") || req.query.has("key")) {
         audit("bad_request", { reason: "query_token_refused", status: 400 });
@@ -294,6 +378,13 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
         audit("too_large", { reason: "content_length", status: 413 });
         return { status: 413, body: { ok: false, error: "body_too_large", maxBytes } };
       }
+
+      const shaHeader = parseContentSha256(req.headers["x-content-sha256"]);
+      if (!shaHeader.ok) {
+        audit("bad_request", { reason: "sha256_header_invalid", status: 400 });
+        return { status: 400, body: { ok: false, error: "sha256_header_invalid" } };
+      }
+      const expectedSha = shaHeader.expected;
 
       const root = resolve(o.root ?? (env.BACKUP_ROOT?.trim() || DEFAULT_BACKUP_ROOT));
       const botDir = resolve(root, bot);
@@ -394,6 +485,7 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
 
         const hash = createHash("sha256");
         let bytes = 0;
+        let sha256 = "";
         let nextCheck = recheckEvery;
         const meter = new Transform({
           transform(chunk: Buffer, _enc, cb) {
@@ -435,6 +527,11 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
           await pipeline(meter, sink);
           await fsOps.sync(fh, temp);
           await fh.close();
+          sha256 = hash.digest("hex");
+          if (expectedSha && sha256 !== expectedSha) {
+            audit("bad_request", { reason: "sha256_mismatch", status: 422, bytes, sha256 });
+            return { status: 422, body: { ok: false, error: "sha256_mismatch" } };
+          }
           try {
             await fsOps.link(temp, file);
           } catch (err) {
@@ -468,7 +565,6 @@ export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
           // Best effort: the data is already fsynced; this makes the new name durable too.
           await syncDir(dir).catch((err) => log.warn(`[backup] directory fsync failed ${(err as NodeJS.ErrnoException).code ?? "error"}`));
         }
-        const sha256 = hash.digest("hex");
         const path = rel.split(sep).join("/");
         audit("ok", { status: 201, bytes, sha256 });
         return { status: 201, body: { path, bytes, sha256 } };

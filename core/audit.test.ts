@@ -26,6 +26,22 @@ test("audit masks ids and drops anything outside the allow list", () => {
   assert.match(String(line.ts), /^\d{4}-\d\d-\d\dT/);
 });
 
+test("audit keeps backup ip and still drops anything outside the allow list", () => {
+  const line = auditLine({
+    adapter: "backup",
+    action: "upload",
+    outcome: "ok",
+    ip: "192.0.2.80",
+    sha256: "a".repeat(64),
+    name: "db.sqlite.gz",
+    // @ts-expect-error not an audit field: must be dropped
+    token: "k1",
+  });
+  assert.equal(line.ip, "192.0.2.80");
+  assert.equal(line.name, "db.sqlite.gz");
+  assert.equal("token" in line, false);
+});
+
 test("actorKeep: default 4, 6 keeps six, \"full\" writes a VIN-shaped actor unmasked and anything else as invalid; other ids stay masked", () => {
   const base = { adapter: "tesla", action: "observe" as const, outcome: "ok" as const, eventId: "tesla:555555555555555555", lane: "vehicle:…MPLE" };
   assert.equal(auditLine({ ...base, actor: "5YJ0000000EXAMPLE" }).actor, "…MPLE");

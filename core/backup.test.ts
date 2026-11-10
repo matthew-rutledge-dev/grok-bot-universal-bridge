@@ -6,7 +6,7 @@ import { link, open, type FileHandle } from "node:fs/promises";
 import { request } from "node:http";
 import { join } from "node:path";
 import { MemoryAudit } from "./audit.js";
-import { BACKUP_INCOMING_DIR, backupNameProblem, DEFAULT_BACKUP_MIN_FREE_BYTES, parseMinFree, registerBackupRoute, type BackupFsOps } from "./backup.js";
+import { BACKUP_INCOMING_DIR, backupNameProblem, backupUploaderIp, DEFAULT_BACKUP_MIN_FREE_BYTES, isLoopbackAddress, normalizeIp, parseContentSha256, parseMinFree, registerBackupRoute, type BackupFsOps } from "./backup.js";
 import { HttpServer } from "./http.js";
 import { Registry } from "./registry.js";
 import { silentLogger, type Logger } from "./types.js";
@@ -46,10 +46,10 @@ function post(
   port: number,
   query: string,
   chunks: Buffer[],
-  o: { auth?: string; length?: number; abortAfterFirst?: boolean } = {},
+  o: { auth?: string; length?: number; abortAfterFirst?: boolean; headers?: Record<string, string> } = {},
 ): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => {
-    const headers: Record<string, string> = { "content-type": "application/octet-stream" };
+    const headers: Record<string, string> = { "content-type": "application/octet-stream", ...(o.headers ?? {}) };
     if (o.auth !== undefined) headers.authorization = o.auth;
     if (o.length !== undefined) headers["content-length"] = String(o.length);
     const req = request({ host: "127.0.0.1", port, method: "POST", path: `/backup/upload?${query}`, headers }, (res) => {
@@ -788,6 +788,145 @@ test("concurrent first uploads share one probe: the mode is probed and logged on
     assert.equal(probeLinks, 1);
     assert.equal(lines.filter((l) => l.includes("publish mode")).length, 1);
     assert.deepEqual(leftovers(s.root), []);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("uploader IP: socket address, CF-Connecting-IP only from a loopback peer, never from other peers", () => {
+  assert.equal(normalizeIp("::ffff:127.0.0.1"), "127.0.0.1");
+  assert.equal(normalizeIp("[::ffff:127.0.0.1]"), "127.0.0.1");
+  assert.equal(normalizeIp("::ffff:7f00:1"), "127.0.0.1");
+  assert.equal(isLoopbackAddress("127.0.0.1"), true);
+  assert.equal(isLoopbackAddress("127.255.255.254"), true);
+  assert.equal(isLoopbackAddress("::1"), true);
+  assert.equal(isLoopbackAddress("0:0:0:0:0:0:0:1"), true);
+  assert.equal(isLoopbackAddress("::ffff:127.0.0.1"), true);
+  assert.equal(isLoopbackAddress("192.0.2.1"), false);
+  assert.equal(isLoopbackAddress("::ffff:192.0.2.1"), false);
+  assert.equal(isLoopbackAddress("2001:db8::1"), false);
+  assert.equal(isLoopbackAddress(""), false);
+  assert.equal(isLoopbackAddress(undefined), false);
+
+  // No header: record the (normalized) socket address.
+  assert.equal(backupUploaderIp("127.0.0.1", undefined), "127.0.0.1");
+  assert.equal(backupUploaderIp("::ffff:127.0.0.1", undefined), "127.0.0.1");
+  assert.equal(backupUploaderIp("192.0.2.10", undefined), "192.0.2.10");
+  assert.equal(backupUploaderIp(undefined, undefined), undefined);
+
+  // Loopback peer: a valid CF-Connecting-IP is used.
+  assert.equal(backupUploaderIp("127.0.0.1", "192.0.2.80"), "192.0.2.80");
+  assert.equal(backupUploaderIp("::1", "198.51.100.9"), "198.51.100.9");
+  assert.equal(backupUploaderIp("::ffff:127.0.0.1", "2001:db8::80"), "2001:db8::80");
+  assert.equal(backupUploaderIp("127.0.0.1", "  203.0.113.7  "), "203.0.113.7");
+
+  // Loopback peer, missing or invalid header: fall back to the socket.
+  assert.equal(backupUploaderIp("127.0.0.1", ""), "127.0.0.1");
+  assert.equal(backupUploaderIp("127.0.0.1", "not-an-ip"), "127.0.0.1");
+  assert.equal(backupUploaderIp("127.0.0.1", "example.com"), "127.0.0.1");
+  assert.equal(backupUploaderIp("127.0.0.1", "192.0.2.80, 198.51.100.9"), "127.0.0.1");
+  assert.equal(backupUploaderIp("127.0.0.1", ["192.0.2.80", "198.51.100.9"]), "127.0.0.1");
+  assert.equal(backupUploaderIp("127.0.0.1", ["192.0.2.80"]), "192.0.2.80");
+
+  // Non-loopback peer: the header is ignored even when it is a valid IP.
+  assert.equal(backupUploaderIp("192.0.2.10", "198.51.100.9"), "192.0.2.10");
+  assert.equal(backupUploaderIp("::ffff:192.0.2.10", "198.51.100.9"), "192.0.2.10");
+  assert.equal(backupUploaderIp("2001:db8::10", "192.0.2.80"), "2001:db8::10");
+
+  // Unknown peer: do not trust the header.
+  assert.equal(backupUploaderIp(undefined, "192.0.2.80"), undefined);
+  assert.equal(backupUploaderIp("", "192.0.2.80"), undefined);
+});
+
+test("X-Content-SHA256: parse a 64-char hex digest, reject anything else, treat absence as no check", () => {
+  const hex = "a".repeat(64);
+  assert.deepEqual(parseContentSha256(undefined), { ok: true, expected: null });
+  assert.deepEqual(parseContentSha256(hex), { ok: true, expected: hex });
+  assert.deepEqual(parseContentSha256(hex.toUpperCase()), { ok: true, expected: hex });
+  assert.deepEqual(parseContentSha256(`  ${hex.toUpperCase()}  `), { ok: true, expected: hex });
+  assert.deepEqual(parseContentSha256([hex]), { ok: true, expected: hex });
+  assert.equal(parseContentSha256("").ok, false);
+  assert.equal(parseContentSha256("  ").ok, false);
+  assert.equal(parseContentSha256("not-hex").ok, false);
+  assert.equal(parseContentSha256("a".repeat(63)).ok, false);
+  assert.equal(parseContentSha256("a".repeat(65)).ok, false);
+  assert.equal(parseContentSha256(`sha256:${hex}`).ok, false);
+  assert.equal(parseContentSha256([hex, hex]).ok, false);
+});
+
+test("audit records the socket IP; CF-Connecting-IP is used only because the test client is loopback", async () => {
+  const s = await server();
+  try {
+    const r = await post(s.port, "bot=example-agent&name=a.bin", [Buffer.from("x")], { auth });
+    assert.equal(r.status, 201);
+    assert.equal(s.audit.lines[0].ip, "127.0.0.1");
+
+    const r2 = await post(s.port, "bot=example-agent&name=b.bin", [Buffer.from("y")], {
+      auth,
+      headers: { "cf-connecting-ip": "192.0.2.80" },
+    });
+    assert.equal(r2.status, 201);
+    assert.equal(s.audit.lines[1].ip, "192.0.2.80");
+
+    // Auth failure still records ip (every audit line).
+    assert.equal((await post(s.port, "bot=example-agent&name=c.bin", [Buffer.from("z")])).status, 401);
+    assert.equal(s.audit.lines[2].ip, "127.0.0.1");
+    assert.equal(s.audit.lines[2].outcome, "auth_fail");
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("X-Content-SHA256 match: 201, file stored, uppercase hex accepted; mismatch: 422, temp removed, name can be retried", async () => {
+  const s = await server();
+  try {
+    const body = Buffer.from("checksum-me");
+    const sha = createHash("sha256").update(body).digest("hex");
+    const ok = await post(s.port, "bot=example-agent&name=ok.bin", [body], {
+      auth,
+      headers: { "x-content-sha256": sha.toUpperCase() },
+    });
+    assert.equal(ok.status, 201);
+    assert.equal(ok.body.sha256, sha);
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "ok.bin")), true);
+    const okLine = s.audit.lines.find((l) => l.name === "ok.bin");
+    assert.deepEqual([okLine?.outcome, okLine?.status, okLine?.sha256, okLine?.ip], ["ok", 201, sha, "127.0.0.1"]);
+
+    const bad = await post(s.port, "bot=example-agent&name=bad.bin", [body], {
+      auth,
+      headers: { "x-content-sha256": "b".repeat(64) },
+    });
+    assert.equal(bad.status, 422);
+    assert.deepEqual(bad.body, { ok: false, error: "sha256_mismatch" });
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "bad.bin")), false);
+    assert.deepEqual(leftovers(s.root), [], "temp .part removed after mismatch");
+    const miss = s.audit.lines.find((l) => l.name === "bad.bin");
+    assert.deepEqual([miss?.outcome, miss?.reason, miss?.status, miss?.sha256, miss?.bytes], ["bad_request", "sha256_mismatch", 422, sha, body.length]);
+
+    const retry = await post(s.port, "bot=example-agent&name=bad.bin", [body], { auth, headers: { "x-content-sha256": sha } });
+    assert.equal(retry.status, 201);
+    assert.equal(existsSync(join(s.root, "example-agent", DAY, "bad.bin")), true);
+  } finally {
+    await s.http.close();
+  }
+});
+
+test("malformed X-Content-SHA256: 400 before anything is written; absent header is unchanged", async () => {
+  const s = await server();
+  try {
+    for (const value of ["", "nope", "a".repeat(63), "sha256:" + "a".repeat(64)]) {
+      const r = await post(s.port, "bot=example-agent&name=skip.bin", [Buffer.from("x")], {
+        auth,
+        headers: { "x-content-sha256": value },
+      });
+      assert.equal(r.status, 400, value);
+      assert.deepEqual(r.body, { ok: false, error: "sha256_header_invalid" });
+    }
+    assert.deepEqual(readdirSync(s.root), []);
+    assert.ok(s.audit.lines.every((l) => l.outcome === "bad_request" && l.reason === "sha256_header_invalid" && l.status === 400 && l.ip === "127.0.0.1"));
+
+    const plain = await post(s.port, "bot=example-agent&name=skip.bin", [Buffer.from("x")], { auth });
+    assert.equal(plain.status, 201);
   } finally {
     await s.http.close();
   }

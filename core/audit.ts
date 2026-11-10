@@ -8,7 +8,9 @@ import { maskId } from "./redact.js";
  * One line per decision: ts, adapter, action, outcome, reason, agent alias,
  * and MASKED ids (last 4 characters; actorKeep "full" writes a VIN-shaped actor
  * unmasked, used by the Tesla adapter). Never message text, prompts, URLs,
- * keys or tokens: fields outside the allow list below are dropped.
+ * keys or tokens: fields outside the allow list below are dropped. Backup
+ * upload lines also keep `ip` (socket address, or CF-Connecting-IP only from
+ * a loopback peer).
  */
 export type AuditAction =
   | "inbound"
@@ -54,6 +56,8 @@ export interface AuditEntry {
   /** Backup uploads only: the validated file name (^[A-Za-z0-9._-]{1,128}$) and the sha256 hex of the stored bytes. */
   name?: string;
   sha256?: string;
+  /** Backup uploads only: socket remote address, or CF-Connecting-IP when the socket peer is loopback. */
+  ip?: string;
 }
 
 /** Outcomes of a backup upload attempt. */
@@ -61,7 +65,7 @@ export type BackupOutcome = "auth_fail" | "bad_request" | "conflict" | "too_larg
 
 /** actorKeep "full" only ever writes a VIN-shaped actor. */
 const VIN_SHAPED = /^[A-HJ-NPR-Z0-9]{17}$/;
-const KEEP = ["adapter", "action", "outcome", "reason", "agent", "route", "type", "status", "tries", "ms", "count", "bytes", "kinds", "name", "sha256"] as const;
+const KEEP = ["adapter", "action", "outcome", "reason", "agent", "route", "type", "status", "tries", "ms", "count", "bytes", "kinds", "name", "sha256", "ip"] as const;
 const MASK = ["eventId", "lane", "actor"] as const;
 
 export interface AuditSink {
