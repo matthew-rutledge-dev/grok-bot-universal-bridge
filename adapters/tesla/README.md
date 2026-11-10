@@ -6,6 +6,25 @@ The bridge's half of the Tesla split. It turns vehicle telemetry and energy-site
 * **Plugin:** the reference Tesla plugin is [`grokbot-vehicle-fleet`](https://github.com/matthew-rutledge-dev/grokbot-vehicle-fleet) (any plugin that exports an access token the same way works; the token export needs 0.3.3 or later). It owns OAuth and token refresh, the Fleet API client, read and command tools, safety (read-only fail-closed, confirm, dry-run, `state_unknown`), and the virtual-key proxy client. It also exports the current access token for energy polling (see [Token](#token)).
 * **Operator (one time):** pushing `fleet_telemetry_config` to each car. That's a signed request through the virtual-key proxy and a real change to the car, so it's a deliberate one-time operator step (a confirm-gated plugin tool may do it later). The plugin doesn't push it today and the bridge never does. `telemetry.fields` here is the source of truth for that config; see [`docs/TESLA-CUTOVER.md`](../../docs/TESLA-CUTOVER.md).
 
+## Fleet telemetry ingest (live)
+
+The supported production path is:
+
+car → mTLS → official Tesla fleet-telemetry receiver → MQTT broker → this bridge.
+
+With the usual `topic_base` of `telemetry`, the receiver publishes each field as `telemetry/<VIN>/v/<Field>` (for example `telemetry/5YJ0000000EXAMPLE/v/Soc`), and the bridge subscribes to `telemetry/+/v/+`. See [MQTT](#mqtt) for topic variants, payload shapes, and broker config.
+
+A vehicle is accepted only when its VIN is in both places in the host-only Tesla config:
+
+* `telemetry.vin_allowlist` — otherwise the message is dropped before the payload is parsed, and the audit records `inbound` / `deny` with reason `vin_not_allowlisted`.
+* the matching route's `allowActors` (typically the `{ "kind": "vehicle" }` route; actor is the VIN) — otherwise the core denies it with reason `actor_not_allowlisted`.
+
+Both lists are read at process start, so adding or removing a VIN needs a bridge restart (for example `docker compose up -d --force-recreate universal-bridge`).
+
+**Status (2026-11-10):** ingest is live. An end-to-end test with a real vehicle confirmed that telemetry reached the MQTT broker and that the bridge accepted the record and routed it. After the VIN was present in both lists, there were no deny audit records and no errors.
+
+**Rollback:** to stop the car streaming, send `DELETE /api/1/vehicles/{vin}/fleet_telemetry_config` through the virtual-key signing proxy, or as the Fleet API docs require. That is a change on the car and needs the owner's yes. To stop the bridge accepting a VIN without changing the car, remove it from `telemetry.vin_allowlist` and from the route's `allowActors`, then restart the bridge. The host checklist in [`docs/TESLA-CUTOVER.md`](../../docs/TESLA-CUTOVER.md) covers the same steps.
+
 ## Hard rules (enforced by the validator and the tests)
 
 * A config with `commands`/`actions` keys, a `vehicle_data` / `wake_up` / `command/` path, or any refresh-token key (`refresh_token`, `refreshTokenRef`, ...) is refused.
