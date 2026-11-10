@@ -8,6 +8,8 @@ Ground rules:
 * Turn on one source at a time and verify it before the next (`telemetry` first, then `energy_poll`).
 * Keep the previous state restorable: note the image tag and copy `config/tesla.json` before you change anything.
 
+**Status (2026-11-10):** fleet telemetry ingest on this path is live. A real vehicle's telemetry reached the MQTT broker, and the bridge accepted the record and routed it. After the VIN was present in both `telemetry.vin_allowlist` and the matching route's `allowActors`, there were no deny audit records and no errors.
+
 ## 0. Before you start
 
 - [ ] The bridge runs at a commit that has the MQTT receiver (`docker compose run -T --rm universal-bridge node dist/src/main.js --check` shows no Tesla config problems).
@@ -57,6 +59,7 @@ Ground rules:
 ## 5. Bridge config (host-only `config/tesla.json`)
 
 - [ ] Start from `adapters/tesla/config.example.json`. Set `telemetry.mode: "mqtt"`, `telemetry.mqtt.broker` (a literal loopback or LAN URL such as `mqtt://<broker-host>:1883`, or an `env:` / `file:` ref), `client_id`, `topic_base`, `username_ref` / `password_ref` (refs to the `bridge` broker user), `vin_allowlist`, `rules` and `routes` (route `agent` = the registry alias that should wake).
+- [ ] The same VIN must appear in both `telemetry.vin_allowlist` and the vehicle route's `allowActors`. A VIN missing from `vin_allowlist` is dropped and audited `vin_not_allowlisted` (before the payload is parsed). A VIN on the allowlist but missing from `allowActors` is denied later with `actor_not_allowlisted`. Both lists are read at process start, so a change needs a bridge restart (the recreate in the next items).
 - [ ] `energy_poll`: `site_allowlist`, `api_base` (your region's Fleet API base URL: `https://fleet-api.prd.na.vn.cloud.tesla.com`, `…eu…` or `https://fleet-api.prd.cn.vn.cloud.tesla.cn`; other hosts are refused) and `token_ref` from step 4.
 - [ ] If the broker is a compose service, put the bridge on the same compose network and use the service name (`mqtt://mosquitto:1883`). Single-label names are accepted as LAN.
 - [ ] In `config/bridge.json`, set `adapters.tesla.enabled: true` (telemetry first: leave `energy_poll.enabled: false` until step 6 passes).
@@ -85,7 +88,7 @@ Ground rules:
 
 - [ ] Set `adapters.tesla.enabled: false` in `config/bridge.json` and recreate the bridge. Nothing else depends on it, and the bridge sends nothing to the car.
 - [ ] Or go back to the previous image tag or commit and `config/tesla.json` copy, then recreate.
-- [ ] fleet-telemetry and the broker can keep running, or be stopped. To stop the car streaming, remove the telemetry config (`DELETE /api/1/vehicles/<VIN>/fleet_telemetry_config`, a car change that needs the owner's yes) or let its `exp` lapse.
+- [ ] fleet-telemetry and the broker can keep running, or be stopped. To stop the car streaming, remove the telemetry config through the virtual-key signing proxy, or as the Fleet API docs require: `DELETE /api/1/vehicles/{vin}/fleet_telemetry_config`. That is a car change and needs the owner's yes. You can also let its `exp` lapse. To stop the bridge accepting a VIN without changing the car, remove it from `telemetry.vin_allowlist` and from the route's `allowActors`, then restart the bridge.
 - [ ] Unset `TESLA_FLEET_ACCESS_TOKEN_EXPORT_FILE` in the plugin and delete the exported file if energy polling is abandoned.
 - [ ] Audit and hold files stay in the data volume for review. `tesla-energy-state.json` can be deleted safely; the only effect is that the next first poll reports what's already in effect.
 
