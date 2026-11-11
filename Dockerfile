@@ -11,13 +11,16 @@ RUN npm run build && npm prune --omit=dev
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production BRIDGE_CONFIG=/app/config/bridge.json
-RUN addgroup -S bridge && adduser -S bridge -G bridge
+# Pin a numeric uid:gid. Alpine already uses gid 100 (`users`), so the group is 101.
+RUN addgroup -g 101 -S bridge \
+ && adduser -u 100 -S -D -H -G bridge bridge
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 # Runtime config, registry and .env are mounted by the host (read-only), never baked in.
-RUN mkdir -p /app/data /app/config /backup && chown bridge:bridge /app/data /backup
-USER bridge
+# /app/data and /backup are the writable paths (named volume / bind mount at run time).
+RUN mkdir -p /app/data /app/config /backup && chown 100:101 /app/data /backup
+USER 100:101
 EXPOSE 18090
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:18090/healthz || exit 1
 CMD ["node", "dist/src/main.js"]
