@@ -29,7 +29,7 @@ node scripts/migrate-old-config.mjs \
 |---|---|
 | `DISCORD_BOT_TOKEN` | `discord.tokenRef: "env:DISCORD_BOT_TOKEN"` |
 | `CALLBACK_TOKEN` | `discord.callbackTokenRef: "env:CALLBACK_TOKEN"` |
-| `CALLBACK_PATH` (`/callback`) | `discord.legacyPaths.callback: "/callback"`: the same handler also serves `/callback`, so the host's nginx shim can go away. The canonical path is `/discord/callback`. |
+| `CALLBACK_PATH` (`/callback`) | `discord.legacyPaths.callback: "/callback"`: the same handler also serves `/callback`. The canonical path is `/discord/callback`. A host-side `grok_bridge_callback_shim` (if present) is only a loopback forwarder; see below. |
 | `CALLBACK_BASE_URL` | `discord.planner.callbackUrl` = base + legacy path (what planner handlers post to). Agents get `http.publicBaseUrl` + `/discord/callback` in metadata. |
 | `CALLBACK_RATE_LIMIT_PER_MIN` | bridge `callbackRateLimitPerMin` |
 | `GROK_BOT_SENDPROMPT_URL`, `GROK_BOT_GATEWAY_TOKEN` | registry `deliver: { kind: "sendprompt", urlRef: "env:GROK_BOT_SENDPROMPT_URL", keyRef: "env:GROK_BOT_GATEWAY_TOKEN" }` (or a `webhook` routine) |
@@ -53,6 +53,8 @@ node scripts/migrate-old-config.mjs \
 | `HTTP_ONLY` | `adapters.discord.enabled: false` (no Gateway login; the other adapters still run) |
 | `CHANNEL_MAP_PATH`, `SECURITY_CONFIG_PATH` | gone: one adapter config file (`adapters.discord.configPath`) |
 | `LOCAL_PLANNER_POWERSHELL` | dropped: 0.2.14 never read it (only the stand-in `bin/local-planner-powershell.mjs` did); the hop is a plain HTTP POST |
+
+If the host still has a forwarder in front of the Discord `/callback` path, it is named `grok_bridge_callback_shim` (compose service name `shim`). It is loopback-bound (`127.0.0.1`), non-root, and read-only, and it does not use host networking. It only forwards `/callback` to the bridge's `/discord/callback` and serves `/healthz`. The bridge's own `legacyPaths.callback` alias is separate: it serves `/callback` on the bridge process itself.
 
 ### `security.json`
 
@@ -121,7 +123,7 @@ The universal bridge already runs in place of the old one, with the old containe
 
 1. `docker compose stop universal-bridge` (or set `adapters.discord.enabled: false` and recreate, if the other adapters must keep running: only one process may log in with the Discord bot token).
 2. `cd <old dir> && docker compose up -d` (use `up -d`, not `restart`, so `.env` is re-read). The old `.env`, `config/` and data volume are untouched by the migration.
-3. `curl -sS http://127.0.0.1:18083/healthz` → `discordReady: true`. Restore the nginx `/callback` shim if it was removed.
+3. `curl -sS http://127.0.0.1:18083/healthz` → `discordReady: true`. If `grok_bridge_callback_shim` (service name `shim`) is still in front of `/callback`, leave it loopback-bound, non-root, and read-only, with no host networking.
 4. Agents and planner handlers that were moved to `/discord/callback` must go back to the old `/callback` URL. The ones still on `/callback` keep working.
 
 ## Parity table
