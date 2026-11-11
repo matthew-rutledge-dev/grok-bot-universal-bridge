@@ -3,11 +3,23 @@
 # After editing .env: docker compose up -d --force-recreate
 # In scripts use `docker compose run -T` / `exec -T`: without -T the container reads
 # stdin and eats the rest of a piped script.
+#
+# The process runs as uid 100, gid 101 (see Dockerfile). Host bind mounts the
+# container writes to (the backup dir) and host files it must read need to be
+# owned appropriately; see README Permissions.
 services:
   universal-bridge:
     build: .
     image: grok-bot-universal-bridge:local
     restart: unless-stopped
+    user: "100:101"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
     # Host-only files live OUTSIDE the repo dir (a sibling <repo>-host/ dir), so they are
     # never in the build context or touched by git pull. Override with BRIDGE_HOST_DIR.
     env_file: ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/.env   # mode 600, never in git
@@ -20,8 +32,8 @@ services:
       - ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/registry.json:/run/bridge/registry.json:ro
       - bridge-data:/app/data          # hold file, request records, audit.jsonl
       # Backup uploads (POST /backup/upload, off until BRIDGE_BACKUP_UPLOAD_KEY is set, 32+ chars).
-      # Create the host dir first, writable by the container's `bridge` user: if it is
-      # missing, Docker creates it owned by root and uploads fail with 500.
+      # Create the host dir first and chown 100:101: if it is missing, Docker creates it
+      # owned by root and uploads fail with 500.
       - ${BACKUP_HOST_DIR:-/mnt/grokbot_backup}:/backup:rw
 volumes:
   bridge-data:

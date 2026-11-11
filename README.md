@@ -39,7 +39,7 @@ docker compose up -d
 ```
 
 * **Use `docker compose run -T`** (and `exec -T`) in scripts. Without `-T` the container reads stdin, so in a piped or heredoc script it swallows the rest of the script and the later lines never run.
-* **Keep host files outside the repo dir.** Put the real `bridge.json`, adapter configs, `registry.json`, `.env` and any secrets in a sibling directory such as `<repo>-host/` (for example `../grok-bot-universal-bridge-host/`), owned by the service user, and mount them from there. Then `git pull` never touches them, and they're never part of the Docker build context: a host-only directory inside the checkout (especially one the build user can't read) breaks `docker compose build`. `.dockerignore` also drops `.env`, `config.host/`, `host/`, `registry*.json`, `*.tmp`, `node_modules`, `.git` and test output, as a safety net for older layouts.
+* **Keep host files outside the repo dir.** Put the real `bridge.json`, adapter configs, `registry.json`, `.env` and any secrets in a sibling directory such as `<repo>-host/` (for example `../grok-bot-universal-bridge-host/`), with modes and ownership as in Permissions below, and mount them from there. Then `git pull` never touches them, and they're never part of the Docker build context: a host-only directory inside the checkout (especially one the build user can't read) breaks `docker compose build`. `.dockerignore` also drops `.env`, `config.host/`, `host/`, `registry*.json`, `*.tmp`, `node_modules`, `.git` and test output, as a safety net for older layouts.
   ```yaml
   env_file: ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/.env
   volumes:
@@ -48,6 +48,18 @@ docker compose up -d
   ```
 * `http.publicBaseUrl` is only needed when an enabled adapter has a live callback route (its `callbackTokenRef` is set). Startup fails with a clear message if it's missing then.
 
+## Permissions
+
+The image and `compose.example.yml` run the process as uid `100`, gid `101` (numeric; Alpine already uses gid 100 for `users`). Writable paths in the container must be owned by that uid, including host bind mounts the process writes to.
+
+On the host, before `docker compose up`:
+
+* The sibling host directory (`${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/`, containing `config/`, `registry.json`, `.env`, and any secret files). Make those files readable by uid 100: mode `0600` or `0640`, never world-readable. Ownership can be `100:101`, or `root:101` with `0640` so the process can read but not write. The compose file mounts `config/` and `registry.json` read-only.
+* The `bridge-data` named volume is `/app/data` inside the container (hold file, request records, `audit.jsonl`). A volume created from this image is already owned by `100:101`. If you reuse a volume that was created under a different uid, `chown -R 100:101` its data on the host.
+* The backup bind mount (`${BACKUP_HOST_DIR:-/mnt/grokbot_backup}` on the host, `/backup` in the container). Create it first and `chown 100:101` so it is writable by the container; if the path is missing, Docker creates it owned by root and uploads fail with `500`.
+
+Published ports stay on `127.0.0.1` by default. The compose example also drops all capabilities, sets `no-new-privileges`, and uses a read-only root filesystem with tmpfs on `/tmp`.
+
 ## Backup upload
 
 A write-only drop for bot backups. Off by default: with `BRIDGE_BACKUP_UPLOAD_KEY` unset, empty or shorter than 32 characters the route answers 404 like any unknown path (a too-short key also logs a startup warning, never the value).
@@ -55,8 +67,8 @@ A write-only drop for bot backups. Off by default: with `BRIDGE_BACKUP_UPLOAD_KE
 | Env | Meaning |
 |---|---|
 | `BRIDGE_BACKUP_UPLOAD_KEY` | Bearer key for uploads, at least 32 characters (host `.env` only, never in git). Unset, empty or shorter = route disabled. |
-| `BACKUP_ROOT` | Directory uploads land in, inside the container. Default `/backup`; bind-mount a host dir there (see `compose.example.yml`), writable by the container's `bridge` user. |
-| `BACKUP_HOST_DIR` | Compose only: the host directory mounted at `/backup` (default `/mnt/grokbot_backup`). Create it before `docker compose up`, or Docker creates it owned by root. |
+| `BACKUP_ROOT` | Directory uploads land in, inside the container. Default `/backup`; bind-mount a host dir there (see `compose.example.yml`), writable by uid `100` (gid `101`). |
+| `BACKUP_HOST_DIR` | Compose only: the host directory mounted at `/backup` (default `/mnt/grokbot_backup`). Create it and `chown 100:101` before `docker compose up`, or Docker creates it owned by root and uploads fail. |
 | `BACKUP_MIN_FREE_BYTES` | Free-space reserve in bytes on the `BACKUP_ROOT` filesystem (default `5368709120`, 5 GiB; `0` turns the check off). An upload is refused with `507` if free space minus its `Content-Length` (or 95 MiB when there is none) would drop below it. A value that is not a whole number logs a warning and the default is used. |
 
 ```bash
