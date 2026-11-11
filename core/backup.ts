@@ -1,0 +1,575 @@
+import { createHash, randomBytes } from "node:crypto";
+import { link, lstat, mkdir, open, statfs, unlink, type FileHandle } from "node:fs/promises";
+import type { IncomingMessage } from "node:http";
+import { isIP } from "node:net";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Transform, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { AuditEntry, AuditSink } from "./audit.js";
+import { safeEqual, type HttpResponse, type HttpServer } from "./http.js";
+import type { Registry } from "./registry.js";
+import type { SecretEnv } from "./secrets.js";
+import { consoleLogger, type Logger } from "./types.js";
+
+/**
+ * POST /backup/upload?bot=<alias>&name=<file>
+ *
+ * Write-only backup drop: streams the body to
+ * <BACKUP_ROOT>/<alias>/<YYYY-MM-DD UTC>/<name>, never overwriting.
+ * No list, read, delete or overwrite routes exist on purpose.
+ *
+ * Auth: `Authorization: Bearer <BRIDGE_BACKUP_UPLOAD_KEY>` (constant-time).
+ * With the env unset, empty or shorter than 32 characters the route answers
+ * 404 like any unknown path.
+ *
+ * Atomic publish: the body goes to <BACKUP_ROOT>/<alias>/.incoming/<random>.part
+ * (opened O_EXCL), is fsynced, then hard-linked to the final name (link() fails
+ * with EEXIST, so a name is never overwritten) and the temp name is unlinked.
+ * A crash mid-upload can only leave a stray .part under .incoming/, never a
+ * file under a real name. `.incoming` cannot clash with an upload: uploads
+ * only ever land in a YYYY-MM-DD folder, and that is the only thing `name`
+ * can address. Where the filesystem has no hard links (EPERM, ENOTSUP,
+ * EXDEV, ...) the publish falls back to an exclusive copy: the final name is
+ * opened with O_EXCL by this request (so a concurrent publish gives 409 and is
+ * never deleted), filled from the temp file and fsynced. Copy mode is not
+ * crash-atomic (see README); the first upload probes which mode is active and
+ * logs it once.
+ *
+ * Free space: before anything is written, statfs(BACKUP_ROOT) must show
+ * free - (Content-Length, or the cap when absent) >= BACKUP_MIN_FREE_BYTES
+ * (default 5 GiB), else 507. Re-checked every 8 MiB while streaming, and
+ * ENOSPC/EDQUOT also answer 507; the temp file is removed either way.
+ *
+ * Optional `X-Content-SHA256: <64 hex>`: the digest is compared with the
+ * hash already computed while streaming. A mismatch answers 422 and the
+ * temp file is removed (nothing is published). A malformed header answers
+ * 400 before anything is written. Absent header = no check.
+ *
+ * Every audit line includes `ip`: the socket remote address, or
+ * `CF-Connecting-IP` only when that peer is loopback (the trusted tunnel).
+ */
+export const BACKUP_PATH = "/backup/upload";
+export const BACKUP_MAX_BYTES = 95 * 1024 * 1024;
+export const BACKUP_MIN_KEY_LENGTH = 32;
+export const DEFAULT_BACKUP_ROOT = "/backup";
+export const BACKUP_INCOMING_DIR = ".incoming";
+/** Default free-space reserve: 5 GiB (see README). 0 disables the check. */
+export const DEFAULT_BACKUP_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024;
+/** Free space is re-checked after every this many streamed bytes. */
+export const BACKUP_SPACE_RECHECK_BYTES = 8 * 1024 * 1024;
+const NO_HARDLINK = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS"]);
+const NO_SPACE = new Set(["ENOSPC", "EDQUOT"]);
+const NAME = /^[A-Za-z0-9._-]{1,128}$/;
+/** Windows device names, with or without an extension (CON, nul.txt, COM1.tar.gz, ...). */
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+
+export interface BackupOptions {
+  registry: Registry;
+  audit: AuditSink;
+  env?: SecretEnv;
+  log?: Logger;
+  /** Test hook: overrides env BACKUP_ROOT. */
+  root?: string;
+  /** Test hook: byte cap (default 95 MiB). */
+  maxBytes?: number;
+  /** Test hook: clock for the date folder. */
+  now?: () => Date;
+  /** Test hooks: filesystem calls that tests need to fail or fake. */
+  fsOps?: Partial<BackupFsOps>;
+  /** Test hook: re-check free space after this many streamed bytes (default 8 MiB). */
+  spaceRecheckBytes?: number;
+}
+
+export interface BackupFsOps {
+  /** Free bytes available to this process on the filesystem holding `path`. */
+  freeBytes(path: string): Promise<number>;
+  link(existing: string, target: string): Promise<void>;
+  /** Create a file exclusively (O_EXCL, 'wx'); EEXIST when the name is taken. */
+  openExcl(path: string): Promise<FileHandle>;
+  /** fsync an open file (`path` only identifies it, e.g. for tests). */
+  sync(fh: FileHandle, path: string): Promise<void>;
+  /** Write part of a buffer to the temp file; returns bytes written. */
+  write(fh: FileHandle, buf: Buffer, offset: number, length: number): Promise<number>;
+}
+
+const realFsOps: BackupFsOps = {
+  async freeBytes(path) {
+    const st = await statfs(path);
+    return Number(st.bavail) * Number(st.bsize);
+  },
+  link: (a, b) => link(a, b),
+  openExcl: (path) => open(path, "wx", 0o640),
+  sync: (fh) => fh.sync(),
+  write: async (fh, buf, offset, length) => (await fh.write(buf, offset, length)).bytesWritten,
+};
+
+/** BACKUP_MIN_FREE_BYTES: a non-negative integer of bytes; anything else = undefined (caller warns, uses the default). */
+export function parseMinFree(raw: string | undefined): number | undefined {
+  const v = (raw ?? "").trim();
+  if (!v) return DEFAULT_BACKUP_MIN_FREE_BYTES;
+  if (!/^\d+$/.test(v)) return undefined;
+  const n = Number(v);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+/** null = ok, else a short reason. */
+export function backupNameProblem(name: string | null): string | null {
+  if (name === null || name === "") return "name_missing";
+  if (!NAME.test(name)) return "name_invalid";
+  if (name === "." || name === "..") return "name_invalid";
+  if (WINDOWS_RESERVED.test(name)) return "name_reserved";
+  return null;
+}
+
+/** The configured key, or "" when unset, empty or too short (the route is then off). */
+export function backupKey(env: SecretEnv): string {
+  const k = (env.BRIDGE_BACKUP_UPLOAD_KEY ?? "").trim();
+  return k.length >= BACKUP_MIN_KEY_LENGTH ? k : "";
+}
+
+/** Strip brackets / zone ids and unwrap IPv4-mapped IPv6 (`::ffff:127.0.0.1` -> `127.0.0.1`). */
+export function normalizeIp(addr: string): string {
+  const raw = addr.trim().replace(/^\[|\]$/g, "").split("%")[0] ?? "";
+  const dotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(raw);
+  if (dotted) return dotted[1];
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(raw);
+  if (hex) {
+    const hi = Number.parseInt(hex[1], 16);
+    const lo = Number.parseInt(hex[2], 16);
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+  }
+  return raw;
+}
+
+/** True for 127.0.0.0/8 and IPv6 loopback, including IPv4-mapped forms. */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  if (!addr) return false;
+  const a = normalizeIp(addr);
+  if (a === "::1" || a === "0:0:0:0:0:0:0:1") return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(a);
+  if (!m) return false;
+  const o = m.slice(1).map(Number);
+  return o[0] === 127 && o.every((n) => n <= 255);
+}
+
+function singleIp(raw: string | string[] | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (Array.isArray(raw)) {
+    if (raw.length !== 1) return undefined;
+    raw = raw[0];
+  }
+  if (typeof raw !== "string") return undefined;
+  const v = raw.trim();
+  if (!v || /[,\s]/.test(v)) return undefined;
+  const ip = normalizeIp(v);
+  return isIP(ip) ? ip : undefined;
+}
+
+/**
+ * IP recorded on every backup audit line: the socket peer, except
+ * `CF-Connecting-IP` is used when that peer is loopback (trusted tunnel).
+ * A missing or invalid header falls back to the socket address. The header
+ * is never trusted from any other peer.
+ */
+export function backupUploaderIp(
+  socketRemote: string | undefined,
+  cfConnectingIp: string | string[] | undefined,
+): string | undefined {
+  const socket = typeof socketRemote === "string" && socketRemote.trim() ? normalizeIp(socketRemote) : undefined;
+  if (isLoopbackAddress(socket)) {
+    const forwarded = singleIp(cfConnectingIp);
+    if (forwarded) return forwarded;
+  }
+  return socket;
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/**
+ * Optional `X-Content-SHA256` value. `expected: null` means the header was
+ * absent (do not check). `{ ok: false }` means it was present but not a 64-char hex digest.
+ */
+export function parseContentSha256(raw: string | string[] | undefined): { ok: true; expected: string | null } | { ok: false } {
+  if (raw === undefined) return { ok: true, expected: null };
+  if (Array.isArray(raw)) {
+    if (raw.length !== 1) return { ok: false };
+    raw = raw[0];
+  }
+  if (typeof raw !== "string") return { ok: false };
+  const v = raw.trim().toLowerCase();
+  if (!SHA256_HEX.test(v)) return { ok: false };
+  return { ok: true, expected: v };
+}
+
+class TooLarge extends Error {}
+
+function bearer(headers: IncomingMessage["headers"]): string {
+  const auth = headers.authorization;
+  if (typeof auth !== "string") return "";
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  return m ? m[1].trim() : "";
+}
+
+/** fsync a directory so a new entry survives power loss. Not possible on Windows. */
+async function syncDir(dir: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const dh = await open(dir, "r");
+  try {
+    await dh.sync();
+  } finally {
+    await dh.close();
+  }
+}
+
+/**
+ * mkdir -p, then refuse a directory that is (or was swapped for) a symlink.
+ * A directory created here has its parent fsynced (best effort, warn only).
+ */
+async function ensureRealDir(dir: string, log: Logger): Promise<void> {
+  const created = await mkdir(dir, { recursive: true, mode: 0o750 });
+  const st = await lstat(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw Object.assign(new Error("not a real directory"), { code: "SYMLINK_DIR" });
+  if (created !== undefined) {
+    await syncDir(dirname(dir)).catch((err) => log.warn(`[backup] parent directory fsync failed ${(err as NodeJS.ErrnoException).code ?? "error"}`));
+  }
+}
+
+class NoSpace extends Error {}
+class ClientAborted extends Error {}
+/** statfs failed or returned nonsense: the upload is refused (500), never let through unchecked. */
+class StatfsFailed extends Error {
+  constructor(readonly why: string) {
+    super("statfs failed");
+  }
+}
+
+const errCode = (err: unknown): string => String((err as NodeJS.ErrnoException)?.code ?? "");
+
+/**
+ * Publish without hard links: create `file` with O_EXCL (so we know this
+ * request owns it), copy the temp file in, fsync. On failure only the file this
+ * request created is removed; an EEXIST from the create is a 409 and the other
+ * request's file is never touched.
+ */
+async function copyExclusive(fsOps: BackupFsOps, temp: string, file: string): Promise<void> {
+  const out = await fsOps.openExcl(file); // throws before creating anything -> nothing of ours to remove
+  try {
+    const inp = await open(temp, "r");
+    try {
+      const buf = Buffer.allocUnsafe(1024 * 1024);
+      for (;;) {
+        const { bytesRead } = await inp.read(buf, 0, buf.length, null);
+        if (!bytesRead) break;
+        let off = 0;
+        while (off < bytesRead) off += await fsOps.write(out, buf, off, bytesRead - off);
+      }
+    } finally {
+      await inp.close();
+    }
+    await fsOps.sync(out, file);
+    await out.close();
+  } catch (err) {
+    await out.close().catch(() => undefined);
+    await unlink(file).catch(() => undefined);
+    throw err;
+  }
+}
+
+export type PublishMode = "link" | "copy";
+
+/** Probe hard-link support inside `incoming` with throwaway files. undefined = could not tell (try again later). */
+async function probePublishMode(fsOps: BackupFsOps, incoming: string): Promise<PublishMode | undefined> {
+  const base = join(incoming, `${randomBytes(12).toString("hex")}.probe`);
+  const linked = `${base}-link`;
+  try {
+    const fh = await open(base, "wx", 0o600);
+    await fh.close();
+    try {
+      await fsOps.link(base, linked);
+      return "link";
+    } catch (err) {
+      return NO_HARDLINK.has(errCode(err)) ? "copy" : undefined;
+    }
+  } catch {
+    return undefined;
+  } finally {
+    await unlink(linked).catch(() => undefined);
+    await unlink(base).catch(() => undefined);
+  }
+}
+
+export function registerBackupRoute(http: HttpServer, o: BackupOptions): void {
+  const env = o.env ?? process.env;
+  const log = o.log ?? consoleLogger;
+  const maxBytes = o.maxBytes ?? BACKUP_MAX_BYTES;
+  const now = o.now ?? (() => new Date());
+  const fsOps: BackupFsOps = { ...realFsOps, ...(o.fsOps ?? {}) };
+  let minFree = parseMinFree(env.BACKUP_MIN_FREE_BYTES);
+  if (minFree === undefined) {
+    log.warn(`[backup] BACKUP_MIN_FREE_BYTES is not a whole number of bytes; using the default ${DEFAULT_BACKUP_MIN_FREE_BYTES}`);
+    minFree = DEFAULT_BACKUP_MIN_FREE_BYTES;
+  }
+  const reserve = minFree;
+  const recheckEvery = o.spaceRecheckBytes ?? BACKUP_SPACE_RECHECK_BYTES;
+  let mode: PublishMode | undefined;
+  /** One probe at a time: concurrent first uploads share it, so the mode is logged once. */
+  let probing: Promise<void> | undefined;
+  const detectMode = (incoming: string): Promise<void> => {
+    if (mode) return Promise.resolve();
+    probing ??= (async () => {
+      const m = await probePublishMode(fsOps, incoming);
+      if (m === "link") log.info("[backup] publish mode: link (atomic)");
+      else if (m === "copy") {
+        log.warn("[backup] publish mode: copy (no hard links on BACKUP_ROOT): a crash mid-copy can leave a truncated file under its final name, see README");
+      }
+      mode = m;
+    })().finally(() => {
+      probing = undefined; // undetermined -> the next upload probes again
+    });
+    return probing;
+  };
+
+  const configured = (env.BRIDGE_BACKUP_UPLOAD_KEY ?? "").trim();
+  if (configured && !backupKey(env)) {
+    log.warn(`[backup] BRIDGE_BACKUP_UPLOAD_KEY is shorter than ${BACKUP_MIN_KEY_LENGTH} characters; backup upload stays disabled (404)`);
+  }
+
+  http.route(
+    "POST",
+    BACKUP_PATH,
+    async (req): Promise<HttpResponse> => {
+      const expected = backupKey(env);
+      // Disabled: indistinguishable from an unknown path (no audit line either).
+      if (!expected) return { status: 404, body: { ok: false, error: "not_found" } };
+
+      const bot = req.query.get("bot") ?? "";
+      const name = req.query.get("name");
+      const ip = backupUploaderIp(req.stream?.socket?.remoteAddress, req.headers["cf-connecting-ip"]);
+      const audit = (outcome: AuditEntry["outcome"], extra: Partial<AuditEntry> = {}) =>
+        o.audit.write({ adapter: "backup", action: "upload", outcome, agent: bot || undefined, name: name ?? undefined, ip, ...extra });
+
+      if (req.query.has("token") || req.query.has("key")) {
+        audit("bad_request", { reason: "query_token_refused", status: 400 });
+        return { status: 400, body: { ok: false, error: "use the Authorization header" } };
+      }
+      const got = bearer(req.headers);
+      if (!got) {
+        audit("auth_fail", { reason: "missing_key", status: 401 });
+        return { status: 401, body: { ok: false, error: "unauthorized" } };
+      }
+      if (!safeEqual(got, expected)) {
+        audit("auth_fail", { reason: "bad_key", status: 403 });
+        return { status: 403, body: { ok: false, error: "forbidden" } };
+      }
+
+      if (!bot || !o.registry.has(bot)) {
+        audit("bad_request", { reason: "unknown_bot", status: 400 });
+        return { status: 400, body: { ok: false, error: "unknown_bot" } };
+      }
+      const nameProblem = backupNameProblem(name);
+      if (nameProblem) {
+        audit("bad_request", { reason: nameProblem, status: 400 });
+        return { status: 400, body: { ok: false, error: nameProblem } };
+      }
+
+      const declaredRaw = req.headers["content-length"];
+      const declared = declaredRaw === undefined ? NaN : Number(declaredRaw);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        audit("too_large", { reason: "content_length", status: 413 });
+        return { status: 413, body: { ok: false, error: "body_too_large", maxBytes } };
+      }
+
+      const shaHeader = parseContentSha256(req.headers["x-content-sha256"]);
+      if (!shaHeader.ok) {
+        audit("bad_request", { reason: "sha256_header_invalid", status: 400 });
+        return { status: 400, body: { ok: false, error: "sha256_header_invalid" } };
+      }
+      const expectedSha = shaHeader.expected;
+
+      const root = resolve(o.root ?? (env.BACKUP_ROOT?.trim() || DEFAULT_BACKUP_ROOT));
+      const botDir = resolve(root, bot);
+      const dir = resolve(botDir, now().toISOString().slice(0, 10));
+      const incoming = resolve(botDir, BACKUP_INCOMING_DIR);
+      const file = resolve(dir, name!);
+      // Defense in depth: the validation above already makes these impossible.
+      const rel = relative(root, file);
+      if (!rel || rel.startsWith("..") || isAbsolute(rel) || rel.split(sep).length !== 3) {
+        audit("bad_request", { reason: "path_escape", status: 400 });
+        return { status: 400, body: { ok: false, error: "bad_path" } };
+      }
+
+      const noSpace = (reason: string, bytes?: number): HttpResponse => {
+        audit("no_space", { reason, status: 507, bytes });
+        return { status: 507, body: { ok: false, error: "insufficient_storage" } };
+      };
+      const fail = (err: unknown, bytes?: number): HttpResponse => {
+        const code = err instanceof StatfsFailed ? `statfs_${err.why}` : String((err as NodeJS.ErrnoException).code ?? (err as Error).name ?? "error");
+        log.warn(`[backup] upload failed ${code}`);
+        audit("error", { reason: code === "SYMLINK_DIR" ? "symlink_dir" : code, status: 500, bytes });
+        return { status: 500, body: { ok: false, error: "write_failed" } };
+      };
+
+      // Track a client disconnect from here on: setup awaits (statfs, mkdir, the
+      // probe) can take a while, and a "close" that fires before the stream
+      // listeners exist would otherwise be missed and the request would hang.
+      const src = req.stream!;
+      let aborted = false;
+      const markAborted = () => {
+        if (!src.readableEnded) aborted = true;
+      };
+      src.once("close", markAborted);
+      src.once("error", markAborted);
+      try {
+        return await upload();
+      } finally {
+        src.removeListener("close", markAborted);
+        src.removeListener("error", markAborted);
+      }
+
+      function gone(): boolean {
+        return aborted || src.readableAborted || (src.destroyed && !src.readableEnded);
+      }
+      function abortedResponse(bytes?: number): HttpResponse {
+        audit("error", { reason: "client_aborted", status: 499, bytes });
+        return { status: 499, body: { ok: false, error: "client_aborted" } };
+      }
+
+      async function upload(): Promise<HttpResponse> {
+        // Cheap early 409 (the link() below is what actually guarantees no overwrite).
+        try {
+          await lstat(file);
+          audit("conflict", { status: 409 });
+          return { status: 409, body: { ok: false, error: "exists" } };
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail(err);
+        }
+        if (gone()) return abortedResponse();
+
+        // Free space before anything is written: free - expected size must stay >= reserve.
+        const expectedBytes = Number.isFinite(declared) && declared >= 0 ? declared : maxBytes;
+        if (reserve > 0) {
+          try {
+            await mkdir(root, { recursive: true, mode: 0o750 });
+          } catch (err) {
+            return NO_SPACE.has(errCode(err)) ? noSpace(errCode(err)) : fail(err);
+          }
+          let free: number;
+          try {
+            free = await fsOps.freeBytes(root);
+          } catch (err) {
+            // Fail closed: without a reading we cannot promise the reserve.
+            return fail(new StatfsFailed(errCode(err) || "error"));
+          }
+          if (gone()) return abortedResponse();
+          if (!Number.isFinite(free)) return fail(new StatfsFailed("bad_value"));
+          if (free - expectedBytes < reserve) return noSpace("below_reserve");
+        }
+
+        let temp = "";
+        let fh;
+        try {
+          await ensureRealDir(botDir, log);
+          await ensureRealDir(dir, log);
+          await ensureRealDir(incoming, log);
+          temp = join(incoming, `${randomBytes(12).toString("hex")}.part`);
+          fh = await fsOps.openExcl(temp);
+        } catch (err) {
+          return NO_SPACE.has(errCode(err)) ? noSpace(errCode(err)) : fail(err);
+        }
+        await detectMode(incoming).catch(() => undefined);
+        if (gone()) {
+          await fh.close().catch(() => undefined);
+          await unlink(temp).catch(() => undefined);
+          return abortedResponse();
+        }
+
+        const hash = createHash("sha256");
+        let bytes = 0;
+        let sha256 = "";
+        let nextCheck = recheckEvery;
+        const meter = new Transform({
+          transform(chunk: Buffer, _enc, cb) {
+            bytes += chunk.length;
+            if (bytes > maxBytes) return cb(new TooLarge("too large"));
+            hash.update(chunk);
+            if (reserve <= 0 || bytes < nextCheck) return cb(null, chunk);
+            nextCheck = bytes + recheckEvery;
+            // Re-check while streaming: other writers share the volume.
+            fsOps.freeBytes(root).then(
+              (free) => (!Number.isFinite(free) ? cb(new StatfsFailed("bad_value")) : free < reserve ? cb(new NoSpace("below reserve")) : cb(null, chunk)),
+              (err) => cb(new StatfsFailed(errCode(err) || "error")),
+            );
+          },
+        });
+        // pipe (not pipeline) for the request side: on 413 the request must stay
+        // open so the core can drain it and the client reads the 413, not a reset.
+        const onAbort = () => {
+          if (!src.readableEnded) meter.destroy(new ClientAborted("client aborted"));
+        };
+        const onError = (e: Error) => meter.destroy(e);
+        src.once("close", onAbort);
+        src.once("error", onError);
+        src.pipe(meter);
+        // A disconnect after the last check but before the listeners above.
+        if (gone()) onAbort();
+        let linked = false;
+        try {
+          const handle = fh;
+          // Our own sink (not fh.createWriteStream) so the handle stays open for fsync.
+          const sink = new Writable({
+            write(chunk: Buffer, _enc, cb) {
+              (async () => {
+                let off = 0;
+                while (off < chunk.length) off += await fsOps.write(handle, chunk, off, chunk.length - off);
+              })().then(() => cb(), cb);
+            },
+          });
+          await pipeline(meter, sink);
+          await fsOps.sync(fh, temp);
+          await fh.close();
+          sha256 = hash.digest("hex");
+          if (expectedSha && sha256 !== expectedSha) {
+            audit("bad_request", { reason: "sha256_mismatch", status: 422, bytes, sha256 });
+            return { status: 422, body: { ok: false, error: "sha256_mismatch" } };
+          }
+          try {
+            await fsOps.link(temp, file);
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code ?? "";
+            if (!NO_HARDLINK.has(code)) throw err;
+            // No hard links here: exclusive copy keeps "never overwrite" (EEXIST -> 409).
+            await copyExclusive(fsOps, temp, file);
+          }
+          linked = true;
+        } catch (err) {
+          src.unpipe(meter);
+          await fh.close().catch(() => undefined);
+          if (err instanceof TooLarge) {
+            audit("too_large", { reason: "streamed", status: 413, bytes });
+            return { status: 413, body: { ok: false, error: "body_too_large", maxBytes } };
+          }
+          if (err instanceof NoSpace) return noSpace("below_reserve_streaming", bytes);
+          if (err instanceof ClientAborted || gone()) return abortedResponse(bytes);
+          if (NO_SPACE.has((err as NodeJS.ErrnoException).code ?? "")) return noSpace(String((err as NodeJS.ErrnoException).code), bytes);
+          if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+            audit("conflict", { status: 409, bytes });
+            return { status: 409, body: { ok: false, error: "exists" } };
+          }
+          return fail(err, bytes);
+        } finally {
+          src.removeListener("close", onAbort);
+          src.removeListener("error", onError);
+          await unlink(temp).catch(() => undefined);
+        }
+        if (linked) {
+          // Best effort: the data is already fsynced; this makes the new name durable too.
+          await syncDir(dir).catch((err) => log.warn(`[backup] directory fsync failed ${(err as NodeJS.ErrnoException).code ?? "error"}`));
+        }
+        const path = rel.split(sep).join("/");
+        audit("ok", { status: 201, bytes, sha256 });
+        return { status: 201, body: { path, bytes, sha256 } };
+      }
+    },
+    { stream: true },
+  );
+}

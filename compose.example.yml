@@ -19,5 +19,9 @@ services:
       - ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/config:/app/config:ro   # host-only bridge.json + adapter configs
       - ${BRIDGE_HOST_DIR:-../grok-bot-universal-bridge-host}/registry.json:/run/bridge/registry.json:ro
       - bridge-data:/app/data          # hold file, request records, audit.jsonl
+      # Backup uploads (POST /backup/upload, off until BRIDGE_BACKUP_UPLOAD_KEY is set, 32+ chars).
+      # Create the host dir first, writable by the container's `bridge` user: if it is
+      # missing, Docker creates it owned by root and uploads fail with 500.
+      - ${BACKUP_HOST_DIR:-/mnt/grokbot_backup}:/backup:rw
 volumes:
   bridge-data:

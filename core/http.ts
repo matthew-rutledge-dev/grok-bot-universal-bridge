@@ -15,6 +15,8 @@ export interface HttpRequest {
   body: unknown;
   /** Exact request bytes for POST/PUT (for adapters that verify a signature over the raw body). */
   rawBody?: Buffer;
+  /** The unread request body, only for routes registered with `stream: true`. */
+  stream?: IncomingMessage;
 }
 
 export interface RouteOptions {
@@ -25,6 +27,13 @@ export interface RouteOptions {
    * (for example an HMAC signature). The handler parses after verification.
    */
   rawBody?: boolean;
+  /**
+   * Do not read the body at all: the handler gets the request stream as
+   * `req.stream` and enforces its own size cap (large uploads that must not be
+   * buffered). maxBytes does not apply. Whatever the handler leaves unread is
+   * drained (up to DRAIN_CAP_BYTES) before the response, then the connection closes.
+   */
+  stream?: boolean;
 }
 
 export interface HttpResponse {
@@ -41,6 +50,7 @@ interface RouteDef {
   handler: Handler;
   maxBytes: number;
   rawBody: boolean;
+  stream: boolean;
 }
 
 export const DEFAULT_MAX_BODY = 256 * 1024;
@@ -71,6 +81,33 @@ export function safeEqual(a: string, b: string): boolean {
  * socket is destroyed, so a sender cannot keep the connection busy forever.
  */
 export const DRAIN_CAP_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Read and discard what is left of a request body so the client sees the
+ * response instead of a reset socket. Past DRAIN_CAP_BYTES the socket is destroyed.
+ */
+export function drainRequest(req: IncomingMessage): Promise<void> {
+  if (req.readableEnded || req.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    let size = 0;
+    const done = () => {
+      req.removeListener("data", onData);
+      resolve();
+    };
+    const onData = (c: Buffer) => {
+      size += c.length;
+      if (size > DRAIN_CAP_BYTES) {
+        req.destroy();
+        done();
+      }
+    };
+    req.on("data", onData);
+    req.once("end", done);
+    req.once("close", done);
+    req.once("error", done);
+    req.resume();
+  });
+}
 
 function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -122,7 +159,7 @@ export class HttpServer {
     if (this.routes.some((r) => r.method === method && r.parts.join("/") === parts.join("/"))) {
       throw new Error(`duplicate route ${method} ${pattern}`);
     }
-    this.routes.push({ method, parts, handler, maxBytes: opts?.maxBytes ?? DEFAULT_MAX_BODY, rawBody: opts?.rawBody === true });
+    this.routes.push({ method, parts, handler, maxBytes: opts?.maxBytes ?? DEFAULT_MAX_BODY, rawBody: opts?.rawBody === true, stream: opts?.stream === true });
   }
 
   /** undefined = no route; "bad_path" = a parameter is not valid percent-encoding. */
@@ -197,6 +234,20 @@ export class HttpServer {
     const m = this.match(method, url.pathname);
     if (m === "bad_path") return { status: 400, body: { ok: false, error: "bad_path_encoding" } };
     if (!m) return { status: 404, body: { ok: false, error: "not_found" } };
+    if (m.def.stream) {
+      let out: HttpResponse;
+      try {
+        out = await m.def.handler({ method, path: url.pathname, headers: req.headers, params: m.params, query: url.searchParams, body: undefined, stream: req });
+      } catch (err) {
+        this.log.error(`[http] handler error ${method} ${m.def.parts[0] ?? "/"} ${(err as Error).name}`);
+        out = { status: 500, body: { ok: false, error: "internal" } };
+      }
+      if (!req.readableEnded) {
+        await drainRequest(req);
+        out = { ...out, headers: { ...(out.headers ?? {}), connection: "close" } };
+      }
+      return out;
+    }
     let body: unknown = undefined;
     let rawBody: Buffer | undefined;
     try {

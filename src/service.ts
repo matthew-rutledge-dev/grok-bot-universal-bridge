@@ -4,6 +4,7 @@ import { ADAPTERS } from "../adapters/index.js";
 import { DiscordAdapter, type DiscordAdapterConfig } from "../adapters/discord/index.js";
 import type { DiscordPort } from "../adapters/discord/port.js";
 import { JsonlAudit } from "../core/audit.js";
+import { registerBackupRoute } from "../core/backup.js";
 import { Bridge, type SourceAdapter } from "../core/bridge.js";
 import { liveCallbackAdapters, loadBridgeConfig, publicBaseUrlProblem } from "../core/config.js";
 import type { FetchLike } from "../core/deliver.js";
@@ -53,9 +54,10 @@ export async function buildService(configFile: string, o: ServiceOverrides = {})
   });
   const dataDir = path(config.dataDir || "./data");
   const backoff = Array.isArray(config.hold.backoffMs) && config.hold.backoffMs.length ? config.hold.backoffMs : undefined;
+  const audit = new JsonlAudit(path(config.audit?.path || join(dataDir, "audit.jsonl")));
   const bridge = new Bridge({
     registry,
-    audit: new JsonlAudit(path(config.audit?.path || join(dataDir, "audit.jsonl"))),
+    audit,
     http,
     holdFile: join(dataDir, "hold.json"),
     holdMaxSec: config.hold.maxSec,
@@ -67,6 +69,8 @@ export async function buildService(configFile: string, o: ServiceOverrides = {})
     fetchImpl: o.fetchImpl,
     delayMs: backoff ? (f) => (f <= 0 ? 0 : backoff[Math.min(f, backoff.length) - 1]) : holdRetryDelayMs,
   });
+  // POST /backup/upload: always registered, answers 404 until BRIDGE_BACKUP_UPLOAD_KEY is set.
+  registerBackupRoute(http, { registry, audit, env, log });
   const adapters = new Map<string, SourceAdapter>();
   for (const [name, entry] of Object.entries(config.adapters)) {
     if (!entry.enabled) continue;
