@@ -256,29 +256,36 @@ test("in flight: only a .part under .incoming exists, never the final name; a ki
   const root = tmp("ubridge-backup-");
   const s = await server({ root });
   const file = join(root, "example-agent", DAY, "killed.bin");
+  const req = request(
+    { host: "127.0.0.1", port: s.port, method: "POST", path: "/backup/upload?bot=example-agent&name=killed.bin", headers: { authorization: auth, "content-length": "100000" } },
+    () => undefined,
+  );
+  const closed = new Promise<void>((resolve) => {
+    req.on("error", () => resolve());
+    req.on("close", () => resolve());
+  });
   try {
     // Hold an upload open mid-body: the final name must not exist yet.
-    const pending = new Promise<void>((resolve) => {
-      const req = request(
-        { host: "127.0.0.1", port: s.port, method: "POST", path: "/backup/upload?bot=example-agent&name=killed.bin", headers: { authorization: auth, "content-length": "100000" } },
-        () => undefined,
-      );
-      req.on("error", () => resolve());
-      req.on("close", () => resolve());
-      req.write(randomBytes(4096), async () => {
-        const end = Date.now() + 3000;
-        while (Date.now() < end && leftovers(root).length === 0) await new Promise((r) => setTimeout(r, 10));
-        assert.equal(leftovers(root).length, 1);
-        assert.match(leftovers(root)[0], /^[0-9a-f]{24}\.part$/);
-        assert.equal(existsSync(file), false, "no file under the real name while streaming");
-        req.destroy();
-      });
-    });
-    await pending;
+    req.write(randomBytes(4096));
+    const isPart = (n: string) => /^[0-9a-f]{24}\.part$/.test(n);
+    const deadline = Date.now() + 3000;
+    let mid: string[] = [];
+    while (Date.now() < deadline) {
+      mid = leftovers(root);
+      // The first upload also probes hard-link support with throwaway *.probe files
+      // under .incoming; wait until those are gone and only the in-flight .part remains.
+      if (mid.length === 1 && isPart(mid[0])) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(mid.length, 1, `expected one in-flight .part, got ${JSON.stringify(mid)}`);
+    assert.match(mid[0], /^[0-9a-f]{24}\.part$/);
+    assert.equal(existsSync(file), false, "no file under the real name while streaming");
+    req.destroy();
+    await closed;
     // Simulate a process kill: a stray .part the cleanup never got to.
     writeFileSync(join(incomingOf(root), "0123456789abcdef01234567.part"), "truncated");
-    const end = Date.now() + 3000;
-    while (Date.now() < end && !s.audit.lines.some((l) => l.outcome === "error")) await new Promise((r) => setTimeout(r, 20));
+    const until = Date.now() + 3000;
+    while (Date.now() < until && !s.audit.lines.some((l) => l.outcome === "error")) await new Promise((r) => setTimeout(r, 20));
     assert.equal(existsSync(file), false);
     const retry = await post(s.port, "bot=example-agent&name=killed.bin", [Buffer.from("complete")], { auth });
     assert.equal(retry.status, 201);
@@ -288,6 +295,7 @@ test("in flight: only a .part under .incoming exists, never the final name; a ki
     assert.equal(lookalike.status, 201);
     assert.equal(lookalike.body.path, `example-agent/${DAY}/${BACKUP_INCOMING_DIR}`);
   } finally {
+    req.destroy();
     await s.http.close();
   }
 });
