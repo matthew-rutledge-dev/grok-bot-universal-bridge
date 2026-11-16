@@ -195,6 +195,54 @@ Daily / weekly per car, never per record: `service_data` every `service_h` (defa
 
 Add these to `telemetry.fields` (and so to the pushed `fleet_telemetry_config`): `Version` 3600, `SoftwareUpdateInstallationPercentComplete` 60, `Odometer` 600, `ServiceMode` 60, `TpmsPressureFl` / `Fr` / `Rl` / `Rr` 600, `TpmsSoftWarnings` / `TpmsHardWarnings` 60, `ChargeEnableRequest` 60, `ChargeLimitSoc` 600, `RatedRange` 600, `EnergyRemaining` 600, `BMSState` 60, `Hvil` 60, `AutomaticEmergencyBrakingOff` 3600, `CarType` 86400, `Trim` 86400, `Location` 300 (only if location on safety/service events is wanted; it needs the `vehicle_location` scope). Alerts additionally need `alert_types` in the vehicle config: community examples use `["service"]` (some add `"customer"`, `"service-fix"`, matching the `Audience` enum); Tesla's endpoint page doesn't list the values, so confirm on the first push. The plugin repo's telemetry field doc has the full request body; pushing it is an operator step that needs the owner's yes.
 
+## Telemetry stall alert (`telemetry.stall_alert`, off by default)
+
+A car that is awake but whose stream has silently died produces no records, so no trigger can notice it. With `stall_alert.enabled`, the adapter remembers when the last live message arrived for each VIN in `telemetry.vin_allowlist` (a retained MQTT replay doesn't count; after a restart the clock starts at bridge start). Once a car has been silent for `silent_minutes`, every `check_minutes` it makes **one** Fleet API call, `GET /api/1/vehicles` (the account's vehicle list with each car's state as Tesla's servers know it; not a live call to the car like `vehicle_data`, and the bridge never calls `wake_up`), and reads that car's `state`:
+
+| `state` | Result |
+|---|---|
+| `online` | one `telemetry_stalled` event to the `{ "kind": "telemetry_stall" }` route |
+| `asleep` / `offline` | no event (a sleeping car streams nothing); audited `stall_car_asleep` / `stall_car_offline` |
+| VIN not in the list / other | no event; audited `stall_vin_not_listed` / `stall_car_state_unknown` |
+
+Non-online outcomes are audited when they change, not on every check. A stall fires at most once; when messages return, `telemetry_resumed` follows once. Prompts carry a JSON envelope (`kind`, `event_type`, `vin_last6`, `ts`, `priority`, `data` with `last_message_at`, `since` and `silent_minutes`), never the full VIN.
+
+**Cost:** Tesla bills each Fleet API answer below 500. While messages flow there are no calls. While a car is silent there is at most one call per check for all cars together, and none once every silent car has alerted. A car that sleeps overnight with the defaults costs about 12 calls an hour while it is asleep past `silent_minutes`; raise `check_minutes` to spend less.
+
+**Errors:** the call uses the same guards as the other REST pulls (allowlisted regional `api_base` only, redirects refused, 1 MiB body cap). A 429 waits out `Retry-After` (capped at an hour); 401/403 re-reads `token_ref` once and retries if the token changed, else backs off from `check_minutes` doubling to an hour. Errors are audited with their code and `type` `telemetry_stall_check`, and never fire an event. A broker disconnect is already audited as `connection` / `mqtt_*`; if it lasts past `silent_minutes` while the car is online, the stall alert fires too.
+
+```json
+"telemetry": {
+  "stall_alert": {
+    "enabled": true,
+    "silent_minutes": 30,
+    "check_minutes": 5,
+    "api_base": "https://fleet-api.prd.na.vn.cloud.tesla.com",
+    "token_ref": "file:/run/secrets/tesla-fleet/access-token"
+  }
+}
+```
+
+`silent_minutes` is 5-1440 (default 30), `check_minutes` 1-60 (default 5). `api_base` and `token_ref` (an access token only, as for energy polling and the ownership REST pulls; the plugin's export file works) are required when enabled, and so is an enabled route with `match: { "kind": "telemetry_stall" }`. Pick `silent_minutes` above the longest interval you expect between messages while the car is awake (a `resend_interval_seconds` heartbeat on one field keeps that bounded).
+
+## Telemetry history (`telemetry.history`, off by default)
+
+With `history.enabled`, every accepted telemetry datum of an allowlisted VIN is appended to a local SQLite file. It is **write-only** from the bridge: there are no read routes; read the file on the host (for example with the `sqlite3` CLI, read-only).
+
+* **What is written:** each field of each record the adapter accepts, including resends. Retained MQTT replays, stale records (older than the last one seen), alerts and telemetry-error records, and non-allowlisted VINs are never written.
+* **Schema:** `telemetry(id, vin, field, value, created_at, received_at)`. `value` is the decoded value as JSON (`50`, `"DetailedChargeStateComplete"`, `{"DriverFront":false,...}`); `created_at` (the car's time, or the receive time when missing) and `received_at` are epoch milliseconds. Indexes on `(vin, field, created_at)` and `received_at`.
+* **Storage:** WAL mode, writes batched into one transaction per second (or per 500 rows). The file (and its `-wal`/`-shm` side files) is mode 600. Rows received more than `retention_days` ago are pruned at start and once a day.
+* **Failure:** a database error drops that batch and audits `history_write_failed` (at most once a minute, with the row count). History never blocks or breaks ingest or the wake triggers. If the file can't be opened the adapter audits `history_open_failed` and runs without history.
+* **Runtime:** uses the built-in `node:sqlite` (Node 22.13 or later; the Docker image ships Node 22). On an older Node the adapter audits `history_sqlite_unavailable` and runs without history. Node prints a one-time `ExperimentalWarning` for `node:sqlite`.
+
+```json
+"telemetry": {
+  "history": { "enabled": true, "path": "file:/var/lib/bridge/telemetry-history.sqlite", "retention_days": 90 }
+}
+```
+
+`path` is optional (`file:/absolute/path`); the default is `tesla-telemetry-history.sqlite` in the bridge data dir (next to the hold file). With no data dir and no `path`, history stays off (`history_no_path`). `retention_days` is 1-3650 (default 90). Size grows with the number of fields and their intervals; the full example `fields` list is roughly tens of thousands of rows per car per day while it is awake.
+
 ## Energy polling
 
 * `live_status` right at start, then every `interval_s` (default 300, floor 60). A tick is skipped while the previous poll is still running, and a failed tick is audited `poll_failed`.
@@ -216,7 +264,7 @@ Add these to `telemetry.fields` (and so to the pushed `fleet_telemetry_config`):
 
 ## Config
 
-See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN), `{ "kind": "energy" }` (actor = site id), `{ "kind": "ownership" }` (actor = VIN; ownership events and digests) or `{ "kind": "dashcam_autosave" }` (actor = VIN; experimental dashcam notify). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited. `audit_full_vin` (boolean, default `true`) controls whether audit lines carry an allowlisted car's full VIN or its last 6; flip it to `false` to mask.
+See `config.example.json`. Routes match `{ "kind": "vehicle" }` (actor = VIN), `{ "kind": "energy" }` (actor = site id), `{ "kind": "ownership" }` (actor = VIN; ownership events and digests), `{ "kind": "dashcam_autosave" }` (actor = VIN; experimental dashcam notify) or `{ "kind": "telemetry_stall" }` (actor = VIN; stall alert). Rules are `{ on, wake, debounce_s, priority }`. With `wake: false` a trigger is only observed and audited. `audit_full_vin` (boolean, default `true`) controls whether audit lines carry an allowlisted car's full VIN or its last 6; flip it to `false` to mask.
 
 
 ## Experimental dashcam auto-save
