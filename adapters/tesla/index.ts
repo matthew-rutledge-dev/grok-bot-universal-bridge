@@ -31,6 +31,8 @@ import {
   validateDashcamAutosave,
   type DashcamAutosaveConfig,
 } from "./dashcam-autosave.js";
+import { TelemetryStallRuntime, validateStallAlert, type StallAlertConfig } from "./telemetry-stall.js";
+import { TelemetryHistory, validateHistory, type TelemetryHistoryConfig } from "./telemetry-history.js";
 import { DecodedJsonReceiver, isLoopbackHost, MtlsTelemetryReceiver, splitListen, type DropReason, type TelemetryReceiver } from "./receiver.js";
 
 export * from "./fields.js";
@@ -43,6 +45,8 @@ export * from "./ownership-runtime.js";
 export * from "./dashcam-autosave.js";
 export * from "./signed-command.js";
 export * from "./proto-wire.js";
+export * from "./telemetry-stall.js";
+export * from "./telemetry-history.js";
 
 /**
  * Tesla source adapter.
@@ -70,6 +74,9 @@ export * from "./proto-wire.js";
  *   - Never poll vehicle_data or wake a car. Vehicles are push-only via telemetry (except the
  *     experimental dashcam path above, which may wake the car as a side effect of the command).
  *   - Energy uses an ACCESS token only (energy_device_data). Refresh tokens are refused.
+ *   - Optional stall alert: GET /api/1/vehicles (vehicle list, each car's state) only while a car
+ *     is silent past silent_minutes; never vehicle_data, never wake_up. See telemetry-stall.ts.
+ *   - Optional history: write-only local SQLite of accepted datums. See telemetry-history.ts.
  *   - Replies go back through the agent's origin channel; there is no /tesla/callback.
  *   - Prompts and audit carry a masked VIN / site id only.
  */
@@ -138,6 +145,10 @@ export interface TeslaConfig {
     low_battery_percent?: number;
     /** resend_interval_seconds the plugin applies to every field (a long one, e.g. 21600). Documentation for the plugin; the bridge never pushes config. */
     resend_interval_s?: number;
+    /** Optional: alert once when an online car stops streaming (route match { kind: "telemetry_stall" }). Off by default. */
+    stall_alert?: StallAlertConfig;
+    /** Optional: append every accepted datum to a local SQLite file (write-only). Off by default. */
+    history?: TelemetryHistoryConfig;
   };
   energy_poll?: {
     enabled: boolean;
@@ -232,6 +243,9 @@ export function validateTeslaConfig(raw: unknown): string[] {
       }
     }
     if (t.enabled && mode === "decoded" && !t.decoded_listen) p.push("tesla.telemetry.decoded_listen is required in decoded mode");
+    const hasStall = (c.routes ?? []).some((r) => r.match?.kind === "telemetry_stall" && r.enabled !== false);
+    p.push(...validateStallAlert(t.stall_alert, hasStall, Boolean(t.enabled)));
+    p.push(...validateHistory(t.history));
   }
   const e = c.energy_poll;
   if (e) {
@@ -250,8 +264,8 @@ export function validateTeslaConfig(raw: unknown): string[] {
   }
   for (const [i, r] of (c.routes ?? []).entries()) {
     const keys = Object.keys(r.match ?? {});
-    if (keys.length !== 1 || keys[0] !== "kind" || !["vehicle", "energy", "ownership", "dashcam_autosave"].includes(String(r.match.kind))) {
-      p.push(`tesla.routes[${i}]: match must be { kind: "vehicle" }, { kind: "energy" }, { kind: "ownership" } or { kind: "dashcam_autosave" }`);
+    if (keys.length !== 1 || keys[0] !== "kind" || !["vehicle", "energy", "ownership", "dashcam_autosave", "telemetry_stall"].includes(String(r.match.kind))) {
+      p.push(`tesla.routes[${i}]: match must be { kind: "vehicle" }, { kind: "energy" }, { kind: "ownership" }, { kind: "dashcam_autosave" } or { kind: "telemetry_stall" }`);
     }
   }
   if (c.ownership !== undefined) {
@@ -363,6 +377,8 @@ export class TeslaAdapter implements SourceAdapter {
   private energy?: EnergyStatusSource;
   private ownership?: OwnershipRuntime;
   private dashcam?: DashcamAutosaveRuntime;
+  private stall?: TelemetryStallRuntime;
+  private history?: TelemetryHistory;
   private polling = false;
   private skipUntil = 0;
   private skipReason = "";
@@ -417,6 +433,19 @@ export class TeslaAdapter implements SourceAdapter {
         auditVin: (vin) => this.auditVin(vin),
       });
       this.dashcam.start();
+    }
+    if (t?.enabled && t.history?.enabled) {
+      const h = new TelemetryHistory(t.history, this.ctx, { now: this.now });
+      if (await h.start()) this.history = h;
+    }
+    if (t?.enabled && t.stall_alert?.enabled) {
+      this.stall = new TelemetryStallRuntime(t.stall_alert, t.vin_allowlist, this.ctx, {
+        now: this.now,
+        fetchImpl: this.deps.fetchImpl,
+        testHosts: this.deps.testHosts,
+        auditVin: (vin) => this.auditVin(vin),
+      });
+      this.stall.start();
     }
     if (t?.enabled) {
       const mode = t.mode ?? "decoded";
@@ -512,18 +541,32 @@ export class TeslaAdapter implements SourceAdapter {
     await this.receiver?.stop().catch(() => undefined);
     await this.ownership?.stop();
     await this.dashcam?.stop();
+    this.stall?.stop();
+    this.history?.stop();
   }
 
   health(): Record<string, unknown> {
     return {
       ownership: this.ownership?.health() ?? { enabled: false },
       dashcam_autosave: this.dashcam?.health() ?? { experimental: true, armed: false },
+      telemetry_stall: this.stall?.health() ?? { enabled: false },
+      telemetry_history: this.history?.health() ?? { enabled: false },
     };
   }
 
   /** Ownership runtime (tests / ops): digest flush, REST pull, pending counts. */
   ownershipRuntime(): OwnershipRuntime | undefined {
     return this.ownership;
+  }
+
+  /** Telemetry stall runtime (tests / ops). */
+  stallRuntime(): TelemetryStallRuntime | undefined {
+    return this.stall;
+  }
+
+  /** Telemetry history writer (tests / ops). */
+  historyWriter(): TelemetryHistory | undefined {
+    return this.history;
   }
 
   /** Bound telemetry port (tests / ops). */
@@ -573,6 +616,10 @@ export class TeslaAdapter implements SourceAdapter {
       this.vinDenied(r.vin);
       return [];
     }
+    // Any live message (not a retained replay) shows the stream is up.
+    if (this.stall && !r.baseline) {
+      void this.stall.seen(r.vin).catch(() => this.ctx.audit({ action: "observe", outcome: "error", reason: "stall_notify_failed", ...this.auditVin(r.vin) }));
+    }
     if (r.telemetryErrors !== undefined) {
       // The car's telemetry client reporting its own errors (bad config, unknown field): audit only.
       this.ctx.audit({ action: "observe", outcome: "error", reason: "telemetry_client_errors", ...this.auditVin(r.vin), count: r.telemetryErrors });
@@ -605,6 +652,7 @@ export class TeslaAdapter implements SourceAdapter {
       return [];
     }
     if (!Number.isNaN(at)) this.lastCreatedAt.set(r.vin, at);
+    if (this.history && Object.keys(r.data).length) this.history.add(r.vin, r.data, Number.isNaN(at) ? this.now() : at, this.now());
     const prev = this.lastVehicle.get(r.vin);
     const { next, delta } = mergeState(prev, r.data);
     this.lastVehicle.set(r.vin, next);

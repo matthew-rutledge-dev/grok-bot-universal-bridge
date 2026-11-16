@@ -29,7 +29,18 @@
       "AutomaticEmergencyBrakingOff": 3600, "CarType": 86400, "Trim": 86400, "Location": 300
     },
     "resend_interval_s": 21600,
-    "low_battery_percent": 20
+    "low_battery_percent": 20,
+    "stall_alert": {
+      "enabled": false,
+      "silent_minutes": 30,
+      "check_minutes": 5,
+      "api_base": "https://fleet-api.prd.na.vn.cloud.tesla.com",
+      "token_ref": "file:/run/secrets/tesla-fleet/access-token"
+    },
+    "history": {
+      "enabled": false,
+      "retention_days": 90
+    }
   },
   "energy_poll": {
     "enabled": false,
@@ -87,6 +98,7 @@
     { "id": "example-vehicle", "enabled": true, "match": { "kind": "vehicle" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" },
     { "id": "example-energy", "enabled": true, "match": { "kind": "energy" }, "allowActors": ["1111111111111111"], "agent": "example-agent" },
     { "id": "example-ownership", "enabled": true, "match": { "kind": "ownership" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" },
-    { "id": "example-dashcam-autosave", "enabled": true, "match": { "kind": "dashcam_autosave" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" }
+    { "id": "example-dashcam-autosave", "enabled": true, "match": { "kind": "dashcam_autosave" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" },
+    { "id": "example-telemetry-stall", "enabled": true, "match": { "kind": "telemetry_stall" }, "allowActors": ["5YJ0000000EXAMPLE"], "agent": "example-agent" }
   ]
 }
