@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deliver, DeliveryConfigError, DeliveryError, isRetryable } from "./deliver.js";
+import { deliver, DeliveryConfigError, DeliveryError, failureCode, isGatewayConflict, isPermanentGatewayConflict, isRetryable, parseGatewayFailureCode } from "./deliver.js";
 import { mockRoutine } from "../test/helpers.js";
 
 test("webhook delivery sends Bearer + X-Automation-Key and the prompt payload", async () => {
@@ -49,8 +49,65 @@ test("a 200 with success:false is a rejection, not a delivery", async () => {
 test("retry classification", () => {
   for (const s of [502, 503, 504, 530, 408, 429]) assert.equal(isRetryable(new DeliveryError("x", s)), true, `status ${s}`);
   for (const s of [400, 401, 403, 404, 422]) assert.equal(isRetryable(new DeliveryError("x", s)), false, `status ${s}`);
+  assert.equal(isRetryable(new DeliveryError("x", 409)), false, "409 is a gateway reject, not a generic retry");
+  assert.equal(isGatewayConflict(new DeliveryError("x", 409)), true);
+  assert.equal(isGatewayConflict(new DeliveryError("x", 401)), false);
+  const unavailable = new DeliveryError("x", 409, JSON.stringify({ failureCode: "send/agent-unavailable" }));
+  assert.equal(parseGatewayFailureCode(unavailable.body), "send/agent-unavailable");
+  assert.equal(parseGatewayFailureCode(JSON.stringify({ error: { code: "send/agent-unavailable" } })), "send/agent-unavailable");
+  assert.equal(parseGatewayFailureCode(JSON.stringify({ message: "busy" })), undefined);
+  assert.equal(isPermanentGatewayConflict(unavailable), true);
+  assert.equal(isPermanentGatewayConflict(new DeliveryError("x", 409, JSON.stringify({ message: "busy" }))), false);
+  assert.equal(failureCode(unavailable), "send/agent-unavailable");
   assert.equal(isRetryable(new DeliveryError("x", 500, "error code: 1033")), true);
   assert.equal(isRetryable(new DeliveryConfigError("no key")), false);
   assert.equal(isRetryable(Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } })), true);
   assert.equal(isRetryable(Object.assign(new Error("x"), { name: "TimeoutError" })), true);
+});
+
+test("a 409 from the gateway is logged with a masked message, never the raw token or full id", async () => {
+  const lines: string[] = [];
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const token = "tok_EXAMPLE_not_a_real_secret";
+  const fetchImpl: typeof fetch = async () =>
+    new Response(JSON.stringify({ message: `active agent is ${agentId}`, token }), {
+      status: 409,
+      headers: { "content-type": "application/json" },
+    });
+  await assert.rejects(
+    deliver(
+      { alias: "a", agentId, kind: "sendprompt", url: "http://127.0.0.1/api/sendPrompt", key: "k", timeoutMs: 2000 },
+      { agentId, prompt: "p" },
+      { from: "bridge:test", fetchImpl, log: { info() {}, warn: (l) => lines.push(l), error() {} } },
+    ),
+    (e: unknown) => e instanceof DeliveryError && e.status === 409,
+  );
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[deliver\] rejected code=http_409 message=/);
+  assert.match(lines[0], /…1111/);
+  assert.equal(lines[0].includes(agentId), false, "full agent id must not be logged");
+  assert.equal(lines[0].includes(token), false, "token must not be logged");
+  assert.ok(lines[0].length < 280, "masked line stays short");
+});
+
+test("a permanent send/agent-unavailable 409 is logged as failure=, never the raw gateway message", async () => {
+  const lines: string[] = [];
+  const body = {
+    failureCode: "send/agent-unavailable",
+    message: "example: delivery refused for a server-hosted agent (no signed-in session)",
+  };
+  const fetchImpl: typeof fetch = async () =>
+    new Response(JSON.stringify(body), { status: 409, headers: { "content-type": "application/json" } });
+  await assert.rejects(
+    deliver(
+      { alias: "a", agentId: "11111111-1111-4111-8111-111111111111", kind: "sendprompt", url: "http://127.0.0.1/api/sendPrompt", key: "k", timeoutMs: 2000 },
+      { agentId: "11111111-1111-4111-8111-111111111111", prompt: "p" },
+      { from: "bridge:test", fetchImpl, log: { info() {}, warn: (l) => lines.push(l), error() {} } },
+    ),
+    (e: unknown) => e instanceof DeliveryError && e.status === 409 && failureCode(e) === "send/agent-unavailable",
+  );
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0], "[deliver] rejected code=http_409 failure=send/agent-unavailable");
+  assert.equal(lines[0].includes("signed-in session"), false);
+  assert.equal(lines[0].includes("example:"), false);
 });

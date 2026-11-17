@@ -3,7 +3,9 @@ import { dirname } from "node:path";
 import { validateRoutes } from "../../core/allowlist.js";
 import { isSecretRef } from "../../core/secrets.js";
 import { legacyPathProblem, type AdapterContext, type SourceAdapter } from "../../core/bridge.js";
+import { DeliveryError, gatewayConflictCode, isGatewayConflict, isPermanentGatewayConflict } from "../../core/deliver.js";
 import type { HeldItem } from "../../core/hold.js";
+import { maskDeliveryMessage } from "../../core/redact.js";
 import type { HttpResponse } from "../../core/http.js";
 import { MultipartBody, MultipartError } from "../../core/multipart.js";
 import type { InboundEvent, Route } from "../../core/types.js";
@@ -142,6 +144,22 @@ export const HOLD_STATUS_TEXT = "Bot is waking up, holding your message…";
 export const HOLD_DELIVERED_TEXT = "Delivered. The bot is on it.";
 export const HOLD_GAVE_UP_TEXT = "❌ Couldn't reach the bot, please try again.";
 export const FAILED_TEXT = "❌ Couldn't deliver that message.";
+
+/** User-facing give-up text. Permanent gateway codes get a short, safe line. */
+export function holdGaveUpText(err: unknown): string {
+  if (isGatewayConflict(err) || (err instanceof DeliveryError && err.status === 409)) {
+    const code = gatewayConflictCode(err);
+    if (code && isPermanentGatewayConflict(err)) return `❌ Bot unavailable (${code})`;
+    const reason = maskDeliveryMessage(err instanceof DeliveryError ? err.body : "", 80) || "conflict";
+    return `❌ The bot gateway rejected the message (409: ${reason})`;
+  }
+  return HOLD_GAVE_UP_TEXT;
+}
+
+export function failedDeliveryText(err: unknown, held: boolean): string {
+  if (isGatewayConflict(err) || (err instanceof DeliveryError && err.status === 409)) return holdGaveUpText(err);
+  return held ? HOLD_GAVE_UP_TEXT : FAILED_TEXT;
+}
 export const NOT_PAIRED_TEXT = "Not paired. Ask the owner to run `!pair <yourId>` (deny-by-default).";
 export const DELIVERED_EMOJI = "✅";
 export const NOT_ACCEPTED_EMOJI = "⚠️";
@@ -660,10 +678,10 @@ export class DiscordAdapter implements SourceAdapter {
       const notAccepted = (result?.body as { accepted?: unknown } | null | undefined)?.accepted === false;
       if (ch && item.ref?.messageId) await this.port.react(ch, item.ref.messageId, notAccepted ? NOT_ACCEPTED_EMOJI : DELIVERED_EMOJI).catch(() => undefined);
     },
-    failed: async (item: HeldItem, _err: unknown, info: { held: boolean }) => {
+    failed: async (item: HeldItem, err: unknown, info: { held: boolean }) => {
       const ch = item.ref?.channelId;
       if (!ch) return;
-      const text = info.held ? HOLD_GAVE_UP_TEXT : FAILED_TEXT;
+      const text = failedDeliveryText(err, info.held);
       if (item.statusRef) await this.port.edit(ch, item.statusRef, text);
       else await this.port.send(ch, text, { replyTo: item.ref?.messageId });
       if (item.ref?.messageId) await this.port.react(ch, item.ref.messageId, FAILED_EMOJI).catch(() => undefined);

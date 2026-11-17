@@ -14,6 +14,9 @@ import { redactUrl } from "./redact.js";
  *               POST JSON with Authorization: Bearer <key> + X-Automation-Key: <key>.
  *   sendprompt  A sendPrompt-style gateway (compatibility with existing bridges).
  *               POST { agentId, prompt, metadata } with Authorization: Bearer <token>.
+ *               Only works when the agent's computer holds a signed-in session.
+ *               Server-hosted bots must use webhook (the bot's webhook routine);
+ *               sendprompt is refused with send/agent-unavailable.
  */
 export type DeliveryKind = "webhook" | "sendprompt";
 

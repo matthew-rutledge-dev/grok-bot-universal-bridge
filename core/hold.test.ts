@@ -91,6 +91,121 @@ test("wake failure keeps holding; delivery still succeeds when the computer come
   }
 });
 
+test("after a wake, a 409 on a held item is retried then delivered if the gateway recovers inside the grace window", async () => {
+  const wakeSrv = await mockRoutine();
+  const { events, ui } = recorder();
+  const wake = new HttpWakeHook({ url: wakeSrv.url, key: "wk", log: silentLogger });
+  let calls = 0;
+  const q = new HoldQueue({
+    filePath: "",
+    maxMs: 180_000,
+    ui,
+    wake,
+    log: silentLogger,
+    delayMs: () => 15,
+    send: async () => {
+      calls += 1;
+      if (calls === 1) throw new DeliveryError("delivery HTTP 530", 530, "error code: 1033");
+      if (calls === 2) throw new DeliveryError("delivery HTTP 409", 409, JSON.stringify({ message: "active agent is 11111111-1111-4111-8111-111111111111" }));
+      return { status: 200, body: {} };
+    },
+  });
+  try {
+    await q.submit(input("msg"));
+    await wake.lastPost;
+    assert.equal(wakeSrv.hits.length, 1, "one wake POST per outage");
+    assert.equal(wakeSrv.hits[0].body.reason, "tunnel_1033");
+    await until(() => events.some((e) => e.startsWith("delivered") || e.startsWith("failed")));
+    assert.deepEqual(events, ["holding:msg", "delivered:msg:held=true"]);
+    assert.equal(calls, 3);
+    assert.equal(q.heldCount(), 0);
+    assert.equal(wake.armed, true, "re-armed after delivery, not after the 409");
+  } finally {
+    q.stop();
+    await wakeSrv.close();
+  }
+});
+
+test("after a wake, a held 409 is retried for 60s then given up (not treated as delivered)", async () => {
+  const wakeSrv = await mockRoutine();
+  const { events, ui } = recorder();
+  const wake = new HttpWakeHook({ url: wakeSrv.url, key: "wk", log: silentLogger });
+  let t = 1_000_000;
+  let calls = 0;
+  const q = new HoldQueue({
+    filePath: "",
+    maxMs: 180_000,
+    now: () => t,
+    ui,
+    wake,
+    log: silentLogger,
+    delayMs: () => 10,
+    send: async () => {
+      calls += 1;
+      if (calls === 1) throw new DeliveryError("delivery HTTP 530", 530, "error code: 1033");
+      if (calls >= 3) t += 30_000;
+      throw new DeliveryError("delivery HTTP 409", 409, JSON.stringify({ message: "active agent is 11111111-1111-4111-8111-111111111111" }));
+    },
+  });
+  try {
+    await q.submit(input("msg"));
+    await wake.lastPost;
+    await until(() => events.some((e) => e.startsWith("failed") || e.startsWith("delivered")));
+    assert.deepEqual(events, ["holding:msg", "failed:msg:held=true:expired=false"]);
+    assert.ok(calls >= 3, `expected retries inside the grace window, got ${calls}`);
+    assert.equal(q.heldCount(), 0);
+  } finally {
+    q.stop();
+    await wakeSrv.close();
+  }
+});
+
+test("a held send/agent-unavailable 409 fails immediately, with no 60s grace retry", async () => {
+  const { events, ui } = recorder();
+  let calls = 0;
+  const q = new HoldQueue({
+    filePath: "",
+    maxMs: 180_000,
+    ui,
+    log: silentLogger,
+    delayMs: () => 15,
+    send: async () => {
+      calls += 1;
+      if (calls === 1) throw new DeliveryError("delivery HTTP 530", 530, "error code: 1033");
+      throw new DeliveryError(
+        "delivery HTTP 409",
+        409,
+        JSON.stringify({ failureCode: "send/agent-unavailable", message: "example: delivery refused for a server-hosted agent" }),
+      );
+    },
+  });
+  try {
+    await q.submit(input("msg"));
+    await until(() => events.some((e) => e.startsWith("failed") || e.startsWith("delivered")));
+    assert.deepEqual(events, ["holding:msg", "failed:msg:held=true:expired=false"]);
+    assert.equal(calls, 2, "no extra retries after a permanent 409");
+    assert.equal(q.heldCount(), 0);
+  } finally {
+    q.stop();
+  }
+});
+
+test("a first-try 409 on a new unheld event still fails fast", async () => {
+  const { events, ui } = recorder();
+  const q = new HoldQueue({
+    filePath: "",
+    maxMs: 60_000,
+    ui,
+    log: silentLogger,
+    send: async () => {
+      throw new DeliveryError("delivery HTTP 409", 409);
+    },
+  });
+  await q.submit(input("fresh"));
+  assert.deepEqual(events, ["failed:fresh:held=false:expired=false"]);
+  q.stop();
+});
+
 test("non-retryable failure fails fast without holding", async () => {
   const { events, ui } = recorder();
   const q = new HoldQueue({

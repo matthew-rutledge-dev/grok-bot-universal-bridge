@@ -13,7 +13,7 @@
     },
     "example-gateway-agent": {
       "agentId": "22222222-2222-4222-8222-222222222222",
-      "label": "Example agent behind a sendPrompt-style gateway (compatibility)",
+      "label": "Example agent behind a sendPrompt-style gateway (compatibility; only when a signed-in session can relay it). Server-hosted bots use kind webhook.",
       "deliver": {
         "kind": "sendprompt",
         "url": "http://127.0.0.1:1340/api/sendPrompt",

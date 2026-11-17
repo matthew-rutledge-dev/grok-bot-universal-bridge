@@ -255,7 +255,7 @@ export class Bridge {
   private async send(item: HeldItem) {
     const r = this.opts.registry.resolve(item.agent);
     if (!r.agent) throw new DeliveryConfigError("agent not ready");
-    return deliver(r.agent, item.request, { from: `bridge:${item.adapter}`, requestId: item.id, fetchImpl: this.opts.fetchImpl });
+    return deliver(r.agent, item.request, { from: `bridge:${item.adapter}`, requestId: item.id, fetchImpl: this.opts.fetchImpl, log: this.log });
   }
 
   private uiRouter(): HoldUi {

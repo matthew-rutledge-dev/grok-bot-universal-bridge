@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { DiscordAdapter, HOLD_DELIVERED_TEXT, HOLD_STATUS_TEXT, validateDiscordConfig, type DiscordAdapterConfig } from "./index.js";
+import { DiscordAdapter, failedDeliveryText, HOLD_DELIVERED_TEXT, HOLD_GAVE_UP_TEXT, HOLD_STATUS_TEXT, holdGaveUpText, validateDiscordConfig, type DiscordAdapterConfig } from "./index.js";
+import { DeliveryError } from "../../core/deliver.js";
 import { chunk, formatPrompt } from "./format.js";
 import { BOT, CHANNEL, FakeDiscordPort, GUILD, USER, discordMessage, mockRoutine, startBridge, until } from "../../test/helpers.js";
 
@@ -92,6 +93,50 @@ test("sleeping routine: ONE status message, edited when delivered", async () => 
   } finally {
     await s.close();
   }
+});
+
+test("after a tunnel hold, a 409 then a 200 edits to delivered, not the gave-up text", async () => {
+  const s = await setup([530, 409, 200]);
+  try {
+    await s.adapter.onMessage(discordMessage());
+    await until(() => s.port.edits.length === 1);
+    assert.equal(s.port.sent.length, 1);
+    assert.equal(s.port.sent[0].content, HOLD_STATUS_TEXT);
+    assert.deepEqual(s.port.edits[0], { channelId: CHANNEL, messageId: s.port.sent[0].id, content: HOLD_DELIVERED_TEXT });
+    assert.equal(s.port.edits.some((e) => e.content === HOLD_GAVE_UP_TEXT || /gateway rejected/.test(e.content)), false);
+    assert.equal(s.m.hits.length, 3);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a gateway 409 give-up shows a masked reason, never the generic text or a full id", () => {
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const err = new DeliveryError("delivery HTTP 409", 409, JSON.stringify({ message: `active agent is ${agentId}`, token: "tok_EXAMPLE_not_a_real_secret" }));
+  const text = holdGaveUpText(err);
+  assert.match(text, /^❌ The bot gateway rejected the message \(409: /);
+  assert.match(text, /…1111/);
+  assert.equal(text.includes(agentId), false);
+  assert.equal(text.includes("tok_EXAMPLE_not_a_real_secret"), false);
+  assert.equal(text.includes(HOLD_GAVE_UP_TEXT), false);
+  assert.equal(failedDeliveryText(err, true), text);
+  assert.equal(failedDeliveryText(err, false), text);
+  assert.equal(holdGaveUpText(new DeliveryError("delivery HTTP 530", 530, "error code: 1033")), HOLD_GAVE_UP_TEXT);
+});
+
+test("a permanent send/agent-unavailable 409 shows a short unavailable line", () => {
+  const err = new DeliveryError(
+    "delivery HTTP 409",
+    409,
+    JSON.stringify({
+      failureCode: "send/agent-unavailable",
+      message: "example: delivery refused for a server-hosted agent (no signed-in session)",
+    }),
+  );
+  assert.equal(holdGaveUpText(err), "❌ Bot unavailable (send/agent-unavailable)");
+  assert.equal(failedDeliveryText(err, true), "❌ Bot unavailable (send/agent-unavailable)");
+  assert.equal(holdGaveUpText(err).includes("signed-in"), false);
+  assert.equal(holdGaveUpText(err).includes("example:"), false);
 });
 
 test("callback: posts to allowlisted channels only, edits a status message, splits long replies", async () => {
