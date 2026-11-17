@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { DeliveryError, failureCode, isIdempotentSuccess, isRetryable } from "./deliver.js";
+import { failureCode, GATEWAY_CONFLICT_GRACE_MS, isGatewayConflict, isRetryable } from "./deliver.js";
 import { NO_WAKE, type WakeHook } from "./wake.js";
 import { consoleLogger, type DeliveryRequest, type DeliveryResult, type Logger } from "./types.js";
 
@@ -12,8 +12,9 @@ import { consoleLogger, type DeliveryRequest, type DeliveryResult, type Logger }
  * in memory, mirrored to a JSON file (atomic rename, mode 600) and retried
  * with backoff (5 s, 10 s, 20 s, then every 30 s) until the hold window runs
  * out. Events in one lane stay in order. A wake hook fires once per outage;
- * if the wake fails the hold simply continues. A later HTTP 409 (same
- * requestId already accepted) is treated as delivered, not as a give-up.
+ * if the wake fails the hold simply continues. After a wake, a 409 on a
+ * held item is retried with the usual backoff for a short grace window
+ * (60 s), then given up — it is a gateway reject, not a successful dedupe.
  */
 export const DEFAULT_HOLD_MAX_SEC = 1800;
 const BACKOFF_MS = [5_000, 10_000, 20_000];
@@ -42,6 +43,8 @@ export interface HeldItem extends HoldInput {
   holdStartedAt?: number;
   tries: number;
   failures: number;
+  /** First 409 on a held item; grace for further 409s is counted from here. */
+  conflictStartedAt?: number;
   /** Adapter-owned id of the single status message it edits (e.g. "Working on it"). */
   statusRef?: string;
 }
@@ -62,6 +65,8 @@ export interface HoldQueueOptions {
   now?: () => number;
   /** Override backoff (tests and local smoke runs). */
   delayMs?: (failures: number) => number;
+  /** Override the post-wake 409 grace window (tests). */
+  conflictGraceMs?: number;
   /** Called after each try (audit). */
   onTry?: (item: HeldItem, outcome: "ok" | "held" | "give_up", err?: unknown) => void;
 }
@@ -84,6 +89,7 @@ export class HoldQueue {
   private readonly now: () => number;
   private readonly wake: WakeHook;
   private readonly delay: (f: number) => number;
+  private readonly conflictGraceMs: number;
   private stopped = false;
 
   constructor(private readonly opts: HoldQueueOptions) {
@@ -91,6 +97,7 @@ export class HoldQueue {
     this.now = opts.now ?? (() => Date.now());
     this.wake = opts.wake ?? NO_WAKE;
     this.delay = opts.delayMs ?? holdRetryDelayMs;
+    this.conflictGraceMs = opts.conflictGraceMs ?? GATEWAY_CONFLICT_GRACE_MS;
   }
 
   snapshot(): HeldItem[] {
@@ -237,26 +244,14 @@ export class HoldQueue {
       try {
         result = await this.opts.send(item);
       } catch (err) {
-        // A tunnel 1033/502 can land after the agent already accepted the
-        // request. The retry then gets 409 for the same requestId: that is
-        // delivery, not a fatal reject. A first-try 409 on a new unheld
-        // event still fails fast (it is not a known dedupe).
-        if (isIdempotentSuccess(err) && (item.holding || item.tries > 1)) {
-          result = { status: 409, body: err instanceof DeliveryError ? err.body : "" };
-        } else {
-          await this.onError(lane, item, err);
-          return;
-        }
+        await this.onError(lane, item, err);
+        return;
       }
       const now = this.now();
       this.finish(lane, item);
       this.safeWake(() => this.wake.succeeded());
-      const via409 = result.status === 409;
-      if (item.holding) {
-        const extra = via409 ? " code=idempotent_http_409" : "";
-        this.log.info(`[hold] delivered after ${secs(now - (item.holdStartedAt ?? item.submittedAt))}s tries=${item.tries}${extra}`);
-      }
-      this.opts.onTry?.(item, "ok", via409 ? new DeliveryError("delivery HTTP 409", 409) : undefined);
+      if (item.holding) this.log.info(`[hold] delivered after ${secs(now - (item.holdStartedAt ?? item.submittedAt))}s tries=${item.tries}`);
+      this.opts.onTry?.(item, "ok");
       await this.opts.ui.delivered(item, result, { held: item.holding, elapsedMs: now - item.submittedAt }).catch(() => undefined);
     } finally {
       this.busy.delete(lane);
@@ -266,7 +261,15 @@ export class HoldQueue {
 
   private async onError(lane: string, item: HeldItem, err: unknown): Promise<void> {
     const now = this.now();
-    const retryable = isRetryable(err);
+    // First-try 409 fails fast. After a wake (item already held, typically
+    // following a tunnel 1033/502), retry 409 for a short grace window.
+    if (isGatewayConflict(err) && item.holding) item.conflictStartedAt ??= now;
+    const inConflictGrace =
+      isGatewayConflict(err) &&
+      item.holding &&
+      item.conflictStartedAt !== undefined &&
+      now < item.conflictStartedAt + this.conflictGraceMs;
+    const retryable = isRetryable(err) || inConflictGrace;
     item.failures += 1;
     if (retryable && now < item.deadline) {
       if (!item.holding) {

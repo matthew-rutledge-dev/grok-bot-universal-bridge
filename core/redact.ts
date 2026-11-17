@@ -45,3 +45,47 @@ export function oneLine(s: string, max = 80): string {
   const flat = s.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
+
+/** Max length of a masked gateway / delivery body excerpt written to logs. */
+export const MASKED_DELIVERY_MESSAGE_MAX = 200;
+
+const TOKENISH = /\b(?:authorization|bearer|token|api[_-]?key|secret|password|credential)s?\s*[:=]\s*["']?[^\s"',}]{8,}/gi;
+const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
+const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
+const LONG_HEX = /\b[0-9a-f]{16,}\b/gi;
+const LONG_DEC = /\b\d{10,}\b/g;
+const URL_RE = /https?:\/\/[^\s"'<>]+/gi;
+
+function pickMessage(v: unknown): string | undefined {
+  if (typeof v === "string" && v.trim()) return v;
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  for (const k of ["message", "error", "reason", "detail", "error_message", "errorMessage"]) {
+    const got = pickMessage(o[k]);
+    if (got) return got;
+  }
+  return undefined;
+}
+
+/**
+ * Gateway / delivery body for logs and user-facing give-up text: one line,
+ * tokens and URLs stripped, ids truncated, capped (default 200 characters).
+ */
+export function maskDeliveryMessage(raw: string, max = MASKED_DELIVERY_MESSAGE_MAX): string {
+  let text = raw ?? "";
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    const picked = pickMessage(parsed);
+    if (picked) text = picked;
+    else if (parsed && typeof parsed === "object") text = JSON.stringify(parsed);
+  } catch {
+    /* keep raw */
+  }
+  text = text.replace(URL_RE, (u) => redactUrl(u) ?? "(url)");
+  text = text.replace(TOKENISH, (m) => m.replace(/[^\s"',}]{8,}$/i, "…"));
+  text = text.replace(JWT, "…");
+  text = text.replace(UUID, (id) => `…${id.slice(-4)}`);
+  text = text.replace(LONG_HEX, (id) => `…${id.slice(-4)}`);
+  text = text.replace(LONG_DEC, (id) => `…${id.slice(-4)}`);
+  return oneLine(text, max);
+}
