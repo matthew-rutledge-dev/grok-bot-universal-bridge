@@ -150,7 +150,7 @@ export function holdGaveUpText(err: unknown): string {
   if (isGatewayConflict(err) || (err instanceof DeliveryError && err.status === 409)) {
     const code = gatewayConflictCode(err);
     if (code && isPermanentGatewayConflict(err)) return `❌ Bot unavailable (${code})`;
-    const reason = maskDeliveryMessage(err instanceof DeliveryError ? err.body : "", 80) || "conflict";
+    const reason = maskDeliveryMessage(err instanceof DeliveryError ? err.body : "", { max: 80, urls: "strip" }) || "conflict";
     return `❌ The bot gateway rejected the message (409: ${reason})`;
   }
   return HOLD_GAVE_UP_TEXT;
