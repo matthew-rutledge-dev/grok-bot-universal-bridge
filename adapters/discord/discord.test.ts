@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { DiscordAdapter, HOLD_DELIVERED_TEXT, HOLD_STATUS_TEXT, validateDiscordConfig, type DiscordAdapterConfig } from "./index.js";
+import { DiscordAdapter, HOLD_DELIVERED_TEXT, HOLD_GAVE_UP_TEXT, HOLD_STATUS_TEXT, validateDiscordConfig, type DiscordAdapterConfig } from "./index.js";
 import { chunk, formatPrompt } from "./format.js";
 import { BOT, CHANNEL, FakeDiscordPort, GUILD, USER, discordMessage, mockRoutine, startBridge, until } from "../../test/helpers.js";
 
@@ -89,6 +89,22 @@ test("sleeping routine: ONE status message, edited when delivered", async () => 
     assert.equal(s.port.sent[0].replyTo, "555555555555555555");
     assert.deepEqual(s.port.edits[0], { channelId: CHANNEL, messageId: s.port.sent[0].id, content: HOLD_DELIVERED_TEXT });
     assert.equal(s.m.hits.length, 3);
+  } finally {
+    await s.close();
+  }
+});
+
+test("held message: a 409 on retry edits to delivered, never the gave-up text (regression)", async () => {
+  const s = await setup([530, 409]);
+  try {
+    await s.adapter.onMessage(discordMessage());
+    await until(() => s.port.edits.length === 1);
+    assert.equal(s.port.sent.length, 1);
+    assert.equal(s.port.sent[0].content, HOLD_STATUS_TEXT);
+    assert.deepEqual(s.port.edits[0], { channelId: CHANNEL, messageId: s.port.sent[0].id, content: HOLD_DELIVERED_TEXT });
+    assert.equal(s.port.edits.some((e) => e.content === HOLD_GAVE_UP_TEXT), false);
+    assert.equal(s.m.hits.length, 2);
+    assert.equal(s.m.hits[0].body.requestId, s.m.hits[1].body.requestId);
   } finally {
     await s.close();
   }

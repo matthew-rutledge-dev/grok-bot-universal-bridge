@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deliver, DeliveryConfigError, DeliveryError, isRetryable } from "./deliver.js";
+import { deliver, DeliveryConfigError, DeliveryError, isIdempotentSuccess, isRetryable } from "./deliver.js";
 import { mockRoutine } from "../test/helpers.js";
 
 test("webhook delivery sends Bearer + X-Automation-Key and the prompt payload", async () => {
@@ -49,6 +49,9 @@ test("a 200 with success:false is a rejection, not a delivery", async () => {
 test("retry classification", () => {
   for (const s of [502, 503, 504, 530, 408, 429]) assert.equal(isRetryable(new DeliveryError("x", s)), true, `status ${s}`);
   for (const s of [400, 401, 403, 404, 422]) assert.equal(isRetryable(new DeliveryError("x", s)), false, `status ${s}`);
+  assert.equal(isRetryable(new DeliveryError("x", 409)), false, "409 is not retried; it is an idempotent success");
+  assert.equal(isIdempotentSuccess(new DeliveryError("x", 409)), true);
+  assert.equal(isIdempotentSuccess(new DeliveryError("x", 401)), false);
   assert.equal(isRetryable(new DeliveryError("x", 500, "error code: 1033")), true);
   assert.equal(isRetryable(new DeliveryConfigError("no key")), false);
   assert.equal(isRetryable(Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } })), true);

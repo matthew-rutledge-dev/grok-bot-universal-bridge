@@ -91,6 +91,59 @@ test("wake failure keeps holding; delivery still succeeds when the computer come
   }
 });
 
+test("a tunnel failure then a 409 on retry is delivered once, not a give-up (regression)", async () => {
+  const wakeSrv = await mockRoutine();
+  const { events, ui } = recorder();
+  const wake = new HttpWakeHook({ url: wakeSrv.url, key: "wk", log: silentLogger });
+  const requestIds: string[] = [];
+  let calls = 0;
+  const q = new HoldQueue({
+    filePath: "",
+    maxMs: 60_000,
+    ui,
+    wake,
+    log: silentLogger,
+    delayMs: () => 20,
+    send: async (i) => {
+      calls += 1;
+      requestIds.push(i.id);
+      if (calls === 1) throw new DeliveryError("delivery HTTP 530", 530, "error code: 1033");
+      throw new DeliveryError("delivery HTTP 409", 409);
+    },
+  });
+  try {
+    await q.submit(input("msg"));
+    await wake.lastPost;
+    assert.equal(wakeSrv.hits.length, 1, "one wake POST per outage");
+    assert.equal(wakeSrv.hits[0].body.reason, "tunnel_1033");
+    await until(() => events.some((e) => e.startsWith("delivered") || e.startsWith("failed")));
+    assert.deepEqual(events, ["holding:msg", "delivered:msg:held=true"]);
+    assert.equal(calls, 2, "one retry after the hold");
+    assert.deepEqual(requestIds, ["msg", "msg"], "the same requestId is reused");
+    assert.equal(q.heldCount(), 0);
+    assert.equal(wake.armed, true, "re-armed after the idempotent 409, not given up");
+  } finally {
+    q.stop();
+    await wakeSrv.close();
+  }
+});
+
+test("a first-try 409 on a new unheld event still fails fast", async () => {
+  const { events, ui } = recorder();
+  const q = new HoldQueue({
+    filePath: "",
+    maxMs: 60_000,
+    ui,
+    log: silentLogger,
+    send: async () => {
+      throw new DeliveryError("delivery HTTP 409", 409);
+    },
+  });
+  await q.submit(input("fresh"));
+  assert.deepEqual(events, ["failed:fresh:held=false:expired=false"]);
+  q.stop();
+});
+
 test("non-retryable failure fails fast without holding", async () => {
   const { events, ui } = recorder();
   const q = new HoldQueue({

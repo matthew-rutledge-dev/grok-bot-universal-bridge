@@ -27,7 +27,9 @@ export const USER_AGENT = "grok-bot-universal-bridge/0.1";
 /**
  * Hold-and-retry classification. A sleeping computer or a tunnel that is down:
  * HTTP 502/503/504/530, Cloudflare 1033 in the body, timeouts, network errors.
- * Auth problems and other 4xx fail fast.
+ * Auth problems and other 4xx fail fast. HTTP 409 is not retried: it means the
+ * agent already accepted this requestId (a prior try can look like a tunnel
+ * error after the origin has the event). The hold path treats that as delivered.
  */
 export function isRetryable(err: unknown): boolean {
   if (err instanceof DeliveryConfigError) return false;
@@ -42,6 +44,14 @@ export function isRetryable(err: unknown): boolean {
   if (e?.name === "AbortError" || e?.name === "TimeoutError") return true;
   const text = `${e?.message ?? ""} ${e?.cause?.code ?? ""} ${e?.cause?.message ?? ""}`;
   return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|UND_ERR/i.test(text);
+}
+
+/**
+ * HTTP 409 Conflict: the webhook already accepted this requestId.
+ * After a hold (or on a later try) this is a successful delivery, not a reject.
+ */
+export function isIdempotentSuccess(err: unknown): boolean {
+  return err instanceof DeliveryError && err.status === 409;
 }
 
 /** Short, content-free reason code for logs and the wake body. */

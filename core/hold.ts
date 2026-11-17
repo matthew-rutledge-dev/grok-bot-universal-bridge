@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { failureCode, isRetryable } from "./deliver.js";
+import { DeliveryError, failureCode, isIdempotentSuccess, isRetryable } from "./deliver.js";
 import { NO_WAKE, type WakeHook } from "./wake.js";
 import { consoleLogger, type DeliveryRequest, type DeliveryResult, type Logger } from "./types.js";
 
@@ -12,7 +12,8 @@ import { consoleLogger, type DeliveryRequest, type DeliveryResult, type Logger }
  * in memory, mirrored to a JSON file (atomic rename, mode 600) and retried
  * with backoff (5 s, 10 s, 20 s, then every 30 s) until the hold window runs
  * out. Events in one lane stay in order. A wake hook fires once per outage;
- * if the wake fails the hold simply continues.
+ * if the wake fails the hold simply continues. A later HTTP 409 (same
+ * requestId already accepted) is treated as delivered, not as a give-up.
  */
 export const DEFAULT_HOLD_MAX_SEC = 1800;
 const BACKOFF_MS = [5_000, 10_000, 20_000];
@@ -236,14 +237,26 @@ export class HoldQueue {
       try {
         result = await this.opts.send(item);
       } catch (err) {
-        await this.onError(lane, item, err);
-        return;
+        // A tunnel 1033/502 can land after the agent already accepted the
+        // request. The retry then gets 409 for the same requestId: that is
+        // delivery, not a fatal reject. A first-try 409 on a new unheld
+        // event still fails fast (it is not a known dedupe).
+        if (isIdempotentSuccess(err) && (item.holding || item.tries > 1)) {
+          result = { status: 409, body: err instanceof DeliveryError ? err.body : "" };
+        } else {
+          await this.onError(lane, item, err);
+          return;
+        }
       }
       const now = this.now();
       this.finish(lane, item);
       this.safeWake(() => this.wake.succeeded());
-      if (item.holding) this.log.info(`[hold] delivered after ${secs(now - (item.holdStartedAt ?? item.submittedAt))}s tries=${item.tries}`);
-      this.opts.onTry?.(item, "ok");
+      const via409 = result.status === 409;
+      if (item.holding) {
+        const extra = via409 ? " code=idempotent_http_409" : "";
+        this.log.info(`[hold] delivered after ${secs(now - (item.holdStartedAt ?? item.submittedAt))}s tries=${item.tries}${extra}`);
+      }
+      this.opts.onTry?.(item, "ok", via409 ? new DeliveryError("delivery HTTP 409", 409) : undefined);
       await this.opts.ui.delivered(item, result, { held: item.holding, elapsedMs: now - item.submittedAt }).catch(() => undefined);
     } finally {
       this.busy.delete(lane);
