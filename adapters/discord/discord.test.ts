@@ -124,6 +124,18 @@ test("a gateway 409 give-up shows a masked reason, never the generic text or a f
   assert.equal(holdGaveUpText(new DeliveryError("delivery HTTP 530", 530, "error code: 1033")), HOLD_GAVE_UP_TEXT);
 });
 
+test("an unclassified 409 give-up strips URLs from the user-facing text", () => {
+  const err = new DeliveryError(
+    "delivery HTTP 409",
+    409,
+    JSON.stringify({ message: "rejected, see https://example.com/api/sendPrompt?x=1" }),
+  );
+  const text = holdGaveUpText(err);
+  assert.match(text, /\[url\]/);
+  assert.equal(text.includes("example.com"), false);
+  assert.equal(text.includes("sendPrompt"), false);
+});
+
 test("a permanent send/agent-unavailable 409 shows a short unavailable line", () => {
   const err = new DeliveryError(
     "delivery HTTP 409",
