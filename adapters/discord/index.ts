@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { validateRoutes } from "../../core/allowlist.js";
 import { isSecretRef } from "../../core/secrets.js";
 import { legacyPathProblem, type AdapterContext, type SourceAdapter } from "../../core/bridge.js";
-import { DeliveryError, isGatewayConflict } from "../../core/deliver.js";
+import { DeliveryError, gatewayConflictCode, isGatewayConflict, isPermanentGatewayConflict } from "../../core/deliver.js";
 import type { HeldItem } from "../../core/hold.js";
 import { maskDeliveryMessage } from "../../core/redact.js";
 import type { HttpResponse } from "../../core/http.js";
@@ -145,9 +145,11 @@ export const HOLD_DELIVERED_TEXT = "Delivered. The bot is on it.";
 export const HOLD_GAVE_UP_TEXT = "❌ Couldn't reach the bot, please try again.";
 export const FAILED_TEXT = "❌ Couldn't deliver that message.";
 
-/** User-facing give-up text. A gateway 409 includes a short masked reason. */
+/** User-facing give-up text. Permanent gateway codes get a short, safe line. */
 export function holdGaveUpText(err: unknown): string {
   if (isGatewayConflict(err) || (err instanceof DeliveryError && err.status === 409)) {
+    const code = gatewayConflictCode(err);
+    if (code && isPermanentGatewayConflict(err)) return `❌ Bot unavailable (${code})`;
     const reason = maskDeliveryMessage(err instanceof DeliveryError ? err.body : "", 80) || "conflict";
     return `❌ The bot gateway rejected the message (409: ${reason})`;
   }

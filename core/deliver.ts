@@ -29,9 +29,9 @@ export const USER_AGENT = "grok-bot-universal-bridge/0.1";
  * Hold-and-retry classification. A sleeping computer or a tunnel that is down:
  * HTTP 502/503/504/530, Cloudflare 1033 in the body, timeouts, network errors.
  * Auth problems and other 4xx fail fast. HTTP 409 from a sendPrompt gateway is
- * a reject (stale token, or an agent id the gateway no longer serves), not a
- * successful dedupe. A masked excerpt is logged. The hold path may retry a 409
- * on an already-held item for a short grace window after a wake.
+ * a reject, not a successful dedupe. A permanent gateway code such as
+ * send/agent-unavailable fails fast. A 409 with no code, or an unknown code,
+ * may be retried on an already-held item for a short grace window after a wake.
  */
 export function isRetryable(err: unknown): boolean {
   if (err instanceof DeliveryConfigError) return false;
@@ -53,12 +53,55 @@ export function isGatewayConflict(err: unknown): boolean {
   return err instanceof DeliveryError && err.status === 409;
 }
 
-/** After a wake, a 409 on a held item is retried this long before giving up. */
+/** After a wake, an unclassified 409 on a held item is retried this long before giving up. */
 export const GATEWAY_CONFLICT_GRACE_MS = 60_000;
+
+/** `kind/name` codes from a gateway 409 body (failureCode or code). */
+const GATEWAY_CODE_RE = /^[a-z][a-z0-9_-]{0,32}\/[a-z][a-z0-9_-]{0,63}$/i;
+
+/** Gateway 409 codes that will not recover on retry (no signed-in box session, etc.). */
+export const PERMANENT_GATEWAY_CODES: ReadonlySet<string> = new Set(["send/agent-unavailable"]);
+
+function pickGatewayCodeField(v: unknown): string[] {
+  if (!v || typeof v !== "object") return [];
+  const o = v as Record<string, unknown>;
+  const out: string[] = [];
+  for (const k of ["failureCode", "code"]) if (typeof o[k] === "string") out.push(o[k] as string);
+  if (o.error && typeof o.error === "object") out.push(...pickGatewayCodeField(o.error));
+  return out;
+}
+
+/** Parse a safe `kind/name` failure code from a gateway 409 body. */
+export function parseGatewayFailureCode(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    for (const raw of pickGatewayCodeField(parsed)) {
+      const code = raw.trim().toLowerCase();
+      if (GATEWAY_CODE_RE.test(code)) return code;
+    }
+  } catch {
+    /* not JSON */
+  }
+  return undefined;
+}
+
+export function gatewayConflictCode(err: unknown): string | undefined {
+  return isGatewayConflict(err) ? parseGatewayFailureCode((err as DeliveryError).body) : undefined;
+}
+
+/** A 409 whose gateway code is known to be permanent: fail fast, do not grace-retry. */
+export function isPermanentGatewayConflict(err: unknown): boolean {
+  const code = gatewayConflictCode(err);
+  return code !== undefined && PERMANENT_GATEWAY_CODES.has(code);
+}
 
 /** Short, content-free reason code for logs and the wake body. */
 export function failureCode(err: unknown): string {
-  if (err instanceof DeliveryError) return /\b1033\b/.test(err.body) ? "tunnel_1033" : `http_${err.status}`;
+  if (err instanceof DeliveryError) {
+    if (/\b1033\b/.test(err.body)) return "tunnel_1033";
+    const gw = err.status === 409 ? parseGatewayFailureCode(err.body) : undefined;
+    return gw ?? `http_${err.status}`;
+  }
   if (err instanceof DeliveryConfigError) return "config";
   const e = err as { name?: string } | null;
   if (e?.name === "AbortError" || e?.name === "TimeoutError") return "timeout";
@@ -92,7 +135,12 @@ async function post(
     /* keep text */
   }
   if (res.status === 409) {
-    log?.warn(`[deliver] rejected code=http_409 message=${maskDeliveryMessage(text)}`);
+    const failure = parseGatewayFailureCode(text);
+    log?.warn(
+      failure
+        ? `[deliver] rejected code=http_409 failure=${failure}`
+        : `[deliver] rejected code=http_409 message=${maskDeliveryMessage(text)}`,
+    );
   }
   if (!res.ok) throw new DeliveryError(`delivery HTTP ${res.status}`, res.status, text);
   return { status: res.status, body: parsed };

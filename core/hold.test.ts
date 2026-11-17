@@ -160,6 +160,36 @@ test("after a wake, a held 409 is retried for 60s then given up (not treated as 
   }
 });
 
+test("a held send/agent-unavailable 409 fails immediately, with no 60s grace retry", async () => {
+  const { events, ui } = recorder();
+  let calls = 0;
+  const q = new HoldQueue({
+    filePath: "",
+    maxMs: 180_000,
+    ui,
+    log: silentLogger,
+    delayMs: () => 15,
+    send: async () => {
+      calls += 1;
+      if (calls === 1) throw new DeliveryError("delivery HTTP 530", 530, "error code: 1033");
+      throw new DeliveryError(
+        "delivery HTTP 409",
+        409,
+        JSON.stringify({ failureCode: "send/agent-unavailable", message: "example: delivery refused for a server-hosted agent" }),
+      );
+    },
+  });
+  try {
+    await q.submit(input("msg"));
+    await until(() => events.some((e) => e.startsWith("failed") || e.startsWith("delivered")));
+    assert.deepEqual(events, ["holding:msg", "failed:msg:held=true:expired=false"]);
+    assert.equal(calls, 2, "no extra retries after a permanent 409");
+    assert.equal(q.heldCount(), 0);
+  } finally {
+    q.stop();
+  }
+});
+
 test("a first-try 409 on a new unheld event still fails fast", async () => {
   const { events, ui } = recorder();
   const q = new HoldQueue({

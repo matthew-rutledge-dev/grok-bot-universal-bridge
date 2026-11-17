@@ -124,6 +124,21 @@ test("a gateway 409 give-up shows a masked reason, never the generic text or a f
   assert.equal(holdGaveUpText(new DeliveryError("delivery HTTP 530", 530, "error code: 1033")), HOLD_GAVE_UP_TEXT);
 });
 
+test("a permanent send/agent-unavailable 409 shows a short unavailable line", () => {
+  const err = new DeliveryError(
+    "delivery HTTP 409",
+    409,
+    JSON.stringify({
+      failureCode: "send/agent-unavailable",
+      message: "example: delivery refused for a server-hosted agent (no signed-in session)",
+    }),
+  );
+  assert.equal(holdGaveUpText(err), "❌ Bot unavailable (send/agent-unavailable)");
+  assert.equal(failedDeliveryText(err, true), "❌ Bot unavailable (send/agent-unavailable)");
+  assert.equal(holdGaveUpText(err).includes("signed-in"), false);
+  assert.equal(holdGaveUpText(err).includes("example:"), false);
+});
+
 test("callback: posts to allowlisted channels only, edits a status message, splits long replies", async () => {
   const s = await setup();
   const auth = { authorization: "Bearer cb-discord" };

@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { failureCode, GATEWAY_CONFLICT_GRACE_MS, isGatewayConflict, isRetryable } from "./deliver.js";
+import { failureCode, GATEWAY_CONFLICT_GRACE_MS, isGatewayConflict, isPermanentGatewayConflict, isRetryable } from "./deliver.js";
 import { NO_WAKE, type WakeHook } from "./wake.js";
 import { consoleLogger, type DeliveryRequest, type DeliveryResult, type Logger } from "./types.js";
 
@@ -14,7 +14,8 @@ import { consoleLogger, type DeliveryRequest, type DeliveryResult, type Logger }
  * out. Events in one lane stay in order. A wake hook fires once per outage;
  * if the wake fails the hold simply continues. After a wake, a 409 on a
  * held item is retried with the usual backoff for a short grace window
- * (60 s), then given up — it is a gateway reject, not a successful dedupe.
+ * (60 s) only when the gateway body has no code, or an unknown one. A
+ * permanent code such as send/agent-unavailable fails immediately.
  */
 export const DEFAULT_HOLD_MAX_SEC = 1800;
 const BACKOFF_MS = [5_000, 10_000, 20_000];
@@ -262,10 +263,12 @@ export class HoldQueue {
   private async onError(lane: string, item: HeldItem, err: unknown): Promise<void> {
     const now = this.now();
     // First-try 409 fails fast. After a wake (item already held, typically
-    // following a tunnel 1033/502), retry 409 for a short grace window.
-    if (isGatewayConflict(err) && item.holding) item.conflictStartedAt ??= now;
+    // following a tunnel 1033/502), retry an unclassified 409 for a short
+    // grace window. Permanent gateway codes (send/agent-unavailable) do not.
+    if (isGatewayConflict(err) && !isPermanentGatewayConflict(err) && item.holding) item.conflictStartedAt ??= now;
     const inConflictGrace =
       isGatewayConflict(err) &&
+      !isPermanentGatewayConflict(err) &&
       item.holding &&
       item.conflictStartedAt !== undefined &&
       now < item.conflictStartedAt + this.conflictGraceMs;

@@ -96,6 +96,7 @@ curl -sS -X POST --data-binary @db.sqlite.gz \
 ## Rules
 
 * Real config, `registry.json` and `.env` live only on the deployment host, and the registry is mounted read-only. Git holds examples only (see `.gitignore`).
+* For a **server-hosted bot**, set `deliver.kind` to `webhook` (the bot's webhook routine). `sendprompt` only works when the agent's computer holds a signed-in session.
 * **Registry aliases are lowercase** (`a-z 0-9 . _ -`, starting with a letter or digit). They are case-sensitive and are not normalised: a mixed-case alias is rejected with a "rename it to …" message, and an adapter route (e.g. a Discord route's `agent`) that differs from a registry alias only by case fails at startup. Write aliases in lowercase everywhere.
 * Config holds secret **references** (`env:NAME`, `file:/path`). Literal secrets are refused.
 * The service binds loopback only. Put the tunnel in front of it and route by path: `/discord/*`, `/grokbuild/*`, `/tesla/*` (and `/backup/upload` if backups are enabled).
